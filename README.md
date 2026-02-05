@@ -106,3 +106,13 @@ Even I use the GPT model to generate the code, I still need to review the code a
 ## Discussion
 
 If you have any questions or suggestions, please feel free to create an issue or pull request. I'm happy to discuss with you. Or you can discuss it in this hacker news [thread](https://news.ycombinator.com/item?id=40764579).
+
+---
+
+## About the Author
+
+This project is maintained by the creator of **MyInvestPilot** —
+a systematic investment assistance platform focused on
+rule-based, long-term investing and transparent strategy research.
+
+🔗 https://www.myinvestpilot.com
