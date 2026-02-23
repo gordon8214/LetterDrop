@@ -1,0 +1,36 @@
+name = "replace-with-worker-name"
+main = "src/index.ts"
+compatibility_date = "2026-02-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ALLOWED_EMAILS = "contact@example.com"
+TURNSTILE_SITE_KEY = "REPLACE_WITH_TURNSTILE_SITE_KEY"
+
+[[services]]
+binding = "NOTIFICATION"
+service = "replace-with-notification-service"
+
+[[queues.producers]]
+binding = "QUEUE"
+queue = "replace-with-queue"
+
+[[queues.consumers]]
+queue = "replace-with-queue"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 10
+dead_letter_queue = "replace-with-dead-letter-queue"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "00000000000000000000000000000000"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "replace-with-r2-bucket"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "replace-with-d1-database"
+database_id = "00000000-0000-0000-0000-000000000000"

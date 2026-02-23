@@ -15,6 +15,7 @@ I have been using `TinyLetter` to send newsletters to my subscribers, but unfort
 ```bash
 curl --request POST \
   --url https://ld.i365.tech/api/newsletter \
+  --header 'Authorization: Bearer <<ADMIN_API_TOKEN>>' \
   --header 'CF-Access-Client-Id: <<CF-Access-Client-Id>>' \
   --header 'CF-Access-Client-Secret: <<CF-Access-Client-Secret>>' \
   --header 'content-type: application/json' \
@@ -30,11 +31,12 @@ curl --request POST \
 ```bash
 curl --request PUT \
   --url https://ld.i365.tech/api/newsletter/9080f810-e0f7-43aa-bac8-8d1cb3ceeff4/offline \
+  --header 'Authorization: Bearer <<ADMIN_API_TOKEN>>' \
   --header 'CF-Access-Client-Id: <<CF-Access-Client-Id>>' \
   --header 'CF-Access-Client-Secret: <<CF-Access-Client-Secret>>'
 ```
 
-__NOTE:__ These APIs should be protected by Cloudflare zero-trust security. That means you need to create a [service-token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) and use it to access these APIs.
+__NOTE:__ These APIs should be protected by Cloudflare zero-trust security and a Worker-level bearer token (`ADMIN_API_TOKEN`). This keeps admin routes fail-closed if edge policy is accidentally changed.
 
 ### Subscribe or Unsubscribe to a newsletter
 
@@ -42,7 +44,7 @@ Just go to the newsletter page and click the subscribe or unsubscribe button. e.
 
 Then you will receive an email to confirm your subscription or unsubscription. After that, you will receive the newsletter when it is published.
 
-__NOTE:__ The newsletter page link pattern is `https://<<your-domain>>/newsletter/:id`.
+__NOTE:__ The newsletter page link pattern is `https://<<your-domain>>/newsletter/:id`. The subscription form now uses Cloudflare Turnstile and per-IP/per-target rate limiting to prevent abuse.
 
 ### Publish a newsletter
 
@@ -59,7 +61,7 @@ __NOTE:__
 
 To use LetterDrop, you need to create a Cloudflare account and deploy the Worker script. The Worker script is available in the `app` directory. You can deploy the Worker script using the Cloudflare Workers dashboard.
 
-__NOTE:__ You need to change the `app/wrangler.toml` file to use your config values.
+__NOTE:__ Keep `app/wrangler.toml` deploy-safe for your active environment. Use `app/wrangler.example.toml` when you need a sanitized template.
 
 ### The dependencies
 
@@ -73,7 +75,19 @@ __NOTE:__ You need to change the `app/wrangler.toml` file to use your config val
 
 ### Variables
 
-- `ALLOWED_EMAILS`: The list of allowed emails to create newsletters.
+- `ALLOWED_EMAILS`: Comma-separated sender allowlist for the email worker.
+- `TURNSTILE_SITE_KEY`: Public site key for Cloudflare Turnstile.
+
+### Secrets
+
+- `ADMIN_API_TOKEN`: Required bearer token for all `/api/newsletter*` admin APIs.
+- `TURNSTILE_SECRET_KEY`: Secret key used to verify Turnstile tokens server-side.
+
+### Deploy safety checks
+
+- `npm --prefix app run check:wrangler`: Fails if active `wrangler.toml` contains placeholder bindings/IDs.
+- `npm --prefix app run smoke:deploy -- --env production`: Verifies required secrets and required D1 migration state before deployment.
+- `npm --prefix app run deploy:safe`: Runs both checks before deploy.
 
 ### How to setup the notification service?
 

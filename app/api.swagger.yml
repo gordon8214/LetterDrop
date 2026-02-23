@@ -6,11 +6,39 @@ info:
 
 paths:
   /api/newsletter:
+    get:
+      summary: List all newsletters
+      description: List all newsletters with subscriber counts
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          type: integer
+          default: 1
+        - name: limit
+          in: query
+          type: integer
+          default: 50
+      responses:
+        '200':
+          description: Newsletters retrieved successfully
+          schema:
+            type: object
+            properties:
+              newsletters:
+                type: array
+                items:
+                  $ref: '#/definitions/Newsletter'
+              pagination:
+                $ref: '#/definitions/Pagination'
+        '500':
+          description: Server error
     post:
       summary: Create a new newsletter
       description: Create a new newsletter
       security:
-        - ZeroTrustAuth: []
+        - AdminBearerAuth: []
       parameters:
         - in: body
           name: body
@@ -25,12 +53,157 @@ paths:
         '500':
           description: Server error
 
+  /api/newsletter/{newsletterId}:
+    get:
+      summary: Get a single newsletter
+      description: Get a single newsletter with subscriber count
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: Newsletter retrieved successfully
+          schema:
+            $ref: '#/definitions/Newsletter'
+        '404':
+          description: Newsletter not found
+        '500':
+          description: Server error
+    put:
+      summary: Update a newsletter
+      description: Partial update of newsletter fields (title, description, logo)
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/UpdateNewsletterRequest'
+      responses:
+        '200':
+          description: Newsletter updated successfully
+          schema:
+            $ref: '#/definitions/Newsletter'
+        '404':
+          description: Newsletter not found
+        '500':
+          description: Server error
+    delete:
+      summary: Delete a newsletter
+      description: Delete a newsletter, its subscribers, and R2 content
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: Newsletter deleted successfully
+        '404':
+          description: Newsletter not found
+        '500':
+          description: Server error
+
+  /api/newsletter/{newsletterId}/subscribers:
+    get:
+      summary: List subscribers
+      description: List all subscribers for a newsletter (subscribed and unsubscribed)
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+        - name: page
+          in: query
+          type: integer
+          default: 1
+        - name: limit
+          in: query
+          type: integer
+          default: 50
+      responses:
+        '200':
+          description: Subscribers retrieved successfully
+          schema:
+            type: object
+            properties:
+              subscribers:
+                type: array
+                items:
+                  $ref: '#/definitions/Subscriber'
+              pagination:
+                $ref: '#/definitions/Pagination'
+        '404':
+          description: Newsletter not found
+        '500':
+          description: Server error
+    post:
+      summary: Add subscribers
+      description: Add one or more subscribers to a newsletter
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/AddSubscribersRequest'
+      responses:
+        '201':
+          description: Subscribers added successfully
+        '400':
+          description: Invalid subscribers payload
+        '404':
+          description: Newsletter not found
+        '500':
+          description: Server error
+
+  /api/newsletter/{newsletterId}/subscribers/{email}:
+    delete:
+      summary: Remove a subscriber
+      description: Hard delete a subscriber from a newsletter
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+        - name: email
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: Subscriber removed successfully
+        '404':
+          description: Subscriber not found
+        '500':
+          description: Server error
+
   /api/newsletter/{newsletterId}/offline:
     put:
       summary: Take a newsletter offline
       description: Mark a newsletter as offline and unsubscribable
       security:
-        - ZeroTrustAuth: []
+        - AdminBearerAuth: []
       parameters:
         - name: newsletterId
           in: path
@@ -42,34 +215,49 @@ paths:
         '500':
           description: Server error
 
-  /api/subscribe/confirm:
-    post:
+  /api/newsletter/{newsletterId}/online:
+    put:
+      summary: Bring a newsletter online
+      description: Mark a newsletter as online and subscribable
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: Newsletter brought online successfully
+        '500':
+          description: Server error
+
+  /api/subscribe/confirm/{token}:
+    get:
       summary: Confirm subscription
       description: Confirm a subscription using the provided token
       parameters:
-        - in: body
-          name: body
+        - name: token
+          in: path
           required: true
-          schema:
-            $ref: '#/definitions/SubscribeConfirmRequest'
+          type: string
       responses:
-        '200':
-          description: Subscription confirmed successfully
+        '302':
+          description: Redirect to the subscription success page
         '400':
           description: Invalid or expired token
         '500':
           description: Server error
 
-  /api/subscribe/cancel:
-    post:
+  /api/subscribe/cancel/{token}:
+    get:
       summary: Cancel subscription
       description: Cancel a subscription using the provided token
       parameters:
-        - in: body
-          name: body
+        - name: token
+          in: path
           required: true
-          schema:
-            $ref: '#/definitions/SubscribeCancelRequest'
+          type: string
       responses:
         '200':
           description: Unsubscribed successfully
@@ -91,6 +279,20 @@ paths:
       responses:
         '200':
           description: Confirmation email sent successfully
+        '400':
+          description: Validation error
+        '403':
+          description: Bot verification failed
+        '404':
+          description: Newsletter not found
+        '409':
+          description: Newsletter is not subscribable
+        '429':
+          description: Too many requests
+          headers:
+            Retry-After:
+              type: string
+              description: Seconds clients should wait before retrying.
         '500':
           description: Server error
 
@@ -107,6 +309,18 @@ paths:
       responses:
         '200':
           description: Cancellation email sent successfully
+        '400':
+          description: Validation error
+        '403':
+          description: Bot verification failed
+        '404':
+          description: Newsletter not found
+        '429':
+          description: Too many requests
+          headers:
+            Retry-After:
+              type: string
+              description: Seconds clients should wait before retrying.
         '500':
           description: Server error
 
@@ -140,36 +354,73 @@ definitions:
       logo:
         type: string
 
-  SubscribeConfirmRequest:
-    type: object
-    properties:
-      email:
-        type: string
-      token:
-        type: string
-
-  SubscribeCancelRequest:
-    type: object
-    properties:
-      email:
-        type: string
-      token:
-        type: string
-
   SendConfirmationRequest:
     type: object
+    required:
+      - email
+      - newsletterId
+      - turnstileToken
     properties:
       email:
         type: string
+        format: email
       newsletterId:
+        type: string
+        format: uuid
+      turnstileToken:
+        type: string
+      firstName:
+        type: string
+      lastName:
         type: string
 
   SendCancellationRequest:
     type: object
+    required:
+      - email
+      - newsletterId
+      - turnstileToken
     properties:
       email:
         type: string
+        format: email
       newsletterId:
+        type: string
+        format: uuid
+      turnstileToken:
+        type: string
+
+  UpdateNewsletterRequest:
+    type: object
+    properties:
+      title:
+        type: string
+      description:
+        type: string
+      logo:
+        type: string
+
+  AddSubscribersRequest:
+    type: object
+    required:
+      - subscribers
+    properties:
+      subscribers:
+        type: array
+        items:
+          $ref: '#/definitions/SubscriberInput'
+
+  SubscriberInput:
+    type: object
+    required:
+      - email
+    properties:
+      email:
+        type: string
+        format: email
+      firstName:
+        type: string
+      lastName:
         type: string
 
   Newsletter:
@@ -188,9 +439,45 @@ definitions:
         type: integer
       subscribable:
         type: boolean
+      createdAt:
+        type: string
+        format: date-time
+      updatedAt:
+        type: string
+        format: date-time
+
+  Subscriber:
+    type: object
+    properties:
+      email:
+        type: string
+        format: email
+      first_name:
+        type: string
+      last_name:
+        type: string
+      newsletter_id:
+        type: string
+        format: uuid
+      isSubscribed:
+        type: boolean
+      upsertedAt:
+        type: string
+        format: date-time
+
+  Pagination:
+    type: object
+    properties:
+      page:
+        type: integer
+      limit:
+        type: integer
+      total:
+        type: integer
 
 securityDefinitions:
-  ZeroTrustAuth:
+  AdminBearerAuth:
     type: apiKey
     in: header
     name: Authorization
+    description: Bearer token required by Worker-level admin auth middleware.
