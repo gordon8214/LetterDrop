@@ -3,16 +3,16 @@ name: Validate Wrangler Config
 on:
   pull_request:
     paths:
-      - app/wrangler.toml
-      - app/scripts/check-wrangler-bindings.mjs
+      - app/wrangler.example.toml
+      - app/scripts/check-wrangler-template.mjs
       - .github/workflows/validate-wrangler.yml
   push:
     branches:
       - main
       - master
     paths:
-      - app/wrangler.toml
-      - app/scripts/check-wrangler-bindings.mjs
+      - app/wrangler.example.toml
+      - app/scripts/check-wrangler-template.mjs
       - .github/workflows/validate-wrangler.yml
 
 jobs:
@@ -28,5 +28,5 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Validate bindings
-        run: node scripts/check-wrangler-bindings.mjs
+      - name: Validate template bindings
+        run: node scripts/check-wrangler-template.mjs

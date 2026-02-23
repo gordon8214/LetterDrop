@@ -61,7 +61,12 @@ __NOTE:__
 
 To use LetterDrop, you need to create a Cloudflare account and deploy the Worker script. The Worker script is available in the `app` directory. You can deploy the Worker script using the Cloudflare Workers dashboard.
 
-__NOTE:__ Keep `app/wrangler.toml` deploy-safe for your active environment. Use `app/wrangler.example.toml` when you need a sanitized template.
+__NOTE:__ `app/wrangler.toml` is gitignored because it contains real resource IDs. To get started, copy the template and fill in your values:
+
+```bash
+cp app/wrangler.example.toml app/wrangler.toml
+# Edit app/wrangler.toml with your Cloudflare resource IDs
+```
 
 ### The dependencies
 
@@ -85,9 +90,10 @@ __NOTE:__ Keep `app/wrangler.toml` deploy-safe for your active environment. Use 
 
 ### Deploy safety checks
 
-- `npm --prefix app run check:wrangler`: Fails if active `wrangler.toml` contains placeholder bindings/IDs.
+- `npm --prefix app run check:wrangler`: Fails if your local `wrangler.toml` still contains placeholder bindings/IDs.
+- `npm --prefix app run check:wrangler:template`: (CI) Validates that `wrangler.example.toml` has all required bindings.
 - `npm --prefix app run smoke:deploy -- --env production`: Verifies required secrets and required D1 migration state before deployment.
-- `npm --prefix app run deploy:safe`: Runs both checks before deploy.
+- `npm --prefix app run deploy:safe`: Runs the local check and smoke test before deploy.
 
 ### How to setup the notification service?
 

@@ -1759,11 +1759,11 @@ Error: No response!
 ▲ [WARNING] The entrypoint src/index.ts has exports like an ES Module, but hasn't defined a default export like a module worker normally would. Building the worker using "service-worker" format...
 
 
-▲ [WARNING] kj/filesystem-disk-unix.c++:1709: warning: PWD environment variable doesn't match current directory; pwd = /home/user/Workspace/personal/side_project/LetterDrop/app
+▲ [WARNING] kj/filesystem-disk-unix.c++:1709: warning: PWD environment variable doesn't match current directory; pwd = /path/to/project/app
 
 
 ⎔ Starting local server...
-▲ [WARNING] kj/filesystem-disk-unix.c++:1709: warning: PWD environment variable doesn't match current directory; pwd = /home/user/Workspace/personal/side_project/LetterDrop/app
+▲ [WARNING] kj/filesystem-disk-unix.c++:1709: warning: PWD environment variable doesn't match current directory; pwd = /path/to/project/app
 ```
 
 而且浏览器在请求时，错误如下：

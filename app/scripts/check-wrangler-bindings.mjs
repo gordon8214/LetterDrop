@@ -1,15 +1,19 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { forbiddenPatterns } from './wrangler-definitions.mjs'
 
 const wranglerFile = resolve(process.cwd(), 'wrangler.toml')
+
+if (!existsSync(wranglerFile)) {
+  console.error(
+    'wrangler.toml not found. Copy the template first:\n' +
+    '  cp wrangler.example.toml wrangler.toml'
+  )
+  process.exit(1)
+}
+
 const content = readFileSync(wranglerFile, 'utf8')
 const lines = content.split('\n')
-
-const forbiddenPatterns = [
-  'replace-with-',
-  '00000000000000000000000000000000',
-  '00000000-0000-0000-0000-000000000000',
-]
 
 const violations = []
 

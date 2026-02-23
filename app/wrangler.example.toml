@@ -4,8 +4,8 @@ compatibility_date = "2026-02-23"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-ALLOWED_EMAILS = "contact@example.com"
-TURNSTILE_SITE_KEY = "REPLACE_WITH_TURNSTILE_SITE_KEY"
+ALLOWED_EMAILS = "replace-with-allowed-emails"
+TURNSTILE_SITE_KEY = "replace-with-turnstile-site-key"
 
 [[services]]
 binding = "NOTIFICATION"

@@ -5,6 +5,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check:wrangler": "node scripts/check-wrangler-bindings.mjs",
+    "check:wrangler:template": "node scripts/check-wrangler-template.mjs",
     "smoke:deploy": "node scripts/predeploy-smoke.mjs",
     "deploy": "wrangler deploy --minify src/index.ts",
     "deploy:safe": "npm run check:wrangler && npm run smoke:deploy && npm run deploy"
