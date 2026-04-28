@@ -29,3 +29,15 @@ CREATE TABLE AbuseEvent (
 );
 
 CREATE INDEX idx_abuse_event_lookup ON AbuseEvent(bucket, key_hash, createdAt);
+
+CREATE TABLE SuppressionEvent (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    newsletter_id TEXT,
+    event_type TEXT NOT NULL,
+    provider_message_id TEXT,
+    provider_payload TEXT,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_suppression_event_lookup ON SuppressionEvent(email, newsletter_id, createdAt);

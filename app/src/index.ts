@@ -10,10 +10,15 @@ type Bindings = {
   QUEUE: Queue;
   ALLOWED_EMAILS: string;
   PUBLISH_EMAIL_ADDRESS: string;
+  NOTIFICATION_SHARED_SECRET?: string;
+  PUBLIC_ORIGIN?: string;
   PUBLISH_BRIDGE_TOKEN: string;
   ADMIN_API_TOKEN: string;
   TURNSTILE_SECRET_KEY: string;
   TURNSTILE_SITE_KEY: string;
+  UNSUBSCRIBE_SIGNING_SECRET?: string;
+  SES_SNS_WEBHOOK_TOKEN?: string;
+  SES_SNS_TOPIC_ARN?: string;
 };
 
 type SubscriberInput = {
@@ -30,6 +35,27 @@ type SubscriptionTokenPayload = {
   newsletterId?: string;
   firstName?: string | null;
   lastName?: string | null;
+};
+
+type UnsubscribeTokenPayload = {
+  v: 1;
+  email: string;
+  newsletterId: string;
+};
+
+type EmailHeader = {
+  name: string;
+  value: string;
+};
+
+type EmailTag = {
+  name: string;
+  value: string;
+};
+
+type SendEmailOptions = {
+  headers?: EmailHeader[];
+  tags?: EmailTag[];
 };
 
 type PublishNewsletterInput = {
@@ -56,6 +82,7 @@ type PublishNewsletterEmailSuccess = {
   newsletterId: string;
   subject: string;
   fileName?: string;
+  textFileName?: string;
   queuedCount: number;
   duplicate: boolean;
 };
@@ -74,7 +101,47 @@ type LimitedJsonObjectResult =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; response: Response };
 
+type NewsletterQueueMessage = {
+  email: string;
+  newsletterId: string;
+  subject: string;
+  fileName: string;
+  textFileName?: string;
+};
+
+type SesSnsEnvelope = {
+  Type?: unknown;
+  MessageId?: unknown;
+  Message?: unknown;
+  Subject?: unknown;
+  TopicArn?: unknown;
+  Timestamp?: unknown;
+  SignatureVersion?: unknown;
+  Signature?: unknown;
+  SigningCertURL?: unknown;
+  SubscribeURL?: unknown;
+  Token?: unknown;
+};
+
+type SesNotification = {
+  notificationType?: unknown;
+  mail?: {
+    messageId?: unknown;
+    destination?: unknown;
+    tags?: Record<string, unknown>;
+  };
+  bounce?: {
+    bounceType?: unknown;
+    bouncedRecipients?: unknown;
+  };
+  complaint?: {
+    complainedRecipients?: unknown;
+  };
+};
+
 const NOTIFICATION_BASE_URL = "http://haben-notification";
+const NOTIFICATION_AUTH_HEADER = "X-LetterDrop-Notification-Token";
+const DEFAULT_PUBLIC_ORIGIN = "https://newsletter.habengirma.com";
 const D1_BATCH_LIMIT = 100;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_REGEX =
@@ -91,6 +158,7 @@ const POST_TURNSTILE_WINDOW_SECONDS = 60 * 60;
 const MISSING_ABUSE_EVENT_TABLE_FRAGMENT = "no such table: AbuseEvent";
 const PUBLISH_SOURCE_MESSAGE_TTL_SECONDS = 60 * 60 * 24 * 30;
 const MAX_PUBLISH_REQUEST_BYTES = 5 * 1024 * 1024;
+const MAX_SUPPRESSION_PAYLOAD_LENGTH = 20_000;
 
 let hasLoggedMissingAbuseEventMigration = false;
 
@@ -137,6 +205,27 @@ function normalizeNonEmptyString(value: unknown): string | null {
   }
   const normalized = value.trim();
   return normalized.length > 0 ? normalized : null;
+}
+
+function getPublicOrigin(env: Bindings): string {
+  const configuredOrigin = env.PUBLIC_ORIGIN?.trim() || DEFAULT_PUBLIC_ORIGIN;
+  try {
+    const url = new URL(configuredOrigin);
+    if (url.protocol === "https:" || url.protocol === "http:") {
+      return url.origin;
+    }
+  } catch {
+    // Fall back to the production origin when local config is malformed.
+  }
+  return DEFAULT_PUBLIC_ORIGIN;
+}
+
+function getUnsubscribeSigningSecret(env: Bindings): string | null {
+  return normalizeNonEmptyString(env.UNSUBSCRIBE_SIGNING_SECRET);
+}
+
+function getNotificationSharedSecret(env: Bindings): string | null {
+  return normalizeNonEmptyString(env.NOTIFICATION_SHARED_SECRET);
 }
 
 function extractEmailAddress(value: unknown): string | null {
@@ -206,6 +295,18 @@ function timingSafeEqual(a: string, b: string): boolean {
 
   let mismatch = 0;
   for (let i = 0; i < first.length; i += 1) {
+    mismatch |= first[i] ^ second[i];
+  }
+  return mismatch === 0;
+}
+
+function timingSafeEqualBytes(first: Uint8Array, second: Uint8Array): boolean {
+  if (first.byteLength !== second.byteLength) {
+    return false;
+  }
+
+  let mismatch = 0;
+  for (let i = 0; i < first.byteLength; i += 1) {
     mismatch |= first[i] ^ second[i];
   }
   return mismatch === 0;
@@ -337,6 +438,433 @@ async function sha256Hex(input: string): Promise<string> {
   return Array.from(bytes)
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function base64UrlDecode(value: string): Uint8Array | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    return null;
+  }
+
+  const padded = value
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(value.length / 4) * 4, "=");
+
+  try {
+    const binary = atob(padded);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+function base64Decode(value: string): Uint8Array | null {
+  const normalized = value.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
+    return null;
+  }
+
+  try {
+    const binary = atob(normalized);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+async function hmacSha256(secret: string, data: string): Promise<Uint8Array> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(data));
+  return new Uint8Array(signature);
+}
+
+async function createUnsubscribeToken(
+  env: Bindings,
+  email: string,
+  newsletterId: string,
+): Promise<string> {
+  const secret = getUnsubscribeSigningSecret(env);
+  if (!secret) {
+    throw new Error("UNSUBSCRIBE_SIGNING_SECRET secret is not configured");
+  }
+
+  const payload: UnsubscribeTokenPayload = { v: 1, email, newsletterId };
+  const encodedPayload = base64UrlEncode(
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  const signature = await hmacSha256(secret, encodedPayload);
+  return `${encodedPayload}.${base64UrlEncode(signature)}`;
+}
+
+async function parseUnsubscribeToken(
+  env: Bindings,
+  token: string,
+): Promise<UnsubscribeTokenPayload | null> {
+  const secret = getUnsubscribeSigningSecret(env);
+  if (!secret) {
+    return null;
+  }
+
+  const [encodedPayload, encodedSignature, extra] = token.split(".");
+  if (!encodedPayload || !encodedSignature || extra !== undefined) {
+    return null;
+  }
+
+  const signature = base64UrlDecode(encodedSignature);
+  if (!signature) {
+    return null;
+  }
+
+  const expectedSignature = await hmacSha256(secret, encodedPayload);
+  if (!timingSafeEqualBytes(signature, expectedSignature)) {
+    return null;
+  }
+
+  const payloadBytes = base64UrlDecode(encodedPayload);
+  if (!payloadBytes) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(
+      new TextDecoder().decode(payloadBytes),
+    ) as Partial<UnsubscribeTokenPayload>;
+    const email = normalizeEmail(parsed.email);
+    const newsletterId =
+      typeof parsed.newsletterId === "string" ? parsed.newsletterId : "";
+    if (parsed.v !== 1 || !email || !isValidUuid(newsletterId)) {
+      return null;
+    }
+    return { v: 1, email, newsletterId };
+  } catch {
+    return null;
+  }
+}
+
+type DerNode = {
+  tag: number;
+  start: number;
+  valueStart: number;
+  valueEnd: number;
+  end: number;
+};
+
+function readDerNode(bytes: Uint8Array, offset: number): DerNode | null {
+  if (offset < 0 || offset + 2 > bytes.byteLength) {
+    return null;
+  }
+
+  const start = offset;
+  const tag = bytes[offset];
+  let cursor = offset + 1;
+  const lengthByte = bytes[cursor];
+  cursor += 1;
+
+  let length = 0;
+  if ((lengthByte & 0x80) === 0) {
+    length = lengthByte;
+  } else {
+    const lengthByteCount = lengthByte & 0x7f;
+    if (
+      lengthByteCount === 0 ||
+      lengthByteCount > 4 ||
+      cursor + lengthByteCount > bytes.byteLength
+    ) {
+      return null;
+    }
+    for (let index = 0; index < lengthByteCount; index += 1) {
+      length = (length << 8) | bytes[cursor + index];
+    }
+    cursor += lengthByteCount;
+  }
+
+  const valueStart = cursor;
+  const valueEnd = valueStart + length;
+  if (valueEnd > bytes.byteLength) {
+    return null;
+  }
+  return { tag, start, valueStart, valueEnd, end: valueEnd };
+}
+
+function extractSubjectPublicKeyInfoFromCertificate(
+  certificateDer: Uint8Array,
+): Uint8Array | null {
+  const certificate = readDerNode(certificateDer, 0);
+  if (
+    !certificate ||
+    certificate.tag !== 0x30 ||
+    certificate.end !== certificateDer.byteLength
+  ) {
+    return null;
+  }
+
+  const tbsCertificate = readDerNode(certificateDer, certificate.valueStart);
+  if (
+    !tbsCertificate ||
+    tbsCertificate.tag !== 0x30 ||
+    tbsCertificate.end > certificate.valueEnd
+  ) {
+    return null;
+  }
+
+  let cursor = tbsCertificate.valueStart;
+  const first = readDerNode(certificateDer, cursor);
+  if (!first) {
+    return null;
+  }
+  if (first.tag === 0xa0) {
+    cursor = first.end;
+  }
+
+  for (let skippedField = 0; skippedField < 5; skippedField += 1) {
+    const node = readDerNode(certificateDer, cursor);
+    if (!node || node.end > tbsCertificate.valueEnd) {
+      return null;
+    }
+    cursor = node.end;
+  }
+
+  const subjectPublicKeyInfo = readDerNode(certificateDer, cursor);
+  if (
+    !subjectPublicKeyInfo ||
+    subjectPublicKeyInfo.tag !== 0x30 ||
+    subjectPublicKeyInfo.end > tbsCertificate.valueEnd
+  ) {
+    return null;
+  }
+  return certificateDer.slice(
+    subjectPublicKeyInfo.start,
+    subjectPublicKeyInfo.end,
+  );
+}
+
+function decodePemBlock(pem: string, label: string): Uint8Array | null {
+  const pattern = new RegExp(
+    `-----BEGIN ${label}-----\\s*([A-Za-z0-9+/=\\s]+?)\\s*-----END ${label}-----`,
+  );
+  const match = pem.match(pattern);
+  if (!match) {
+    return null;
+  }
+  return base64Decode(match[1]);
+}
+
+function extractPublicKeyDerFromPem(pem: string): Uint8Array | null {
+  const publicKey = decodePemBlock(pem, "PUBLIC KEY");
+  if (publicKey) {
+    return publicKey;
+  }
+
+  const certificate = decodePemBlock(pem, "CERTIFICATE");
+  return certificate
+    ? extractSubjectPublicKeyInfoFromCertificate(certificate)
+    : null;
+}
+
+function getStringField(
+  envelope: SesSnsEnvelope,
+  field: keyof SesSnsEnvelope,
+): string | null {
+  const value = envelope[field];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function getSnsTopicRegion(topicArn: string): string | null {
+  const [, , service, region] = topicArn.split(":");
+  return service === "sns" && region ? region : null;
+}
+
+function isTrustedSnsHost(hostname: string, topicArn: string): boolean {
+  const region = getSnsTopicRegion(topicArn);
+  if (region) {
+    return hostname === `sns.${region}.amazonaws.com`;
+  }
+  return /^sns\.[a-z0-9-]+\.amazonaws\.com$/.test(hostname);
+}
+
+function parseTrustedSnsUrl(
+  value: string,
+  topicArn: string,
+): URL | null {
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      !isTrustedSnsHost(url.hostname, topicArn)
+    ) {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function isTrustedSnsSigningCertUrl(
+  value: string,
+  topicArn: string,
+): boolean {
+  const url = parseTrustedSnsUrl(value, topicArn);
+  return Boolean(
+    url &&
+      !url.search &&
+      !url.hash &&
+      /^\/SimpleNotificationService-[A-Za-z0-9]+\.pem$/.test(url.pathname),
+  );
+}
+
+function isTrustedSnsSubscribeUrl(
+  value: string,
+  topicArn: string,
+  token: string,
+): boolean {
+  const url = parseTrustedSnsUrl(value, topicArn);
+  return Boolean(
+    url &&
+      url.searchParams.get("Action") === "ConfirmSubscription" &&
+      url.searchParams.get("TopicArn") === topicArn &&
+      url.searchParams.get("Token") === token,
+  );
+}
+
+function buildSnsStringToSign(envelope: SesSnsEnvelope): string | null {
+  const type = getStringField(envelope, "Type");
+  const fields =
+    type === "Notification"
+      ? ["Message", "MessageId", "Subject", "Timestamp", "TopicArn", "Type"]
+      : type === "SubscriptionConfirmation" ||
+          type === "UnsubscribeConfirmation"
+        ? [
+            "Message",
+            "MessageId",
+            "SubscribeURL",
+            "Timestamp",
+            "Token",
+            "TopicArn",
+            "Type",
+          ]
+        : null;
+  if (!fields) {
+    return null;
+  }
+
+  const pairs: string[] = [];
+  for (const field of fields) {
+    if (field === "Subject" && typeof envelope.Subject !== "string") {
+      continue;
+    }
+    const value = getStringField(envelope, field as keyof SesSnsEnvelope);
+    if (!value) {
+      return null;
+    }
+    pairs.push(`${field}\n${value}`);
+  }
+  return pairs.join("\n");
+}
+
+async function verifySnsEnvelopeSignature(
+  envelope: SesSnsEnvelope,
+): Promise<boolean> {
+  const stringToSign = buildSnsStringToSign(envelope);
+  const topicArn = getStringField(envelope, "TopicArn");
+  const signature = getStringField(envelope, "Signature");
+  const signatureVersion = getStringField(envelope, "SignatureVersion");
+  const signingCertUrl = getStringField(envelope, "SigningCertURL");
+  if (
+    !stringToSign ||
+    !topicArn ||
+    !signature ||
+    !signatureVersion ||
+    !signingCertUrl ||
+    !isTrustedSnsSigningCertUrl(signingCertUrl, topicArn)
+  ) {
+    return false;
+  }
+
+  const hash =
+    signatureVersion === "2"
+      ? "SHA-256"
+      : signatureVersion === "1"
+        ? "SHA-1"
+        : null;
+  const signatureBytes = base64Decode(signature);
+  if (!hash || !signatureBytes) {
+    return false;
+  }
+
+  const certificateResponse = await fetch(signingCertUrl);
+  if (!certificateResponse.ok) {
+    throw new Error(
+      `Failed to fetch SNS signing certificate: ${certificateResponse.status}`,
+    );
+  }
+
+  const publicKeyDer = extractPublicKeyDerFromPem(
+    await certificateResponse.text(),
+  );
+  if (!publicKeyDer) {
+    return false;
+  }
+
+  try {
+    const key = await crypto.subtle.importKey(
+      "spki",
+      publicKeyDer,
+      { name: "RSASSA-PKCS1-v1_5", hash },
+      false,
+      ["verify"],
+    );
+    return crypto.subtle.verify(
+      "RSASSA-PKCS1-v1_5",
+      key,
+      signatureBytes,
+      new TextEncoder().encode(stringToSign),
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function confirmSnsSubscription(
+  envelope: SesSnsEnvelope,
+): Promise<boolean> {
+  const topicArn = getStringField(envelope, "TopicArn");
+  const subscribeUrl = getStringField(envelope, "SubscribeURL");
+  const token = getStringField(envelope, "Token");
+  if (
+    !topicArn ||
+    !subscribeUrl ||
+    !token ||
+    !isTrustedSnsSubscribeUrl(subscribeUrl, topicArn, token)
+  ) {
+    return false;
+  }
+
+  const response = await fetch(subscribeUrl, { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`SNS subscription confirmation failed: ${response.status}`);
+  }
+  return true;
 }
 
 async function cleanupRateLimitEvents(db: D1Database): Promise<void> {
@@ -644,6 +1172,7 @@ app.post("/api/newsletter/:newsletterId/publish", async (c) => {
       newsletterId: result.newsletterId,
       subject: result.subject,
       fileName: result.fileName,
+      textFileName: result.textFileName,
       queuedCount: result.queuedCount,
       duplicate: result.duplicate,
     });
@@ -690,6 +1219,7 @@ app.post("/api/publish/google-workspace", async (c) => {
       newsletterId: result.newsletterId,
       subject: result.subject,
       fileName: result.fileName,
+      textFileName: result.textFileName,
       queuedCount: result.queuedCount,
       duplicate: result.duplicate,
     });
@@ -1042,11 +1572,7 @@ app.get("/api/subscribe/cancel/:token", async (c) => {
     }
 
     // Update Subscription Status
-    await c.env.DB.prepare(
-      `UPDATE Subscriber SET isSubscribed = 0 WHERE email = ? AND newsletter_id = ?`,
-    )
-      .bind(email, newsletterId)
-      .run();
+    await markSubscriberUnsubscribed(c.env.DB, email, newsletterId);
 
     // Enforce one-time use semantics for cancellation links.
     await c.env.KV.delete(token);
@@ -1054,6 +1580,85 @@ app.get("/api/subscribe/cancel/:token", async (c) => {
     return renderHtml(c, "Unsubscribed successfully", "取消订阅成功");
   } catch (error: unknown) {
     return internalServerError(c, "cancel-subscription", error);
+  }
+});
+
+app.post("/api/subscribe/list-unsubscribe/:token", async (c) => {
+  const { token } = c.req.param();
+
+  try {
+    if (!getUnsubscribeSigningSecret(c.env)) {
+      logError(
+        "list-unsubscribe-config",
+        new Error("UNSUBSCRIBE_SIGNING_SECRET secret is not configured"),
+      );
+      return c.json({ error: "Unsubscribe unavailable" }, 503);
+    }
+
+    const payload = await parseUnsubscribeToken(c.env, token);
+    if (!payload) {
+      return c.json({ error: "Invalid unsubscribe token" }, 400);
+    }
+
+    await markSubscriberUnsubscribed(
+      c.env.DB,
+      payload.email,
+      payload.newsletterId,
+    );
+    return c.json({ message: "Unsubscribed successfully" });
+  } catch (error: unknown) {
+    return internalServerError(c, "one-click-unsubscribe", error);
+  }
+});
+
+app.get("/api/subscribe/unsubscribe/:token", async (c) => {
+  const { token } = c.req.param();
+
+  try {
+    if (!getUnsubscribeSigningSecret(c.env)) {
+      logError(
+        "visible-unsubscribe-config",
+        new Error("UNSUBSCRIBE_SIGNING_SECRET secret is not configured"),
+      );
+      return c.json({ error: "Unsubscribe unavailable" }, 503);
+    }
+
+    const payload = await parseUnsubscribeToken(c.env, token);
+    if (!payload) {
+      return c.json({ error: "Invalid unsubscribe token" }, 400);
+    }
+
+    return renderUnsubscribeConfirmationHtml(c, token);
+  } catch (error: unknown) {
+    return internalServerError(c, "visible-unsubscribe-confirmation", error);
+  }
+});
+
+app.post("/api/subscribe/unsubscribe/:token", async (c) => {
+  const { token } = c.req.param();
+
+  try {
+    if (!getUnsubscribeSigningSecret(c.env)) {
+      logError(
+        "visible-unsubscribe-config",
+        new Error("UNSUBSCRIBE_SIGNING_SECRET secret is not configured"),
+      );
+      return c.json({ error: "Unsubscribe unavailable" }, 503);
+    }
+
+    const payload = await parseUnsubscribeToken(c.env, token);
+    if (!payload) {
+      return c.json({ error: "Invalid unsubscribe token" }, 400);
+    }
+
+    await markSubscriberUnsubscribed(
+      c.env.DB,
+      payload.email,
+      payload.newsletterId,
+    );
+    return renderHtml(c, "Unsubscribed successfully", "取消订阅成功");
+  } catch (error: unknown) {
+    return internalServerError(c, "visible-unsubscribe", error);
   }
 });
 
@@ -1270,18 +1875,223 @@ app.post("/api/subscribe/send-cancellation", async (c) => {
   }
 });
 
+app.post("/api/ses/sns/:token", async (c) => {
+  const { token } = c.req.param();
+  const webhookToken = normalizeNonEmptyString(c.env.SES_SNS_WEBHOOK_TOKEN);
+  if (!webhookToken) {
+    logError(
+      "ses-sns-config",
+      new Error("SES_SNS_WEBHOOK_TOKEN secret is not configured"),
+    );
+    return c.json({ error: "SES webhook unavailable" }, 503);
+  }
+  if (!timingSafeEqual(token, webhookToken)) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const envelope = await c.req.json<SesSnsEnvelope>();
+    const verified = await verifySnsEnvelopeSignature(envelope);
+    if (!verified) {
+      return c.json({ error: "Invalid SNS signature" }, 403);
+    }
+
+    const configuredTopicArn = normalizeNonEmptyString(c.env.SES_SNS_TOPIC_ARN);
+    const topicArn =
+      typeof envelope.TopicArn === "string" ? envelope.TopicArn : "";
+    if (configuredTopicArn && topicArn !== configuredTopicArn) {
+      return c.json({ error: "Unexpected SNS topic" }, 403);
+    }
+
+    if (envelope.Type === "SubscriptionConfirmation") {
+      const confirmed = await confirmSnsSubscription(envelope);
+      if (!confirmed) {
+        return c.json({ error: "Invalid SNS subscription confirmation" }, 400);
+      }
+      console.log("[ses-sns] Subscription confirmed");
+      return c.json({ message: "SNS subscription confirmed" });
+    }
+
+    if (envelope.Type !== "Notification" || typeof envelope.Message !== "string") {
+      return c.json({ error: "Invalid SNS payload" }, 400);
+    }
+
+    const result = await processSesNotification(c.env.DB, envelope.Message);
+    return c.json({
+      message: "SES notification processed",
+      recordedCount: result.recordedCount,
+      unsubscribedCount: result.unsubscribedCount,
+    });
+  } catch (error: unknown) {
+    if (error instanceof SyntaxError) {
+      return c.json({ error: "Invalid SNS payload" }, 400);
+    }
+    return internalServerError(c, "ses-sns-webhook", error);
+  }
+});
+
+function getSesTagValue(
+  tags: Record<string, unknown> | undefined,
+  name: string,
+): string | null {
+  const value = tags?.[name];
+  if (Array.isArray(value) && typeof value[0] === "string") {
+    return value[0];
+  }
+  return typeof value === "string" ? value : null;
+}
+
+function getSesNotificationRecipients(notification: SesNotification): string[] {
+  const recipientObjects =
+    notification.notificationType === "Complaint"
+      ? notification.complaint?.complainedRecipients
+      : notification.bounce?.bouncedRecipients;
+  if (Array.isArray(recipientObjects)) {
+    return recipientObjects
+      .map((recipient) => {
+        if (
+          recipient &&
+          typeof recipient === "object" &&
+          "emailAddress" in recipient
+        ) {
+          return normalizeEmail(
+            (recipient as { emailAddress?: unknown }).emailAddress,
+          );
+        }
+        return null;
+      })
+      .filter((email): email is string => Boolean(email));
+  }
+
+  const destinations = notification.mail?.destination;
+  if (Array.isArray(destinations)) {
+    return destinations
+      .map((destination) => normalizeEmail(destination))
+      .filter((email): email is string => Boolean(email));
+  }
+
+  return [];
+}
+
+async function recordSuppressionEvent(
+  db: D1Database,
+  event: {
+    email: string;
+    newsletterId: string | null;
+    eventType: string;
+    providerMessageId: string | null;
+    providerPayload: string;
+  },
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO SuppressionEvent (id, email, newsletter_id, event_type, provider_message_id, provider_payload, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      event.email,
+      event.newsletterId,
+      event.eventType,
+      event.providerMessageId,
+      event.providerPayload.slice(0, MAX_SUPPRESSION_PAYLOAD_LENGTH),
+      new Date().toISOString(),
+    )
+    .run();
+}
+
+async function processSesNotification(
+  db: D1Database,
+  messageJson: string,
+): Promise<{ recordedCount: number; unsubscribedCount: number }> {
+  const notification = JSON.parse(messageJson) as SesNotification;
+  const notificationType =
+    typeof notification.notificationType === "string"
+      ? notification.notificationType
+      : "";
+  if (notificationType !== "Bounce" && notificationType !== "Complaint") {
+    return { recordedCount: 0, unsubscribedCount: 0 };
+  }
+
+  const bounceType =
+    typeof notification.bounce?.bounceType === "string"
+      ? notification.bounce.bounceType
+      : "";
+  const shouldUnsubscribe =
+    notificationType === "Complaint" ||
+    (notificationType === "Bounce" && bounceType === "Permanent");
+  const newsletterTag = getSesTagValue(notification.mail?.tags, "newsletterId");
+  const newsletterId =
+    newsletterTag && isValidUuid(newsletterTag) ? newsletterTag : null;
+  const providerMessageId =
+    typeof notification.mail?.messageId === "string"
+      ? notification.mail.messageId
+      : null;
+  const eventType =
+    notificationType === "Complaint"
+      ? "complaint"
+      : `bounce:${bounceType || "unknown"}`;
+  const recipients = getSesNotificationRecipients(notification);
+  const providerPayload = JSON.stringify(notification);
+
+  let recordedCount = 0;
+  let unsubscribedCount = 0;
+  for (const email of recipients) {
+    await recordSuppressionEvent(db, {
+      email,
+      newsletterId,
+      eventType,
+      providerMessageId,
+      providerPayload,
+    });
+    recordedCount += 1;
+
+    if (shouldUnsubscribe && newsletterId) {
+      await markSubscriberUnsubscribed(db, email, newsletterId);
+      unsubscribedCount += 1;
+    }
+  }
+
+  return { recordedCount, unsubscribedCount };
+}
+
 const sendEmail = async (
   env: Bindings,
   email: string,
   subject: string,
   txt: string,
   html: string = "",
-) => {
+  options: SendEmailOptions = {},
+): Promise<string | undefined> => {
+  const body: {
+    mail_to: string;
+    subject: string;
+    txt: string;
+    html: string;
+    headers?: EmailHeader[];
+    tags?: EmailTag[];
+  } = { mail_to: email, subject, txt, html };
+
+  if (options.headers && options.headers.length > 0) {
+    body.headers = options.headers;
+  }
+  if (options.tags && options.tags.length > 0) {
+    body.tags = options.tags;
+  }
+
+  const notificationSharedSecret = getNotificationSharedSecret(env);
+  if (!notificationSharedSecret) {
+    throw new Error("NOTIFICATION_SHARED_SECRET secret is not configured");
+  }
+
   const res = await env.NOTIFICATION.fetch(
     new Request(`${NOTIFICATION_BASE_URL}/send_email`, {
       method: "POST",
-      body: JSON.stringify({ mail_to: email, subject, txt, html }),
-      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      headers: {
+        "Content-Type": "application/json",
+        [NOTIFICATION_AUTH_HEADER]: notificationSharedSecret,
+      },
     }),
   );
 
@@ -1289,11 +2099,16 @@ const sendEmail = async (
     throw new Error(`Notification service returned status ${res.status}`);
   }
 
-  const { message } = (await res.json()) as { message?: string };
+  const { message, messageId } = (await res.json()) as {
+    message?: string;
+    messageId?: string;
+  };
 
   if (message !== "success") {
     throw new Error(`Failed to send email to ${email}`);
   }
+
+  return messageId;
 };
 
 // Public Page for viewing Newsletters
@@ -1536,6 +2351,45 @@ function renderHtml(
   return c.html(html);
 }
 
+function renderUnsubscribeConfirmationHtml(c: AppContext, token: string) {
+  const language = c.req
+    .header("Accept-Language")
+    ?.toLowerCase()
+    .startsWith("zh")
+    ? "zh"
+    : "en";
+  const title =
+    language === "zh" ? "确认取消订阅" : "Confirm unsubscribe";
+  const description =
+    language === "zh"
+      ? "请选择下方按钮以取消订阅。"
+      : "Choose the button below to unsubscribe.";
+  const buttonLabel = language === "zh" ? "取消订阅" : "Unsubscribe";
+  const safeTitle = escapeHtml(title);
+  const safeDescription = escapeHtml(description);
+  const safeButtonLabel = escapeHtml(buttonLabel);
+  const safeAction = `/api/subscribe/unsubscribe/${escapeHtml(token)}`;
+  const html = `
+    <!DOCTYPE html>
+    <html lang="${language}">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${safeTitle}</title>
+      </head>
+      <body>
+        <h1>${safeTitle}</h1>
+        <p>${safeDescription}</p>
+        <form method="post" action="${safeAction}">
+          <button type="submit">${safeButtonLabel}</button>
+        </form>
+      </body>
+    </html>
+  `;
+
+  return c.html(html);
+}
+
 const streamToArrayBuffer = async function (
   stream: ReadableStream,
   streamSize: number,
@@ -1565,6 +2419,77 @@ async function getSubscribers(
     .bind(newsletterId)
     .all();
   return results as { email: string }[];
+}
+
+async function markSubscriberUnsubscribed(
+  db: D1Database,
+  email: string,
+  newsletterId: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE Subscriber SET isSubscribed = 0 WHERE email = ? AND newsletter_id = ?`,
+    )
+    .bind(email, newsletterId)
+    .run();
+}
+
+function appendUnsubscribeFooterToHtml(
+  html: string,
+  unsubscribeUrl: string,
+): string {
+  const safeUrl = escapeHtml(unsubscribeUrl);
+  const footer = [
+    "<hr>",
+    "<p style=\"font-size: 12px; color: #555;\">",
+    "You are receiving this email because you subscribed to this newsletter. ",
+    `<a href="${safeUrl}">Unsubscribe</a>`,
+    "</p>",
+  ].join("");
+
+  if (/<\/body>/i.test(html)) {
+    return html.replace(/<\/body>/i, `${footer}</body>`);
+  }
+  return `${html}${footer}`;
+}
+
+function appendUnsubscribeFooterToText(
+  text: string,
+  unsubscribeUrl: string,
+): string {
+  const body = text.trimEnd();
+  const footer = `\n\n--\nYou are receiving this email because you subscribed to this newsletter.\nUnsubscribe: ${unsubscribeUrl}`;
+  return `${body}${footer}`;
+}
+
+function buildNewsletterListHeaders(
+  newsletterId: string,
+  recipientHash: string,
+  oneClickUrl: string,
+): EmailHeader[] {
+  return [
+    { name: "List-Unsubscribe", value: `<${oneClickUrl}>` },
+    {
+      name: "List-Unsubscribe-Post",
+      value: "List-Unsubscribe=One-Click",
+    },
+    {
+      name: "List-ID",
+      value: `LetterDrop Newsletter ${newsletterId} <${newsletterId}.newsletter.habengirma.com>`,
+    },
+    { name: "X-Newsletter-ID", value: newsletterId },
+    { name: "X-Recipient-Hash", value: recipientHash },
+  ];
+}
+
+function buildNewsletterEmailTags(
+  newsletterId: string,
+  recipientHash: string,
+): EmailTag[] {
+  return [
+    { name: "newsletterId", value: newsletterId },
+    { name: "recipientHash", value: recipientHash },
+  ];
 }
 
 async function getPublishSourceMessageKey(
@@ -1613,9 +2538,12 @@ async function publishNewsletter(
     };
   }
 
-  const fileName = `newsletters/${input.newsletterId}/${Date.now()}.html`;
+  const timestamp = Date.now();
+  const fileName = `newsletters/${input.newsletterId}/${timestamp}.html`;
+  const textFileName = `newsletters/${input.newsletterId}/${timestamp}.txt`;
 
   await env.R2.put(fileName, html);
+  await env.R2.put(textFileName, text);
 
   const subscribers = await getSubscribers(input.newsletterId, env.DB);
 
@@ -1625,6 +2553,7 @@ async function publishNewsletter(
       newsletterId: input.newsletterId,
       subject,
       fileName,
+      textFileName,
     });
   }
 
@@ -1639,6 +2568,7 @@ async function publishNewsletter(
     newsletterId: input.newsletterId,
     subject,
     fileName,
+    textFileName,
     queuedCount: subscribers.length,
     duplicate: false,
   };
@@ -1726,16 +2656,12 @@ export default {
     }
   },
   async queue(
-    batch: MessageBatch<{
-      email: string;
-      newsletterId: string;
-      subject: string;
-      fileName: string;
-    }>,
+    batch: MessageBatch<NewsletterQueueMessage>,
     env: Bindings,
   ): Promise<void> {
     for (const message of batch.messages) {
-      const { email, subject, newsletterId, fileName } = message.body;
+      const { email, subject, newsletterId, fileName, textFileName } =
+        message.body;
 
       console.log(`Sending email to ${email} for newsletter ${newsletterId}`);
 
@@ -1744,11 +2670,47 @@ export default {
         if (!object) throw new Error("Failed to get HTML content from R2");
 
         const htmlContent = await object.text();
+        const textObject = textFileName ? await env.R2.get(textFileName) : null;
+        const textContent = textObject ? await textObject.text() : "";
+        const unsubscribeToken = await createUnsubscribeToken(
+          env,
+          email,
+          newsletterId,
+        );
+        const origin = getPublicOrigin(env);
+        const oneClickUrl = `${origin}/api/subscribe/list-unsubscribe/${unsubscribeToken}`;
+        const visibleUnsubscribeUrl = `${origin}/api/subscribe/unsubscribe/${unsubscribeToken}`;
+        const recipientHash = await sha256Hex(`${newsletterId}:${email}`);
+        const deliverableHtml = appendUnsubscribeFooterToHtml(
+          htmlContent,
+          visibleUnsubscribeUrl,
+        );
+        const deliverableText = appendUnsubscribeFooterToText(
+          textContent,
+          visibleUnsubscribeUrl,
+        );
 
-        await sendEmail(env, email, subject, "", htmlContent);
-        console.log(`Email sent to ${email}`);
+        const messageId = await sendEmail(
+          env,
+          email,
+          subject,
+          deliverableText,
+          deliverableHtml,
+          {
+            headers: buildNewsletterListHeaders(
+              newsletterId,
+              recipientHash,
+              oneClickUrl,
+            ),
+            tags: buildNewsletterEmailTags(newsletterId, recipientHash),
+          },
+        );
+        console.log(
+          `Email sent to ${email}${messageId ? ` with SES message ${messageId}` : ""}`,
+        );
       } catch (error: unknown) {
         console.error(`Failed to send email to ${email}:`, error);
+        message.retry();
       }
     }
   },

@@ -14,7 +14,10 @@ cp wrangler.example.toml wrangler.toml
 ```bash
 npm install
 wrangler secret put ADMIN_API_TOKEN
+wrangler secret put NOTIFICATION_SHARED_SECRET
 wrangler secret put TURNSTILE_SECRET_KEY
+wrangler secret put UNSUBSCRIBE_SIGNING_SECRET
+wrangler secret put SES_SNS_WEBHOOK_TOKEN
 ```
 
 3. Run locally or deploy:
@@ -71,4 +74,18 @@ erDiagram
         string key_hash
         datetime createdAt
     }
+
+    SuppressionEvent {
+        string id PK
+        string email
+        string newsletter_id
+        string event_type
+        string provider_message_id
+        string provider_payload
+        datetime createdAt
+    }
 ```
+
+## Deliverability operations
+
+Set `PUBLIC_ORIGIN` in `wrangler.toml` to the production newsletter origin. Configure `NOTIFICATION_SHARED_SECRET` to match the notification worker's `SEND_EMAIL_SHARED_SECRET`. Before sending newsletters in production, enable SES Easy DKIM for `habengirma.com`, configure custom MAIL FROM at `bounce.habengirma.com`, publish DMARC at `_dmarc.habengirma.com`, create the `haben-letterdrop` SES configuration set, and subscribe SES bounce/complaint notifications to `/api/ses/sns/<SES_SNS_WEBHOOK_TOKEN>`.

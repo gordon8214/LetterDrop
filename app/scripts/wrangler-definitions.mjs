@@ -9,6 +9,7 @@ export const requiredBindings = [
   { key: 'binding = "NOTIFICATION"', label: 'Service binding (NOTIFICATION)' },
   { key: 'ALLOWED_EMAILS', label: 'Var: ALLOWED_EMAILS' },
   { key: 'PUBLISH_EMAIL_ADDRESS', label: 'Var: PUBLISH_EMAIL_ADDRESS' },
+  { key: 'PUBLIC_ORIGIN', label: 'Var: PUBLIC_ORIGIN' },
   { key: 'TURNSTILE_SITE_KEY', label: 'Var: TURNSTILE_SITE_KEY' },
   { key: '[[queues.consumers]]', label: 'Queue consumer' },
   { key: 'dead_letter_queue', label: 'Dead letter queue' },

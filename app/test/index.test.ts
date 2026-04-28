@@ -30,6 +30,15 @@ type AbuseEvent = {
   createdAt: string
 }
 
+type SuppressionEvent = {
+  email: string
+  newsletterId: string | null
+  eventType: string
+  providerMessageId: string | null
+  providerPayload: string
+  createdAt: string
+}
+
 class FakeKVNamespace {
   readonly store = new Map<string, string>()
 
@@ -76,6 +85,7 @@ class FakeD1Database {
   readonly newsletters = new Map<string, NewsletterRecord>()
   readonly subscribers = new Map<string, SubscriberRecord>()
   readonly abuseEvents: AbuseEvent[] = []
+  readonly suppressionEvents: SuppressionEvent[] = []
   readonly attemptedRateLimitBuckets: string[] = []
 
   private readonly denyBuckets: Set<string>
@@ -194,6 +204,18 @@ class FakeD1Database {
       return { meta: { changes: 1 } }
     }
 
+    if (normalized.includes('insert into suppressionevent')) {
+      this.suppressionEvents.push({
+        email: String(params[1] ?? ''),
+        newsletterId: params[2] === null ? null : String(params[2] ?? ''),
+        eventType: String(params[3] ?? ''),
+        providerMessageId: params[4] === null ? null : String(params[4] ?? ''),
+        providerPayload: String(params[5] ?? ''),
+        createdAt: String(params[6] ?? ''),
+      })
+      return { meta: { changes: 1 } }
+    }
+
     if (normalized.includes('delete from abuseevent where createdat < ?')) {
       if (this.missingAbuseEventTable) {
         throw new Error('D1_ERROR: no such table: AbuseEvent')
@@ -224,12 +246,24 @@ function createEnv(options: FakeDatabaseOptions = {}) {
 
   const kv = new FakeKVNamespace()
   const notificationFetch = vi.fn(async () => (
-    new Response(JSON.stringify({ message: 'success' }), {
+    new Response(JSON.stringify({ message: 'success', messageId: 'ses-message-id' }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     })
   ))
-  const r2Put = vi.fn()
+  const r2Objects = new Map<string, string>()
+  const r2Put = vi.fn(async (key: string, value: string) => {
+    r2Objects.set(key, value)
+  })
+  const r2Get = vi.fn(async (key: string) => {
+    const value = r2Objects.get(key)
+    if (value === undefined) {
+      return null
+    }
+    return {
+      text: async () => value,
+    }
+  })
   const queueSend = vi.fn()
 
   const env = {
@@ -238,20 +272,25 @@ function createEnv(options: FakeDatabaseOptions = {}) {
     KV: kv as unknown as KVNamespace,
     R2: {
       put: r2Put,
-      get: vi.fn(),
+      get: r2Get,
       list: vi.fn(async () => ({ objects: [], truncated: false })),
       delete: vi.fn(),
     } as unknown as R2Bucket,
     QUEUE: { send: queueSend } as unknown as Queue,
     ALLOWED_EMAILS: 'sender@example.com',
     PUBLISH_EMAIL_ADDRESS: 'publish@example.com',
+    NOTIFICATION_SHARED_SECRET: 'notification-secret',
+    PUBLIC_ORIGIN: 'https://newsletter.example.com',
     PUBLISH_BRIDGE_TOKEN: 'bridge-token',
     ADMIN_API_TOKEN: 'admin-token',
     TURNSTILE_SECRET_KEY: 'turnstile-secret',
     TURNSTILE_SITE_KEY: 'turnstile-site-key',
+    UNSUBSCRIBE_SIGNING_SECRET: 'unsubscribe-secret',
+    SES_SNS_WEBHOOK_TOKEN: 'ses-webhook-token',
+    SES_SNS_TOPIC_ARN: 'arn:aws:sns:us-west-1:123456789012:letterdrop',
   }
 
-  return { env, db, kv, notificationFetch, r2Put, queueSend }
+  return { env, db, kv, notificationFetch, r2Put, r2Get, queueSend }
 }
 
 async function postJson(
@@ -342,6 +381,123 @@ function createTextOnlyRawEmailStream(subject: string, messageId: string) {
       },
     }),
   }
+}
+
+function createQueueBatch(body: Record<string, unknown>) {
+  const message = {
+    id: 'queue-message-id',
+    timestamp: new Date(),
+    body,
+    attempts: 1,
+    retry: vi.fn(),
+    ack: vi.fn(),
+  }
+
+  return {
+    batch: {
+      messages: [message],
+      queue: 'letterdrop-test',
+      metadata: { metrics: { backlogCount: 1, backlogBytes: 1 } },
+      retryAll: vi.fn(),
+      ackAll: vi.fn(),
+    } as unknown as MessageBatch<Record<string, unknown>>,
+    message,
+  }
+}
+
+async function getNotificationRequestBody(notificationFetch: ReturnType<typeof vi.fn>) {
+  const request = notificationFetch.mock.calls.at(-1)?.[0] as Request
+  return request.json() as Promise<Record<string, unknown>>
+}
+
+function extractUnsubscribeToken(sendBody: Record<string, unknown>): string {
+  const headers = sendBody.headers as Array<{ name: string; value: string }>
+  const header = headers.find((entry) => entry.name === 'List-Unsubscribe')
+  const match = header?.value.match(/list-unsubscribe\/([^>]+)>$/)
+  if (!match) {
+    throw new Error('List-Unsubscribe header missing token')
+  }
+  return match[1]
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte)
+  }
+  return btoa(binary)
+}
+
+function pemFromDer(label: string, der: Uint8Array): string {
+  const base64 = bytesToBase64(der)
+  const lines = base64.match(/.{1,64}/g) ?? []
+  return `-----BEGIN ${label}-----\n${lines.join('\n')}\n-----END ${label}-----`
+}
+
+function buildTestSnsStringToSign(envelope: Record<string, unknown>): string {
+  const type = envelope.Type
+  const fields = type === 'Notification'
+    ? ['Message', 'MessageId', 'Subject', 'Timestamp', 'TopicArn', 'Type']
+    : ['Message', 'MessageId', 'SubscribeURL', 'Timestamp', 'Token', 'TopicArn', 'Type']
+  return fields
+    .filter((field) => field !== 'Subject' || typeof envelope.Subject === 'string')
+    .map((field) => `${field}\n${String(envelope[field])}`)
+    .join('\n')
+}
+
+async function createSnsSigner() {
+  const certUrl = 'https://sns.us-west-1.amazonaws.com/SimpleNotificationService-test.pem'
+  const subscribeUrl = [
+    'https://sns.us-west-1.amazonaws.com/',
+    '?Action=ConfirmSubscription',
+    `&TopicArn=${encodeURIComponent('arn:aws:sns:us-west-1:123456789012:letterdrop')}`,
+    '&Token=confirmation-token',
+  ].join('')
+  const keyPair = await crypto.subtle.generateKey(
+    {
+      name: 'RSASSA-PKCS1-v1_5',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256',
+    },
+    true,
+    ['sign', 'verify']
+  ) as CryptoKeyPair
+  const publicKeyDer = new Uint8Array(
+    await crypto.subtle.exportKey('spki', keyPair.publicKey)
+  )
+  const publicKeyPem = pemFromDer('PUBLIC KEY', publicKeyDer)
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = input instanceof Request ? input.url : String(input)
+    if (url === certUrl) {
+      return new Response(publicKeyPem)
+    }
+    if (url === subscribeUrl) {
+      return new Response('<ConfirmSubscriptionResponse />', { status: 200 })
+    }
+    return new Response('not found', { status: 404 })
+  })
+
+  async function signEnvelope(base: Record<string, unknown>) {
+    const envelope = {
+      MessageId: 'sns-message-id',
+      Timestamp: '2026-04-28T18:30:00.000Z',
+      SignatureVersion: '2',
+      SigningCertURL: certUrl,
+      ...base,
+    }
+    const signature = await crypto.subtle.sign(
+      'RSASSA-PKCS1-v1_5',
+      keyPair.privateKey,
+      new TextEncoder().encode(buildTestSnsStringToSign(envelope))
+    )
+    return {
+      ...envelope,
+      Signature: bytesToBase64(new Uint8Array(signature)),
+    }
+  }
+
+  return { fetchSpy, signEnvelope, subscribeUrl }
 }
 
 describe('admin auth middleware', () => {
@@ -543,14 +699,19 @@ describe('direct newsletter publish endpoint', () => {
       fileName: expect.stringMatching(
         new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.html$`)
       ),
+      textFileName: expect.stringMatching(
+        new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.txt$`)
+      ),
     }))
     expect(r2Put).toHaveBeenCalledWith(result.fileName, publishPayload.html)
+    expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
     expect(queueSend).toHaveBeenCalledWith({
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
       fileName: result.fileName,
+      textFileName: result.textFileName,
     })
   })
 
@@ -585,7 +746,7 @@ describe('direct newsletter publish endpoint', () => {
       queuedCount: 0,
       duplicate: true,
     })
-    expect(r2Put).toHaveBeenCalledTimes(1)
+    expect(r2Put).toHaveBeenCalledTimes(2)
     expect(queueSend).toHaveBeenCalledTimes(1)
   })
 
@@ -635,13 +796,14 @@ describe('direct newsletter publish endpoint', () => {
       queuedCount: 1,
       duplicate: false,
     }))
-    expect(r2Put).toHaveBeenCalledTimes(2)
+    expect(r2Put).toHaveBeenCalledTimes(4)
     expect(queueSend).toHaveBeenCalledTimes(2)
     expect(queueSend).toHaveBeenLastCalledWith({
       email: 'second@example.com',
       newsletterId: SECOND_NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
       fileName: secondResult.fileName,
+      textFileName: secondResult.textFileName,
     })
   })
 
@@ -788,14 +950,19 @@ describe('Google Workspace publish bridge', () => {
       fileName: expect.stringMatching(
         new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.html$`)
       ),
+      textFileName: expect.stringMatching(
+        new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.txt$`)
+      ),
     }))
     expect(r2Put).toHaveBeenCalledWith(result.fileName, publishPayload.html)
+    expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
     expect(queueSend).toHaveBeenCalledWith({
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
       subject: 'Bridge title: spaces & symbols',
       fileName: result.fileName,
+      textFileName: result.textFileName,
     })
   })
 
@@ -914,11 +1081,18 @@ describe('Cloudflare Email Worker publish path', () => {
       expect.stringMatching(new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.html$`))
     )
     expect(String(html).trim()).toBe('<h1>Hello subscribers</h1>')
+    const textFileName = r2Put.mock.calls[1][0]
+    const text = r2Put.mock.calls[1][1]
+    expect(textFileName).toEqual(
+      expect.stringMatching(new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.txt$`))
+    )
+    expect(String(text).trim()).toBe('Hello subscribers')
     expect(queueSend).toHaveBeenCalledWith({
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
       subject: 'Email worker title',
       fileName,
+      textFileName,
     })
   })
 
@@ -948,6 +1122,312 @@ describe('Cloudflare Email Worker publish path', () => {
     expect(setReject).not.toHaveBeenCalled()
     expect(r2Put).not.toHaveBeenCalled()
     expect(queueSend).not.toHaveBeenCalled()
+  })
+})
+
+describe('newsletter queue delivery', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('sends newsletter mail with text content, unsubscribe headers, footer, and SES tags', async () => {
+    const { env, notificationFetch } = createEnv()
+    const fileName = `newsletters/${NEWSLETTER_ID}/1.html`
+    const textFileName = `newsletters/${NEWSLETTER_ID}/1.txt`
+    await env.R2.put(fileName, '<html><body><h1>Hello</h1></body></html>')
+    await env.R2.put(textFileName, 'Plain text body')
+    const { batch, message } = createQueueBatch({
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      subject: 'Deliverability test',
+      fileName,
+      textFileName,
+    })
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).not.toHaveBeenCalled()
+    expect(notificationFetch).toHaveBeenCalledTimes(1)
+    const request = notificationFetch.mock.calls[0][0] as Request
+    expect(request.headers.get('X-LetterDrop-Notification-Token')).toBe('notification-secret')
+    const body = await getNotificationRequestBody(notificationFetch)
+    expect(body.mail_to).toBe('first@example.com')
+    expect(body.subject).toBe('Deliverability test')
+    expect(String(body.txt)).toContain('Plain text body')
+    expect(String(body.txt)).toContain('Unsubscribe: https://newsletter.example.com/api/subscribe/unsubscribe/')
+    expect(String(body.html)).toContain('https://newsletter.example.com/api/subscribe/unsubscribe/')
+    expect(body.headers).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'List-Unsubscribe-Post',
+        value: 'List-Unsubscribe=One-Click',
+      }),
+      expect.objectContaining({ name: 'X-Newsletter-ID', value: NEWSLETTER_ID }),
+      expect.objectContaining({ name: 'X-Recipient-Hash' }),
+    ]))
+    expect(body.tags).toEqual(expect.arrayContaining([
+      { name: 'newsletterId', value: NEWSLETTER_ID },
+      expect.objectContaining({ name: 'recipientHash' }),
+    ]))
+  })
+
+  it('keeps old queued messages deliverable when no text object is present', async () => {
+    const { env, notificationFetch } = createEnv()
+    const fileName = `newsletters/${NEWSLETTER_ID}/legacy.html`
+    await env.R2.put(fileName, '<h1>Legacy</h1>')
+    const { batch, message } = createQueueBatch({
+      email: 'legacy@example.com',
+      newsletterId: NEWSLETTER_ID,
+      subject: 'Legacy message',
+      fileName,
+    })
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).not.toHaveBeenCalled()
+    const body = await getNotificationRequestBody(notificationFetch)
+    expect(String(body.txt)).toContain('Unsubscribe: https://newsletter.example.com/api/subscribe/unsubscribe/')
+    expect(String(body.html)).toContain('<h1>Legacy</h1>')
+  })
+})
+
+describe('stateless newsletter unsubscribe links', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function sendQueuedNewsletterAndExtractToken() {
+    const { env, db, notificationFetch } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const fileName = `newsletters/${NEWSLETTER_ID}/unsubscribe.html`
+    const textFileName = `newsletters/${NEWSLETTER_ID}/unsubscribe.txt`
+    await env.R2.put(fileName, '<p>Body</p>')
+    await env.R2.put(textFileName, 'Body')
+    const { batch } = createQueueBatch({
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      subject: 'Unsubscribe test',
+      fileName,
+      textFileName,
+    })
+
+    await worker.queue(batch, env)
+    const sendBody = await getNotificationRequestBody(notificationFetch)
+    return { env, db, token: extractUnsubscribeToken(sendBody) }
+  }
+
+  it('supports RFC 8058 one-click POST unsubscribe', async () => {
+    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+
+    const response = await postJson(env, `/api/subscribe/list-unsubscribe/${token}`, {})
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'Unsubscribed successfully',
+    })
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+  })
+
+  it('rejects tampered unsubscribe tokens without changing subscriber state', async () => {
+    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+    const tamperedToken = `${token.slice(0, -1)}x`
+
+    const response = await postJson(env, `/api/subscribe/list-unsubscribe/${tamperedToken}`, {})
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Invalid unsubscribe token',
+    })
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(1)
+  })
+
+  it('renders visible GET unsubscribe confirmation without unsubscribing', async () => {
+    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+
+    const response = await app.request(
+      `https://example.com/api/subscribe/unsubscribe/${token}`,
+      {},
+      env
+    )
+
+    expect(response.status).toBe(200)
+    await expect(response.text()).resolves.toContain('Confirm unsubscribe')
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(1)
+  })
+
+  it('supports visible POST unsubscribe confirmation', async () => {
+    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+
+    const response = await postJson(env, `/api/subscribe/unsubscribe/${token}`, {})
+
+    expect(response.status).toBe(200)
+    await expect(response.text()).resolves.toContain('Unsubscribed successfully')
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+  })
+})
+
+describe('SES SNS suppression webhook', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('records permanent bounces and unsubscribes matching newsletter subscribers', async () => {
+    const { env, db } = createEnv()
+    const { signEnvelope } = await createSnsSigner()
+    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        notificationType: 'Bounce',
+        mail: {
+          messageId: 'ses-message-id',
+          tags: { newsletterId: [NEWSLETTER_ID], recipientHash: ['hash'] },
+        },
+        bounce: {
+          bounceType: 'Permanent',
+          bouncedRecipients: [{ emailAddress: SUBSCRIBER_EMAIL }],
+        },
+      }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'SES notification processed',
+      recordedCount: 1,
+      unsubscribedCount: 1,
+    })
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+    expect(db.suppressionEvents[0]).toEqual(expect.objectContaining({
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      eventType: 'bounce:Permanent',
+      providerMessageId: 'ses-message-id',
+    }))
+  })
+
+  it('records transient bounces without unsubscribing', async () => {
+    const { env, db } = createEnv()
+    const { signEnvelope } = await createSnsSigner()
+    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        notificationType: 'Bounce',
+        mail: {
+          messageId: 'transient-message-id',
+          tags: { newsletterId: [NEWSLETTER_ID] },
+        },
+        bounce: {
+          bounceType: 'Transient',
+          bouncedRecipients: [{ emailAddress: SUBSCRIBER_EMAIL }],
+        },
+      }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'SES notification processed',
+      recordedCount: 1,
+      unsubscribedCount: 0,
+    })
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(1)
+    expect(db.suppressionEvents[0].eventType).toBe('bounce:Transient')
+  })
+
+  it('records complaints and unsubscribes matching newsletter subscribers', async () => {
+    const { env, db } = createEnv()
+    const { signEnvelope } = await createSnsSigner()
+    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        notificationType: 'Complaint',
+        mail: {
+          messageId: 'complaint-message-id',
+          tags: { newsletterId: [NEWSLETTER_ID] },
+        },
+        complaint: {
+          complainedRecipients: [{ emailAddress: SUBSCRIBER_EMAIL }],
+        },
+      }),
+    }))
+
+    expect(response.status).toBe(200)
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+    expect(db.suppressionEvents[0].eventType).toBe('complaint')
+  })
+
+  it('rejects SNS notifications without a valid signature', async () => {
+    const { env, db } = createEnv()
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', {
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        notificationType: 'Complaint',
+        mail: {
+          messageId: 'forged-message-id',
+          tags: { newsletterId: [NEWSLETTER_ID] },
+        },
+        complaint: {
+          complainedRecipients: [{ emailAddress: SUBSCRIBER_EMAIL }],
+        },
+      }),
+    })
+
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Invalid SNS signature',
+    })
+    expect(db.suppressionEvents).toEqual([])
+  })
+
+  it('confirms signed SNS subscriptions by fetching SubscribeURL', async () => {
+    const { env } = createEnv()
+    const { fetchSpy, signEnvelope, subscribeUrl } = await createSnsSigner()
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'SubscriptionConfirmation',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Token: 'confirmation-token',
+      SubscribeURL: subscribeUrl,
+      Message: 'Confirm the subscription',
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'SNS subscription confirmed',
+    })
+    expect(fetchSpy).toHaveBeenCalledWith(subscribeUrl, { method: 'GET' })
   })
 })
 

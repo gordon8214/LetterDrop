@@ -5,7 +5,13 @@ import { execFile as execFileCallback } from 'node:child_process'
 
 const execFile = promisify(execFileCallback)
 const wranglerBin = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-const requiredSecrets = ['ADMIN_API_TOKEN', 'TURNSTILE_SECRET_KEY']
+const requiredSecrets = [
+  'ADMIN_API_TOKEN',
+  'NOTIFICATION_SHARED_SECRET',
+  'TURNSTILE_SECRET_KEY',
+  'UNSUBSCRIBE_SIGNING_SECRET',
+  'SES_SNS_WEBHOOK_TOKEN',
+]
 
 function parseArgs(argv) {
   const args = { env: process.env.WRANGLER_ENV ?? '', database: process.env.D1_DATABASE_NAME ?? '' }
@@ -107,6 +113,17 @@ async function checkMigrations(databaseName, envName) {
   if (abuseEventTables.length === 0) {
     throw new Error(
       'Missing AbuseEvent table. Apply db/20260223_add_abuse_event_table.sql before deploy.'
+    )
+  }
+
+  const suppressionEventTables = await queryD1(
+    databaseName,
+    envName,
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='SuppressionEvent'"
+  )
+  if (suppressionEventTables.length === 0) {
+    throw new Error(
+      'Missing SuppressionEvent table. Apply db/20260428_add_suppression_event_table.sql before deploy.'
     )
   }
 

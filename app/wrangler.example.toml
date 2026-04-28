@@ -6,7 +6,10 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 ALLOWED_EMAILS = "replace-with-allowed-emails"
 PUBLISH_EMAIL_ADDRESS = "replace-with-publish-email-address"
+PUBLIC_ORIGIN = "https://newsletter.example.com"
 TURNSTILE_SITE_KEY = "replace-with-turnstile-site-key"
+# Optional: set to the SES/SNS topic ARN to reject webhook posts from any other topic.
+# SES_SNS_TOPIC_ARN = "arn:aws:sns:us-west-1:123456789012:letterdrop"
 
 [[services]]
 binding = "NOTIFICATION"

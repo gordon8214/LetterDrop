@@ -120,13 +120,18 @@ cp app/wrangler.example.toml app/wrangler.toml
 
 - `ALLOWED_EMAILS`: Comma-separated sender allowlist for the email worker.
 - `PUBLISH_EMAIL_ADDRESS`: Email address that receives newsletter drafts. This can be a Cloudflare Email Routing address or a Google Workspace mailbox/alias used by the bridge.
+- `PUBLIC_ORIGIN`: Public origin for subscription and unsubscribe links, for example `https://newsletter.habengirma.com`.
 - `TURNSTILE_SITE_KEY`: Public site key for Cloudflare Turnstile.
+- `SES_SNS_TOPIC_ARN`: Optional SES/SNS topic ARN. If set, the SES webhook rejects notifications from any other topic.
 
 ### Secrets
 
 - `ADMIN_API_TOKEN`: Required bearer token for all `/api/newsletter*` admin APIs.
+- `NOTIFICATION_SHARED_SECRET`: Shared secret sent to the notification service in `X-LetterDrop-Notification-Token`.
 - `PUBLISH_BRIDGE_TOKEN`: Required bearer token for `/api/publish/google-workspace` only.
 - `TURNSTILE_SECRET_KEY`: Secret key used to verify Turnstile tokens server-side.
+- `UNSUBSCRIBE_SIGNING_SECRET`: HMAC secret used for stateless one-click unsubscribe links.
+- `SES_SNS_WEBHOOK_TOKEN`: Shared secret embedded in the SES/SNS webhook URL.
 
 ### Deploy safety checks
 
@@ -139,9 +144,21 @@ cp app/wrangler.example.toml app/wrangler.toml
 
 Currently LetterDrop uses [AWS SES](https://aws.amazon.com/ses/) to send emails. You need to create an AWS account and configure SES to send emails. After that, you need to create a Cloudflare Worker as a notification service. The code is very simple, you can use the ChatGPT to generate the code.
 
+For compliant newsletter delivery, configure SES and DNS before production sending:
+
+- Enable Easy DKIM for the `habengirma.com` SES identity in `us-west-1`.
+- Configure custom MAIL FROM as `bounce.habengirma.com`.
+- Add DNS records:
+  - `bounce.habengirma.com MX 10 feedback-smtp.us-west-1.amazonses.com`
+  - `bounce.habengirma.com TXT "v=spf1 include:amazonses.com ~all"`
+  - `_dmarc.habengirma.com TXT "v=DMARC1; p=none; rua=mailto:dmarc@habengirma.com; adkim=r; aspf=r"`
+- Ensure `dmarc@habengirma.com` is monitored or routed.
+- Create an SES configuration set named `haben-letterdrop`; publish bounce and complaint events to SNS and subscribe the LetterDrop webhook at `/api/ses/sns/<SES_SNS_WEBHOOK_TOKEN>`.
+- Configure the notification worker with `workers_dev = false` and the same shared send secret as `SEND_EMAIL_SHARED_SECRET`.
+
 ### How to handle the failed emails?
 
-LetterDrop uses the Cloudflare Queues to handle the failed emails. You can use the Cloudflare dashboard to monitor the failed emails and replay them in the dead-letter queue.
+LetterDrop uses Cloudflare Queues for delivery retries and a `SuppressionEvent` D1 table for SES bounce/complaint audit records. Permanent bounces and complaints from SES unsubscribe the affected subscriber for the tagged newsletter.
 
 ## What is the next step?
 

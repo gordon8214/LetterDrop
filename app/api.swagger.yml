@@ -343,6 +343,84 @@ paths:
         '500':
           description: Server error
 
+  /api/subscribe/list-unsubscribe/{token}:
+    post:
+      summary: One-click unsubscribe
+      description: RFC 8058 one-click unsubscribe endpoint used by mailbox providers.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: Unsubscribed successfully
+        '400':
+          description: Invalid unsubscribe token
+        '503':
+          description: Unsubscribe signing is not configured
+        '500':
+          description: Server error
+
+  /api/subscribe/unsubscribe/{token}:
+    get:
+      summary: Visible unsubscribe confirmation
+      description: Human-facing unsubscribe link included in newsletter footers. Renders a confirmation page without changing subscriber state.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: Confirmation page rendered
+        '400':
+          description: Invalid unsubscribe token
+        '503':
+          description: Unsubscribe signing is not configured
+        '500':
+          description: Server error
+    post:
+      summary: Visible unsubscribe
+      description: Form-compatible unsubscribe endpoint that changes subscriber state after the user confirms.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: Unsubscribed successfully
+        '400':
+          description: Invalid unsubscribe token
+        '503':
+          description: Unsubscribe signing is not configured
+        '500':
+          description: Server error
+
+  /api/ses/sns/{token}:
+    post:
+      summary: SES SNS webhook
+      description: Receives signed SES bounce, complaint, and subscription confirmation notifications from SNS.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          type: string
+      responses:
+        '200':
+          description: SES notification processed
+        '400':
+          description: Invalid SNS payload
+        '401':
+          description: Invalid webhook token
+        '403':
+          description: Unexpected SNS topic
+        '503':
+          description: SES webhook token is not configured
+        '500':
+          description: Server error
+
   /api/subscribe/send-confirmation:
     post:
       summary: Send confirmation email
@@ -590,6 +668,8 @@ definitions:
       subject:
         type: string
       fileName:
+        type: string
+      textFileName:
         type: string
       queuedCount:
         type: integer
