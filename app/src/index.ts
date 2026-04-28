@@ -889,7 +889,7 @@ function buildSnsStringToSign(envelope: SesSnsEnvelope): string | null {
     }
     pairs.push(`${field}\n${value}`);
   }
-  return pairs.join("\n");
+  return `${pairs.join("\n")}\n`;
 }
 
 async function verifySnsEnvelopeSignature(

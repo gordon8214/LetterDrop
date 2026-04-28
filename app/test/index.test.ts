@@ -755,7 +755,7 @@ function buildTestSnsStringToSign(envelope: Record<string, unknown>): string {
   return fields
     .filter((field) => field !== 'Subject' || typeof envelope.Subject === 'string')
     .map((field) => `${field}\n${String(envelope[field])}`)
-    .join('\n')
+    .join('\n') + '\n'
 }
 
 async function createSnsSigner() {
