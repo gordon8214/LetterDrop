@@ -5,6 +5,12 @@ const NEWSLETTER_ID = '11111111-1111-4111-8111-111111111111'
 const MISSING_NEWSLETTER_ID = '22222222-2222-4222-8222-222222222222'
 const SECOND_NEWSLETTER_ID = '33333333-3333-4333-8333-333333333333'
 const SUBSCRIBER_EMAIL = 'user@example.com'
+const TRACKED_PUBLISH_PAYLOAD = {
+  subject: 'Tracked title',
+  html: '<p>Hello tracked subscribers</p>',
+  text: 'Hello tracked subscribers',
+  sourceMessageId: 'tracked-source-message',
+}
 
 type NewsletterRecord = {
   id: string
@@ -22,6 +28,7 @@ type SubscriberRecord = {
 type FakeDatabaseOptions = {
   denyBuckets?: string[]
   missingAbuseEventTable?: boolean
+  failRecipientStatusUpdates?: string[]
 }
 
 type AbuseEvent = {
@@ -36,6 +43,67 @@ type SuppressionEvent = {
   eventType: string
   providerMessageId: string | null
   providerPayload: string
+  createdAt: string
+}
+
+type NewsletterSendRecord = {
+  id: string
+  newsletterId: string
+  subject: string
+  sourceMessageId: string | null
+  status: string
+  recipientCount: number
+  queuedCount: number
+  queueFailedCount: number
+  providerAcceptedCount: number
+  deliveredCount: number
+  deliveryDelayedCount: number
+  bouncedCount: number
+  complainedCount: number
+  failedCount: number
+  deadLetteredCount: number
+  lastError: string | null
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
+}
+
+type NewsletterSendRecipientRecord = {
+  id: string
+  sendId: string
+  newsletterId: string
+  email: string
+  recipientHash: string
+  status: string
+  attempts: number
+  failureType: string | null
+  providerMessageId: string | null
+  lastError: string | null
+  queuedAt: string | null
+  sendingAt: string | null
+  providerAcceptedAt: string | null
+  deliveryDelayedAt: string | null
+  deliveredAt: string | null
+  bouncedAt: string | null
+  complainedAt: string | null
+  failedAt: string | null
+  deadLetteredAt: string | null
+  updatedAt: string
+}
+
+type NewsletterSendEventRecord = {
+  id: number
+  sendId: string
+  newsletterId: string
+  recipientId: string | null
+  recipientHash: string | null
+  email: string | null
+  eventType: string
+  recipientStatus: string | null
+  sendStatus: string | null
+  message: string | null
+  providerMessageId: string | null
+  providerPayload: string | null
   createdAt: string
 }
 
@@ -86,14 +154,20 @@ class FakeD1Database {
   readonly subscribers = new Map<string, SubscriberRecord>()
   readonly abuseEvents: AbuseEvent[] = []
   readonly suppressionEvents: SuppressionEvent[] = []
+  readonly newsletterSends = new Map<string, NewsletterSendRecord>()
+  readonly newsletterSendRecipients = new Map<string, NewsletterSendRecipientRecord>()
+  readonly newsletterSendEvents: NewsletterSendEventRecord[] = []
   readonly attemptedRateLimitBuckets: string[] = []
 
   private readonly denyBuckets: Set<string>
   private readonly missingAbuseEventTable: boolean
+  private readonly failRecipientStatusUpdates: Set<string>
+  private nextNewsletterSendEventId = 1
 
   constructor(options: FakeDatabaseOptions = {}) {
     this.denyBuckets = new Set(options.denyBuckets ?? [])
     this.missingAbuseEventTable = options.missingAbuseEventTable ?? false
+    this.failRecipientStatusUpdates = new Set(options.failRecipientStatusUpdates ?? [])
   }
 
   prepare(sql: string): FakeD1PreparedStatement {
@@ -117,6 +191,44 @@ class FakeD1Database {
       return (newsletter ? { id: newsletter.id } : null) as T | null
     }
 
+    if (normalized.includes('from newslettersendrecipient') && normalized.includes('count(*) as recipientcount')) {
+      const sendId = String(params[0] ?? '')
+      const recipients = Array.from(this.newsletterSendRecipients.values())
+        .filter((recipient) => recipient.sendId === sendId)
+      const countStatus = (status: string) => recipients.filter((recipient) => recipient.status === status).length
+      return ({
+        recipientCount: recipients.length,
+        queuedCount: countStatus('queued'),
+        queueFailedCount: recipients.filter((recipient) => recipient.status === 'failed' && recipient.failureType === 'queue').length,
+        providerAcceptedCount: countStatus('providerAccepted'),
+        deliveredCount: countStatus('delivered'),
+        deliveryDelayedCount: countStatus('deliveryDelayed'),
+        bouncedCount: countStatus('bounced'),
+        complainedCount: countStatus('complained'),
+        failedCount: recipients.filter((recipient) => recipient.status === 'failed' && recipient.failureType !== 'queue').length,
+        deadLetteredCount: countStatus('deadLettered'),
+        activeCount: recipients.filter((recipient) =>
+          ['queued', 'sending', 'providerAccepted', 'deliveryDelayed', 'retrying'].includes(recipient.status)
+        ).length,
+      } as T)
+    }
+
+    if (normalized.includes('from newslettersendrecipient') && normalized.includes('where send_id = ? and recipient_hash = ?')) {
+      const sendId = String(params[0] ?? '')
+      const recipientHash = String(params[1] ?? '')
+      return (this.newsletterSendRecipients.get(`${sendId}:${recipientHash}`) ?? null) as T | null
+    }
+
+    if (normalized.includes('from newslettersendevent') && normalized.includes('where id = ?')) {
+      const id = Number(params[0] ?? 0)
+      return (this.newsletterSendEvents.find((event) => event.id === id) ?? null) as T | null
+    }
+
+    if (normalized.includes('from newslettersend') && normalized.includes('where id = ?')) {
+      const sendId = String(params[0] ?? '')
+      return (this.newsletterSends.get(sendId) ?? null) as T | null
+    }
+
     return null
   }
 
@@ -132,6 +244,33 @@ class FakeD1Database {
         ))
         .map((subscriber) => ({ email: subscriber.email }))
       return { results: subscribers as T[] }
+    }
+
+    if (normalized.includes('from newslettersendrecipient') && normalized.includes('where send_id = ?')) {
+      const sendId = String(params[0] ?? '')
+      const recipients = Array.from(this.newsletterSendRecipients.values())
+        .filter((recipient) => recipient.sendId === sendId)
+        .sort((a, b) => a.email.localeCompare(b.email))
+      return { results: recipients as T[] }
+    }
+
+    if (normalized.includes('from newslettersendevent') && normalized.includes('where send_id = ? and id > ?')) {
+      const sendId = String(params[0] ?? '')
+      const afterId = Number(params[1] ?? 0)
+      const limit = Number(params[2] ?? Number.MAX_SAFE_INTEGER)
+      const events = this.newsletterSendEvents
+        .filter((event) => event.sendId === sendId && event.id > afterId)
+        .sort((a, b) => a.id - b.id)
+        .slice(0, limit)
+      return { results: events as T[] }
+    }
+
+    if (normalized.includes('from newslettersend') && normalized.includes('where newsletter_id = ?')) {
+      const newsletterId = String(params[0] ?? '')
+      const sends = Array.from(this.newsletterSends.values())
+        .filter((send) => send.newsletterId === newsletterId)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      return { results: sends as T[] }
     }
 
     return { results: [] }
@@ -216,6 +355,158 @@ class FakeD1Database {
       return { meta: { changes: 1 } }
     }
 
+    if (normalized.includes('insert into newslettersendrecipient')) {
+      const recipient: NewsletterSendRecipientRecord = {
+        id: String(params[0] ?? ''),
+        sendId: String(params[1] ?? ''),
+        newsletterId: String(params[2] ?? ''),
+        email: String(params[3] ?? ''),
+        recipientHash: String(params[4] ?? ''),
+        status: String(params[5] ?? ''),
+        attempts: 0,
+        failureType: null,
+        providerMessageId: null,
+        lastError: null,
+        queuedAt: String(params[6] ?? ''),
+        sendingAt: null,
+        providerAcceptedAt: null,
+        deliveryDelayedAt: null,
+        deliveredAt: null,
+        bouncedAt: null,
+        complainedAt: null,
+        failedAt: null,
+        deadLetteredAt: null,
+        updatedAt: String(params[7] ?? ''),
+      }
+      this.newsletterSendRecipients.set(`${recipient.sendId}:${recipient.recipientHash}`, recipient)
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('insert into newslettersendevent')) {
+      const event: NewsletterSendEventRecord = {
+        id: this.nextNewsletterSendEventId,
+        sendId: String(params[0] ?? ''),
+        newsletterId: String(params[1] ?? ''),
+        recipientId: params[2] === null ? null : String(params[2] ?? ''),
+        recipientHash: params[3] === null ? null : String(params[3] ?? ''),
+        email: params[4] === null ? null : String(params[4] ?? ''),
+        eventType: String(params[5] ?? ''),
+        recipientStatus: params[6] === null ? null : String(params[6] ?? ''),
+        sendStatus: params[7] === null ? null : String(params[7] ?? ''),
+        message: params[8] === null ? null : String(params[8] ?? ''),
+        providerMessageId: params[9] === null ? null : String(params[9] ?? ''),
+        providerPayload: params[10] === null ? null : String(params[10] ?? ''),
+        createdAt: String(params[11] ?? ''),
+      }
+      this.nextNewsletterSendEventId += 1
+      this.newsletterSendEvents.push(event)
+      return { meta: { changes: 1, last_row_id: event.id } as { changes: number; last_row_id: number } }
+    }
+
+    if (normalized.includes('insert into newslettersend')) {
+      const send: NewsletterSendRecord = {
+        id: String(params[0] ?? ''),
+        newsletterId: String(params[1] ?? ''),
+        subject: String(params[2] ?? ''),
+        sourceMessageId: params[3] === null ? null : String(params[3] ?? ''),
+        status: String(params[4] ?? ''),
+        recipientCount: Number(params[5] ?? 0),
+        queuedCount: 0,
+        queueFailedCount: 0,
+        providerAcceptedCount: 0,
+        deliveredCount: 0,
+        deliveryDelayedCount: 0,
+        bouncedCount: 0,
+        complainedCount: 0,
+        failedCount: 0,
+        deadLetteredCount: 0,
+        lastError: null,
+        createdAt: String(params[6] ?? ''),
+        updatedAt: String(params[7] ?? ''),
+        completedAt: null,
+      }
+      this.newsletterSends.set(send.id, send)
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('update newslettersendrecipient')) {
+      let index = 0
+      const status = String(params[index++] ?? '')
+      if (this.failRecipientStatusUpdates.has(status)) {
+        throw new Error(`Simulated status update failure: ${status}`)
+      }
+      const attempts = Number(params[index++] ?? 0)
+      const providerMessageId = params[index] === null ? null : String(params[index] ?? '')
+      index += 1
+      const lastError = params[index] === null ? null : String(params[index] ?? '')
+      index += 1
+      const failureType = params[index] === null ? null : String(params[index] ?? '')
+      index += 1
+      let timestamp: string | null = null
+      const timestampColumns = [
+        'queuedat = ?',
+        'sendingat = ?',
+        'provideracceptedat = ?',
+        'deliverydelayedat = ?',
+        'deliveredat = ?',
+        'bouncedat = ?',
+        'complainedat = ?',
+        'failedat = ?',
+        'deadletteredat = ?',
+      ]
+      if (timestampColumns.some((column) => normalized.includes(column))) {
+        timestamp = String(params[index++] ?? '')
+      }
+      const updatedAt = String(params[index++] ?? '')
+      const sendId = String(params[index++] ?? '')
+      const recipientHash = String(params[index++] ?? '')
+      const recipient = this.newsletterSendRecipients.get(`${sendId}:${recipientHash}`)
+      if (recipient) {
+        recipient.status = status
+        recipient.attempts = attempts
+        recipient.providerMessageId = providerMessageId
+        recipient.lastError = lastError
+        recipient.failureType = failureType
+        recipient.updatedAt = updatedAt
+        if (timestamp) {
+          if (normalized.includes('queuedat = ?')) recipient.queuedAt = timestamp
+          if (normalized.includes('sendingat = ?')) recipient.sendingAt = timestamp
+          if (normalized.includes('provideracceptedat = ?')) recipient.providerAcceptedAt = timestamp
+          if (normalized.includes('deliverydelayedat = ?')) recipient.deliveryDelayedAt = timestamp
+          if (normalized.includes('deliveredat = ?')) recipient.deliveredAt = timestamp
+          if (normalized.includes('bouncedat = ?')) recipient.bouncedAt = timestamp
+          if (normalized.includes('complainedat = ?')) recipient.complainedAt = timestamp
+          if (normalized.includes('failedat = ?')) recipient.failedAt = timestamp
+          if (normalized.includes('deadletteredat = ?')) recipient.deadLetteredAt = timestamp
+        }
+      }
+      return { meta: { changes: recipient ? 1 : 0 } }
+    }
+
+    if (normalized.includes('update newslettersend')) {
+      const sendId = String(params[14] ?? '')
+      const send = this.newsletterSends.get(sendId)
+      if (send) {
+        send.status = String(params[0] ?? '')
+        send.recipientCount = Number(params[1] ?? 0)
+        send.queuedCount = Number(params[2] ?? 0)
+        send.queueFailedCount = Number(params[3] ?? 0)
+        send.providerAcceptedCount = Number(params[4] ?? 0)
+        send.deliveredCount = Number(params[5] ?? 0)
+        send.deliveryDelayedCount = Number(params[6] ?? 0)
+        send.bouncedCount = Number(params[7] ?? 0)
+        send.complainedCount = Number(params[8] ?? 0)
+        send.failedCount = Number(params[9] ?? 0)
+        send.deadLetteredCount = Number(params[10] ?? 0)
+        if (params[11] !== null) {
+          send.lastError = String(params[11] ?? '')
+        }
+        send.updatedAt = String(params[12] ?? '')
+        send.completedAt = params[13] === null ? null : String(params[13] ?? '')
+      }
+      return { meta: { changes: send ? 1 : 0 } }
+    }
+
     if (normalized.includes('delete from abuseevent where createdat < ?')) {
       if (this.missingAbuseEventTable) {
         throw new Error('D1_ERROR: no such table: AbuseEvent')
@@ -265,6 +556,15 @@ function createEnv(options: FakeDatabaseOptions = {}) {
     }
   })
   const queueSend = vi.fn()
+  const sendStatusBrokerFetch = vi.fn(async () => (
+    new Response(JSON.stringify({ message: 'Broadcast sent' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  ))
+  const sendStatusBrokerGetByName = vi.fn(() => ({
+    fetch: sendStatusBrokerFetch,
+  }))
 
   const env = {
     DB: db as unknown as D1Database,
@@ -277,6 +577,9 @@ function createEnv(options: FakeDatabaseOptions = {}) {
       delete: vi.fn(),
     } as unknown as R2Bucket,
     QUEUE: { send: queueSend } as unknown as Queue,
+    SEND_STATUS_BROKER: {
+      getByName: sendStatusBrokerGetByName,
+    } as unknown as DurableObjectNamespace,
     ALLOWED_EMAILS: 'sender@example.com',
     PUBLISH_EMAIL_ADDRESS: 'publish@example.com',
     NOTIFICATION_SHARED_SECRET: 'notification-secret',
@@ -290,7 +593,17 @@ function createEnv(options: FakeDatabaseOptions = {}) {
     SES_SNS_TOPIC_ARN: 'arn:aws:sns:us-west-1:123456789012:letterdrop',
   }
 
-  return { env, db, kv, notificationFetch, r2Put, r2Get, queueSend }
+  return {
+    env,
+    db,
+    kv,
+    notificationFetch,
+    r2Put,
+    r2Get,
+    queueSend,
+    sendStatusBrokerFetch,
+    sendStatusBrokerGetByName,
+  }
 }
 
 async function postJson(
@@ -383,7 +696,7 @@ function createTextOnlyRawEmailStream(subject: string, messageId: string) {
   }
 }
 
-function createQueueBatch(body: Record<string, unknown>) {
+function createQueueBatch(body: Record<string, unknown>, queue = 'letterdrop-test') {
   const message = {
     id: 'queue-message-id',
     timestamp: new Date(),
@@ -396,7 +709,7 @@ function createQueueBatch(body: Record<string, unknown>) {
   return {
     batch: {
       messages: [message],
-      queue: 'letterdrop-test',
+      queue,
       metadata: { metrics: { backlogCount: 1, backlogBytes: 1 } },
       retryAll: vi.fn(),
       ackAll: vi.fn(),
@@ -606,7 +919,7 @@ describe('direct newsletter publish endpoint', () => {
     const response = await postJson(
       env,
       '/api/newsletter/not-a-uuid/publish',
-      publishPayload,
+      TRACKED_PUBLISH_PAYLOAD,
       { Authorization: 'Bearer admin-token' }
     )
 
@@ -621,7 +934,7 @@ describe('direct newsletter publish endpoint', () => {
     const response = await postJson(
       env,
       `/api/newsletter/${MISSING_NEWSLETTER_ID}/publish`,
-      publishPayload,
+      TRACKED_PUBLISH_PAYLOAD,
       { Authorization: 'Bearer admin-token' }
     )
 
@@ -694,6 +1007,8 @@ describe('direct newsletter publish endpoint', () => {
     expect(result).toEqual(expect.objectContaining({
       newsletterId: NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
+      sendId: expect.any(String),
+      queueFailedCount: 0,
       queuedCount: 1,
       duplicate: false,
       fileName: expect.stringMatching(
@@ -706,13 +1021,17 @@ describe('direct newsletter publish endpoint', () => {
     expect(r2Put).toHaveBeenCalledWith(result.fileName, publishPayload.html)
     expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
-    expect(queueSend).toHaveBeenCalledWith({
+    expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
       fileName: result.fileName,
       textFileName: result.textFileName,
-    })
+      sendId: result.sendId,
+      recipientHash: expect.any(String),
+    }))
+    expect(db.newsletterSends.get(result.sendId)?.queuedCount).toBe(1)
+    expect(db.newsletterSendRecipients.size).toBe(1)
   })
 
   it('does not requeue a direct publish source message that was already processed', async () => {
@@ -740,14 +1059,113 @@ describe('direct newsletter publish endpoint', () => {
 
     expect(firstResponse.status).toBe(200)
     expect(secondResponse.status).toBe(200)
-    await expect(secondResponse.json()).resolves.toEqual({
+    await expect(secondResponse.json()).resolves.toEqual(expect.objectContaining({
       newsletterId: NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
       queuedCount: 0,
+      queueFailedCount: 0,
       duplicate: true,
-    })
+    }))
     expect(r2Put).toHaveBeenCalledTimes(2)
     expect(queueSend).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns send history and recipient snapshots for tracked publishes', async () => {
+    const { env, db } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const publishResult = await publishResponse.json() as Record<string, unknown>
+
+    const sendsResponse = await app.request(
+      `https://example.com/api/newsletter/${NEWSLETTER_ID}/sends`,
+      { headers: { Authorization: 'Bearer admin-token' } },
+      env
+    )
+    const snapshotResponse = await app.request(
+      `https://example.com/api/newsletter/${NEWSLETTER_ID}/sends/${publishResult.sendId}`,
+      { headers: { Authorization: 'Bearer admin-token' } },
+      env
+    )
+    const sendsResult = await sendsResponse.json() as { sends: Array<Record<string, unknown>> }
+    const snapshot = await snapshotResponse.json() as {
+      send: Record<string, unknown>
+      recipients: Array<Record<string, unknown>>
+      events: Array<Record<string, unknown>>
+    }
+
+    expect(sendsResponse.status).toBe(200)
+    expect(snapshotResponse.status).toBe(200)
+    expect(sendsResult.sends[0]).toEqual(expect.objectContaining({
+      id: publishResult.sendId,
+      newsletterId: NEWSLETTER_ID,
+    }))
+    expect(snapshot.send.id).toBe(publishResult.sendId)
+    expect(snapshot.recipients).toHaveLength(1)
+    expect(snapshot.events.map((event) => event.eventType)).toEqual([
+      'sendCreated',
+      'recipientQueued',
+    ])
+  })
+
+  it('returns complete send event history beyond one D1 page', async () => {
+    const { env, db } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const publishResult = await publishResponse.json() as Record<string, unknown>
+    db.newsletterSendEvents.length = 0
+    for (let id = 1; id <= 505; id += 1) {
+      db.newsletterSendEvents.push({
+        id,
+        sendId: String(publishResult.sendId),
+        newsletterId: NEWSLETTER_ID,
+        recipientId: null,
+        recipientHash: null,
+        email: null,
+        eventType: `event-${id}`,
+        recipientStatus: null,
+        sendStatus: 'sending',
+        message: null,
+        providerMessageId: null,
+        providerPayload: null,
+        createdAt: '2026-04-28T19:00:00.000Z',
+      })
+    }
+
+    const snapshotResponse = await app.request(
+      `https://example.com/api/newsletter/${NEWSLETTER_ID}/sends/${publishResult.sendId}`,
+      { headers: { Authorization: 'Bearer admin-token' } },
+      env
+    )
+    const snapshot = await snapshotResponse.json() as {
+      events: Array<Record<string, unknown>>
+      lastEventId: number
+    }
+
+    expect(snapshotResponse.status).toBe(200)
+    expect(snapshot.events).toHaveLength(505)
+    expect(snapshot.lastEventId).toBe(505)
   })
 
   it('scopes duplicate source messages by newsletter', async () => {
@@ -798,13 +1216,15 @@ describe('direct newsletter publish endpoint', () => {
     }))
     expect(r2Put).toHaveBeenCalledTimes(4)
     expect(queueSend).toHaveBeenCalledTimes(2)
-    expect(queueSend).toHaveBeenLastCalledWith({
+    expect(queueSend).toHaveBeenLastCalledWith(expect.objectContaining({
       email: 'second@example.com',
       newsletterId: SECOND_NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
       fileName: secondResult.fileName,
       textFileName: secondResult.textFileName,
-    })
+      sendId: secondResult.sendId,
+      recipientHash: expect.any(String),
+    }))
   })
 
   it('rejects missing subject, html, or text fields', async () => {
@@ -945,6 +1365,8 @@ describe('Google Workspace publish bridge', () => {
     expect(result).toEqual(expect.objectContaining({
       newsletterId: NEWSLETTER_ID,
       subject: 'Bridge title: spaces & symbols',
+      sendId: expect.any(String),
+      queueFailedCount: 0,
       queuedCount: 1,
       duplicate: false,
       fileName: expect.stringMatching(
@@ -957,13 +1379,15 @@ describe('Google Workspace publish bridge', () => {
     expect(r2Put).toHaveBeenCalledWith(result.fileName, publishPayload.html)
     expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
-    expect(queueSend).toHaveBeenCalledWith({
+    expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
       subject: 'Bridge title: spaces & symbols',
       fileName: result.fileName,
       textFileName: result.textFileName,
-    })
+      sendId: result.sendId,
+      recipientHash: expect.any(String),
+    }))
   })
 
   it('does not requeue a Gmail message that was already processed', async () => {
@@ -991,12 +1415,13 @@ describe('Google Workspace publish bridge', () => {
 
     expect(firstResponse.status).toBe(200)
     expect(secondResponse.status).toBe(200)
-    await expect(secondResponse.json()).resolves.toEqual({
+    await expect(secondResponse.json()).resolves.toEqual(expect.objectContaining({
       newsletterId: NEWSLETTER_ID,
       subject: 'Bridge title: spaces & symbols',
       queuedCount: 0,
+      queueFailedCount: 0,
       duplicate: true,
-    })
+    }))
     expect(queueSend).toHaveBeenCalledTimes(1)
   })
 
@@ -1087,13 +1512,15 @@ describe('Cloudflare Email Worker publish path', () => {
       expect.stringMatching(new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.txt$`))
     )
     expect(String(text).trim()).toBe('Hello subscribers')
-    expect(queueSend).toHaveBeenCalledWith({
+    expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
       subject: 'Email worker title',
       fileName,
       textFileName,
-    })
+      sendId: expect.any(String),
+      recipientHash: expect.any(String),
+    }))
   })
 
   it('logs and returns when inbound email parsing does not produce HTML and text', async () => {
@@ -1129,6 +1556,33 @@ describe('newsletter queue delivery', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
   })
+
+  async function publishTrackedNewsletter() {
+    const { env, db, notificationFetch, queueSend, sendStatusBrokerFetch } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as Record<string, unknown>
+    expect(response.status).toBe(200)
+    return {
+      env,
+      db,
+      notificationFetch,
+      sendStatusBrokerFetch,
+      queueBody: queueSend.mock.calls[0][0] as Record<string, unknown>,
+      sendId: String(result.sendId),
+    }
+  }
 
   it('sends newsletter mail with text content, unsubscribe headers, footer, and SES tags', async () => {
     const { env, notificationFetch } = createEnv()
@@ -1187,6 +1641,105 @@ describe('newsletter queue delivery', () => {
     const body = await getNotificationRequestBody(notificationFetch)
     expect(String(body.txt)).toContain('Unsubscribe: https://newsletter.example.com/api/subscribe/unsubscribe/')
     expect(String(body.html)).toContain('<h1>Legacy</h1>')
+  })
+
+  it('updates tracked recipients when SES accepts queued mail', async () => {
+    const { env, db, notificationFetch, sendStatusBrokerFetch, queueBody, sendId } = await publishTrackedNewsletter()
+    const { batch, message } = createQueueBatch(queueBody)
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).not.toHaveBeenCalled()
+    const body = await getNotificationRequestBody(notificationFetch)
+    expect(body.headers).toEqual(expect.arrayContaining([
+      { name: 'X-LetterDrop-Send-ID', value: sendId },
+    ]))
+    expect(body.tags).toEqual(expect.arrayContaining([
+      { name: 'sendId', value: sendId },
+    ]))
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient).toEqual(expect.objectContaining({
+      status: 'providerAccepted',
+      attempts: 1,
+      providerMessageId: 'ses-message-id',
+    }))
+    expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
+      status: 'sending',
+      providerAcceptedCount: 1,
+    }))
+    expect(sendStatusBrokerFetch).toHaveBeenCalled()
+    const broadcastPaths = sendStatusBrokerFetch.mock.calls.map((call) =>
+      new URL((call[0] as Request).url).pathname
+    )
+    expect(broadcastPaths.every((path) => path === '/broadcast')).toBe(true)
+  })
+
+  it('does not retry after SES accepts when provider-accepted tracking fails', async () => {
+    const { env, db, notificationFetch, queueSend } = createEnv({
+      failRecipientStatusUpdates: ['providerAccepted'],
+    })
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    expect(response.status).toBe(200)
+    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const { batch, message } = createQueueBatch(queueBody)
+
+    await worker.queue(batch, env)
+
+    expect(notificationFetch).toHaveBeenCalledTimes(1)
+    expect(message.retry).not.toHaveBeenCalled()
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient).toEqual(expect.objectContaining({
+      status: 'sending',
+      attempts: 1,
+    }))
+  })
+
+  it('marks tracked recipients retrying when the sender fails', async () => {
+    const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
+    notificationFetch.mockResolvedValueOnce(new Response('sender unavailable', { status: 500 }))
+    const { batch, message } = createQueueBatch(queueBody)
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).toHaveBeenCalledTimes(1)
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient).toEqual(expect.objectContaining({
+      status: 'retrying',
+      attempts: 1,
+      lastError: 'Notification service returned status 500',
+    }))
+    expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
+      status: 'sending',
+      queuedCount: 0,
+    }))
+  })
+
+  it('marks tracked recipients dead-lettered from the DLQ consumer', async () => {
+    const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
+    notificationFetch.mockClear()
+    const { batch } = createQueueBatch(queueBody, 'haben-letterdrop-dlq')
+
+    await worker.queue(batch, env)
+
+    expect(notificationFetch).not.toHaveBeenCalled()
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient.status).toBe('deadLettered')
+    expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
+      status: 'completedWithFailures',
+      deadLetteredCount: 1,
+    }))
   })
 })
 
@@ -1315,6 +1868,202 @@ describe('SES SNS suppression webhook', () => {
       newsletterId: NEWSLETTER_ID,
       eventType: 'bounce:Permanent',
       providerMessageId: 'ses-message-id',
+    }))
+  })
+
+  it('updates tracked recipients from SES delivery events', async () => {
+    const { env, db, queueSend } = createEnv()
+    const { signEnvelope } = await createSnsSigner()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const publishResult = await publishResponse.json() as Record<string, unknown>
+    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        eventType: 'Delivery',
+        mail: {
+          messageId: 'ses-message-id',
+          destination: ['first@example.com'],
+          tags: {
+            newsletterId: [NEWSLETTER_ID],
+            sendId: [publishResult.sendId],
+            recipientHash: [queueBody.recipientHash],
+          },
+        },
+        delivery: {
+          recipients: ['first@example.com'],
+        },
+      }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'SES notification processed',
+      recordedCount: 0,
+      unsubscribedCount: 0,
+    })
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient.status).toBe('delivered')
+    expect(db.newsletterSends.get(String(publishResult.sendId))).toEqual(expect.objectContaining({
+      status: 'completed',
+      deliveredCount: 1,
+    }))
+  })
+
+  it('does not reopen terminal recipients when active SES events arrive late', async () => {
+    const { env, db, queueSend } = createEnv()
+    const { signEnvelope } = await createSnsSigner()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const publishResult = await publishResponse.json() as Record<string, unknown>
+    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const tags = {
+      newsletterId: [NEWSLETTER_ID],
+      sendId: [publishResult.sendId],
+      recipientHash: [queueBody.recipientHash],
+    }
+
+    const deliveryResponse = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        eventType: 'Delivery',
+        mail: {
+          messageId: 'ses-message-id',
+          destination: ['first@example.com'],
+          tags,
+        },
+        delivery: {
+          recipients: ['first@example.com'],
+        },
+      }),
+    }))
+    expect(deliveryResponse.status).toBe(200)
+
+    for (const lateNotification of [
+      {
+        eventType: 'Send',
+        mail: {
+          messageId: 'ses-message-id',
+          destination: ['first@example.com'],
+          tags,
+        },
+      },
+      {
+        eventType: 'DeliveryDelay',
+        mail: {
+          messageId: 'ses-message-id',
+          destination: ['first@example.com'],
+          tags,
+        },
+        deliveryDelay: {
+          delayedRecipients: ['first@example.com'],
+          delayType: 'MailboxFull',
+        },
+      },
+    ]) {
+      const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+        Type: 'Notification',
+        TopicArn: env.SES_SNS_TOPIC_ARN,
+        Message: JSON.stringify(lateNotification),
+      }))
+      expect(response.status).toBe(200)
+    }
+
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient.status).toBe('delivered')
+    expect(db.newsletterSends.get(String(publishResult.sendId))).toEqual(expect.objectContaining({
+      status: 'completed',
+      providerAcceptedCount: 0,
+      deliveredCount: 1,
+      deliveryDelayedCount: 0,
+    }))
+    expect(db.newsletterSendEvents.slice(-2).map((event) => event.eventType)).toEqual([
+      'providerSend',
+      'deliveryDelayed',
+    ])
+    expect(db.newsletterSendEvents.slice(-2).map((event) => event.recipientStatus)).toEqual([
+      'delivered',
+      'delivered',
+    ])
+  })
+
+  it('keeps sends active for SES delivery delay events', async () => {
+    const { env, db, queueSend } = createEnv()
+    const { signEnvelope } = await createSnsSigner()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const publishResult = await publishResponse.json() as Record<string, unknown>
+    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        eventType: 'DeliveryDelay',
+        mail: {
+          messageId: 'ses-message-id',
+          destination: ['first@example.com'],
+          tags: {
+            newsletterId: [NEWSLETTER_ID],
+            sendId: [publishResult.sendId],
+            recipientHash: [queueBody.recipientHash],
+          },
+        },
+        deliveryDelay: {
+          delayedRecipients: ['first@example.com'],
+          delayType: 'MailboxFull',
+        },
+      }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'SES notification processed',
+      recordedCount: 0,
+      unsubscribedCount: 0,
+    })
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient.status).toBe('deliveryDelayed')
+    expect(db.newsletterSends.get(String(publishResult.sendId))).toEqual(expect.objectContaining({
+      status: 'sending',
+      deliveryDelayedCount: 1,
     }))
   })
 

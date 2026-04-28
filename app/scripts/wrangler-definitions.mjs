@@ -7,12 +7,14 @@ export const requiredBindings = [
   { key: 'binding = "R2"', label: 'R2 bucket (R2)' },
   { key: 'binding = "QUEUE"', label: 'Queue producer (QUEUE)' },
   { key: 'binding = "NOTIFICATION"', label: 'Service binding (NOTIFICATION)' },
+  { key: 'name = "SEND_STATUS_BROKER"', label: 'Durable Object binding (SEND_STATUS_BROKER)' },
   { key: 'ALLOWED_EMAILS', label: 'Var: ALLOWED_EMAILS' },
   { key: 'PUBLISH_EMAIL_ADDRESS', label: 'Var: PUBLISH_EMAIL_ADDRESS' },
   { key: 'PUBLIC_ORIGIN', label: 'Var: PUBLIC_ORIGIN' },
   { key: 'TURNSTILE_SITE_KEY', label: 'Var: TURNSTILE_SITE_KEY' },
   { key: '[[queues.consumers]]', label: 'Queue consumer' },
   { key: 'dead_letter_queue', label: 'Dead letter queue' },
+  { key: 'new_sqlite_classes = ["SendStatusBroker"]', label: 'Durable Object migration' },
 ]
 
 export const forbiddenPatterns = [

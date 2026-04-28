@@ -26,6 +26,20 @@ max_batch_timeout = 30
 max_retries = 10
 dead_letter_queue = "replace-with-dead-letter-queue"
 
+[[queues.consumers]]
+queue = "replace-with-dead-letter-queue"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 0
+
+[[durable_objects.bindings]]
+name = "SEND_STATUS_BROKER"
+class_name = "SendStatusBroker"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SendStatusBroker"]
+
 [[kv_namespaces]]
 binding = "KV"
 id = "00000000000000000000000000000000"

@@ -70,7 +70,7 @@ paths:
   /api/newsletter/{newsletterId}/publish:
     post:
       summary: Publish a newsletter directly
-      description: Accept direct newsletter content from an authenticated admin client and enqueue delivery to subscribers.
+      description: Accept direct newsletter content from an authenticated admin client, create a durable send record, and enqueue delivery to subscribers.
       security:
         - AdminBearerAuth: []
       parameters:
@@ -100,10 +100,107 @@ paths:
         '500':
           description: Server error
 
+  /api/newsletter/{newsletterId}/sends:
+    get:
+      summary: List newsletter sends
+      description: Return recent durable send records for an authenticated admin.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Newsletter sends retrieved successfully
+          schema:
+            type: object
+            properties:
+              sends:
+                type: array
+                items:
+                  $ref: '#/definitions/NewsletterSendSummary'
+        '400':
+          description: Invalid newsletter ID
+        '401':
+          description: Missing or invalid admin bearer token
+        '500':
+          description: Server error
+
+  /api/newsletter/{newsletterId}/sends/{sendId}:
+    get:
+      summary: Get newsletter send snapshot
+      description: Return aggregate send status, recipient rows, and event history for an authenticated admin.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+          format: uuid
+        - name: sendId
+          in: path
+          required: true
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Newsletter send snapshot retrieved successfully
+          schema:
+            $ref: '#/definitions/NewsletterSendSnapshot'
+        '400':
+          description: Invalid newsletter ID or send ID
+        '401':
+          description: Missing or invalid admin bearer token
+        '404':
+          description: Newsletter send not found
+        '500':
+          description: Server error
+
+  /api/newsletter/{newsletterId}/sends/{sendId}/stream:
+    get:
+      summary: Stream newsletter send status
+      description: Authenticated WebSocket endpoint for live send status updates. Use afterEventId to replay missed events after reconnect.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+          format: uuid
+        - name: sendId
+          in: path
+          required: true
+          type: string
+          format: uuid
+        - name: afterEventId
+          in: query
+          type: integer
+          default: 0
+      responses:
+        '101':
+          description: WebSocket upgrade accepted
+        '400':
+          description: Invalid newsletter ID or send ID
+        '401':
+          description: Missing or invalid admin bearer token
+        '404':
+          description: Newsletter send not found
+        '426':
+          description: Expected WebSocket upgrade
+        '503':
+          description: Send status stream unavailable
+        '500':
+          description: Server error
+
   /api/publish/google-workspace:
     post:
       summary: Publish a newsletter from Google Workspace
-      description: Accept a parsed Gmail message from the Google Workspace Apps Script bridge and enqueue delivery to subscribers.
+      description: Accept a parsed Gmail message from the Google Workspace Apps Script bridge, create a durable send record, and enqueue delivery to subscribers.
       security:
         - PublishBridgeBearerAuth: []
       parameters:
@@ -671,10 +768,204 @@ definitions:
         type: string
       textFileName:
         type: string
+      sendId:
+        type: string
+        format: uuid
+      send:
+        $ref: '#/definitions/NewsletterSendSummary'
       queuedCount:
+        type: integer
+      queueFailedCount:
         type: integer
       duplicate:
         type: boolean
+
+  NewsletterSendSummary:
+    type: object
+    properties:
+      id:
+        type: string
+        format: uuid
+      newsletterId:
+        type: string
+        format: uuid
+      subject:
+        type: string
+      sourceMessageId:
+        type: string
+      status:
+        type: string
+        enum:
+          - queued
+          - sending
+          - completed
+          - completedWithFailures
+      recipientCount:
+        type: integer
+      queuedCount:
+        type: integer
+      queueFailedCount:
+        type: integer
+      providerAcceptedCount:
+        type: integer
+      deliveredCount:
+        type: integer
+      deliveryDelayedCount:
+        type: integer
+      bouncedCount:
+        type: integer
+      complainedCount:
+        type: integer
+      failedCount:
+        type: integer
+      deadLetteredCount:
+        type: integer
+      lastError:
+        type: string
+      createdAt:
+        type: string
+        format: date-time
+      updatedAt:
+        type: string
+        format: date-time
+      completedAt:
+        type: string
+        format: date-time
+
+  NewsletterSendRecipient:
+    type: object
+    properties:
+      id:
+        type: string
+        format: uuid
+      sendId:
+        type: string
+        format: uuid
+      newsletterId:
+        type: string
+        format: uuid
+      email:
+        type: string
+        format: email
+      recipientHash:
+        type: string
+      status:
+        type: string
+        enum:
+          - queued
+          - sending
+          - providerAccepted
+          - deliveryDelayed
+          - delivered
+          - bounced
+          - complained
+          - retrying
+          - failed
+          - deadLettered
+      attempts:
+        type: integer
+      providerMessageId:
+        type: string
+      lastError:
+        type: string
+      queuedAt:
+        type: string
+        format: date-time
+      sendingAt:
+        type: string
+        format: date-time
+      providerAcceptedAt:
+        type: string
+        format: date-time
+      deliveryDelayedAt:
+        type: string
+        format: date-time
+      deliveredAt:
+        type: string
+        format: date-time
+      bouncedAt:
+        type: string
+        format: date-time
+      complainedAt:
+        type: string
+        format: date-time
+      failedAt:
+        type: string
+        format: date-time
+      deadLetteredAt:
+        type: string
+        format: date-time
+      updatedAt:
+        type: string
+        format: date-time
+
+  NewsletterSendEvent:
+    type: object
+    properties:
+      id:
+        type: integer
+      sendId:
+        type: string
+        format: uuid
+      newsletterId:
+        type: string
+        format: uuid
+      recipientId:
+        type: string
+        format: uuid
+      recipientHash:
+        type: string
+      email:
+        type: string
+        format: email
+      eventType:
+        type: string
+      recipientStatus:
+        type: string
+      sendStatus:
+        type: string
+      message:
+        type: string
+      providerMessageId:
+        type: string
+      createdAt:
+        type: string
+        format: date-time
+
+  NewsletterSendSnapshot:
+    type: object
+    properties:
+      send:
+        $ref: '#/definitions/NewsletterSendSummary'
+      recipients:
+        type: array
+        items:
+          $ref: '#/definitions/NewsletterSendRecipient'
+      events:
+        type: array
+        items:
+          $ref: '#/definitions/NewsletterSendEvent'
+      lastEventId:
+        type: integer
+
+  NewsletterSendStreamMessage:
+    type: object
+    description: WebSocket messages are either connected acknowledgements or sendEvent updates. sendEvent updates include the event and may include the latest aggregate send and recipient row.
+    properties:
+      type:
+        type: string
+        enum:
+          - connected
+          - sendEvent
+      sendId:
+        type: string
+        format: uuid
+      event:
+        $ref: '#/definitions/NewsletterSendEvent'
+      send:
+        $ref: '#/definitions/NewsletterSendSummary'
+      recipient:
+        $ref: '#/definitions/NewsletterSendRecipient'
 
   Subscriber:
     type: object

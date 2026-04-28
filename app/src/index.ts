@@ -8,6 +8,7 @@ type Bindings = {
   KV: KVNamespace;
   R2: R2Bucket;
   QUEUE: Queue;
+  SEND_STATUS_BROKER?: DurableObjectNamespace;
   ALLOWED_EMAILS: string;
   PUBLISH_EMAIL_ADDRESS: string;
   NOTIFICATION_SHARED_SECRET?: string;
@@ -83,7 +84,10 @@ type PublishNewsletterEmailSuccess = {
   subject: string;
   fileName?: string;
   textFileName?: string;
+  sendId?: string;
+  send?: NewsletterSendSummary;
   queuedCount: number;
+  queueFailedCount?: number;
   duplicate: boolean;
 };
 
@@ -107,6 +111,100 @@ type NewsletterQueueMessage = {
   subject: string;
   fileName: string;
   textFileName?: string;
+  sendId?: string;
+  recipientHash?: string;
+};
+
+type NewsletterSendStatus =
+  | "queued"
+  | "sending"
+  | "completed"
+  | "completedWithFailures"
+  | "duplicate";
+
+type NewsletterSendRecipientStatus =
+  | "queued"
+  | "sending"
+  | "providerAccepted"
+  | "deliveryDelayed"
+  | "delivered"
+  | "bounced"
+  | "complained"
+  | "retrying"
+  | "failed"
+  | "deadLettered";
+
+type NewsletterSendSummary = {
+  id: string;
+  newsletterId: string;
+  subject: string;
+  sourceMessageId: string | null;
+  status: NewsletterSendStatus;
+  recipientCount: number;
+  queuedCount: number;
+  queueFailedCount: number;
+  providerAcceptedCount: number;
+  deliveredCount: number;
+  deliveryDelayedCount: number;
+  bouncedCount: number;
+  complainedCount: number;
+  failedCount: number;
+  deadLetteredCount: number;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+};
+
+type NewsletterSendRecipient = {
+  id: string;
+  sendId: string;
+  newsletterId: string;
+  email: string;
+  recipientHash: string;
+  status: NewsletterSendRecipientStatus;
+  attempts: number;
+  providerMessageId: string | null;
+  lastError: string | null;
+  queuedAt: string | null;
+  sendingAt: string | null;
+  providerAcceptedAt: string | null;
+  deliveryDelayedAt: string | null;
+  deliveredAt: string | null;
+  bouncedAt: string | null;
+  complainedAt: string | null;
+  failedAt: string | null;
+  deadLetteredAt: string | null;
+  updatedAt: string;
+};
+
+type NewsletterSendEvent = {
+  id: number;
+  sendId: string;
+  newsletterId: string;
+  recipientId: string | null;
+  recipientHash: string | null;
+  email: string | null;
+  eventType: string;
+  recipientStatus: NewsletterSendRecipientStatus | null;
+  sendStatus: NewsletterSendStatus | null;
+  message: string | null;
+  providerMessageId: string | null;
+  createdAt: string;
+};
+
+type NewsletterSendStreamMessage =
+  | { type: "connected"; sendId: string }
+  | {
+      type: "sendEvent";
+      event: NewsletterSendEvent;
+      send?: NewsletterSendSummary;
+      recipient?: NewsletterSendRecipient;
+    };
+
+type PublishSourceMessageRecord = {
+  sendId?: string;
+  fileName?: string;
 };
 
 type SesSnsEnvelope = {
@@ -124,6 +222,7 @@ type SesSnsEnvelope = {
 };
 
 type SesNotification = {
+  eventType?: unknown;
   notificationType?: unknown;
   mail?: {
     messageId?: unknown;
@@ -136,6 +235,16 @@ type SesNotification = {
   };
   complaint?: {
     complainedRecipients?: unknown;
+  };
+  delivery?: {
+    recipients?: unknown;
+  };
+  deliveryDelay?: {
+    delayedRecipients?: unknown;
+    delayType?: unknown;
+  };
+  reject?: {
+    reason?: unknown;
   };
 };
 
@@ -159,6 +268,7 @@ const MISSING_ABUSE_EVENT_TABLE_FRAGMENT = "no such table: AbuseEvent";
 const PUBLISH_SOURCE_MESSAGE_TTL_SECONDS = 60 * 60 * 24 * 30;
 const MAX_PUBLISH_REQUEST_BYTES = 5 * 1024 * 1024;
 const MAX_SUPPRESSION_PAYLOAD_LENGTH = 20_000;
+const NEWSLETTER_SEND_EVENT_PAGE_SIZE = 500;
 
 let hasLoggedMissingAbuseEventMigration = false;
 
@@ -1171,13 +1281,85 @@ app.post("/api/newsletter/:newsletterId/publish", async (c) => {
     return c.json({
       newsletterId: result.newsletterId,
       subject: result.subject,
-      fileName: result.fileName,
-      textFileName: result.textFileName,
-      queuedCount: result.queuedCount,
-      duplicate: result.duplicate,
-    });
+	      fileName: result.fileName,
+	      textFileName: result.textFileName,
+	      sendId: result.sendId,
+	      send: result.send,
+	      queuedCount: result.queuedCount,
+	      queueFailedCount: result.queueFailedCount ?? 0,
+	      duplicate: result.duplicate,
+	    });
   } catch (error: unknown) {
     return internalServerError(c, "publish-newsletter-direct", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/sends", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+
+  try {
+    const sends = await listNewsletterSendSummaries(c.env.DB, newsletterId);
+    return c.json({ sends });
+  } catch (error: unknown) {
+    return internalServerError(c, "list-newsletter-sends", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/sends/:sendId", async (c) => {
+  const { newsletterId, sendId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(sendId)) {
+    return c.json({ error: "Invalid newsletterId or sendId" }, 400);
+  }
+
+  try {
+    const send = await getNewsletterSendSummary(c.env.DB, sendId);
+    if (!send || send.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter send not found" }, 404);
+    }
+    const recipients = await getNewsletterSendRecipients(c.env.DB, sendId);
+    const events = await getNewsletterSendEvents(c.env.DB, sendId);
+    const lastEventId = events.length > 0 ? events[events.length - 1].id : 0;
+    return c.json({ send, recipients, events, lastEventId });
+  } catch (error: unknown) {
+    return internalServerError(c, "get-newsletter-send", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/sends/:sendId/stream", async (c) => {
+  const { newsletterId, sendId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(sendId)) {
+    return c.json({ error: "Invalid newsletterId or sendId" }, 400);
+  }
+  if (c.req.header("Upgrade")?.toLowerCase() !== "websocket") {
+    return c.json({ error: "Expected WebSocket upgrade" }, 426);
+  }
+  if (!c.env.SEND_STATUS_BROKER) {
+    return c.json({ error: "Send status stream unavailable" }, 503);
+  }
+
+  try {
+    const send = await getNewsletterSendSummary(c.env.DB, sendId);
+    if (!send || send.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter send not found" }, 404);
+    }
+    const afterEventId = Math.max(
+      0,
+      Number(c.req.query("afterEventId") ?? "0") || 0,
+    );
+    const stub = c.env.SEND_STATUS_BROKER.getByName(sendId);
+    return stub.fetch(
+      new Request(
+        `https://send-status-broker/stream?newsletterId=${encodeURIComponent(
+          newsletterId,
+        )}&sendId=${encodeURIComponent(sendId)}&afterEventId=${afterEventId}`,
+        { headers: c.req.raw.headers },
+      ),
+    );
+  } catch (error: unknown) {
+    return internalServerError(c, "stream-newsletter-send", error);
   }
 });
 
@@ -1218,11 +1400,14 @@ app.post("/api/publish/google-workspace", async (c) => {
     return c.json({
       newsletterId: result.newsletterId,
       subject: result.subject,
-      fileName: result.fileName,
-      textFileName: result.textFileName,
-      queuedCount: result.queuedCount,
-      duplicate: result.duplicate,
-    });
+	      fileName: result.fileName,
+	      textFileName: result.textFileName,
+	      sendId: result.sendId,
+	      send: result.send,
+	      queuedCount: result.queuedCount,
+	      queueFailedCount: result.queueFailedCount ?? 0,
+	      duplicate: result.duplicate,
+	    });
   } catch (error: unknown) {
     return internalServerError(c, "publish-google-workspace", error);
   }
@@ -1916,7 +2101,7 @@ app.post("/api/ses/sns/:token", async (c) => {
       return c.json({ error: "Invalid SNS payload" }, 400);
     }
 
-    const result = await processSesNotification(c.env.DB, envelope.Message);
+    const result = await processSesNotification(c.env, envelope.Message);
     return c.json({
       message: "SES notification processed",
       recordedCount: result.recordedCount,
@@ -1942,13 +2127,26 @@ function getSesTagValue(
 }
 
 function getSesNotificationRecipients(notification: SesNotification): string[] {
+  const notificationType =
+    typeof notification.eventType === "string"
+      ? notification.eventType
+      : typeof notification.notificationType === "string"
+        ? notification.notificationType
+        : "";
   const recipientObjects =
-    notification.notificationType === "Complaint"
+    notificationType === "Complaint"
       ? notification.complaint?.complainedRecipients
-      : notification.bounce?.bouncedRecipients;
+      : notificationType === "DeliveryDelay"
+        ? notification.deliveryDelay?.delayedRecipients
+        : notificationType === "Delivery"
+          ? notification.delivery?.recipients
+          : notification.bounce?.bouncedRecipients;
   if (Array.isArray(recipientObjects)) {
     return recipientObjects
       .map((recipient) => {
+        if (typeof recipient === "string") {
+          return normalizeEmail(recipient);
+        }
         if (
           recipient &&
           typeof recipient === "object" &&
@@ -2001,15 +2199,25 @@ async function recordSuppressionEvent(
 }
 
 async function processSesNotification(
-  db: D1Database,
+  env: Bindings,
   messageJson: string,
 ): Promise<{ recordedCount: number; unsubscribedCount: number }> {
   const notification = JSON.parse(messageJson) as SesNotification;
   const notificationType =
-    typeof notification.notificationType === "string"
-      ? notification.notificationType
-      : "";
-  if (notificationType !== "Bounce" && notificationType !== "Complaint") {
+    typeof notification.eventType === "string"
+      ? notification.eventType
+      : typeof notification.notificationType === "string"
+        ? notification.notificationType
+        : "";
+  const trackedTypes = new Set([
+    "Send",
+    "Reject",
+    "Delivery",
+    "DeliveryDelay",
+    "Bounce",
+    "Complaint",
+  ]);
+  if (!trackedTypes.has(notificationType)) {
     return { recordedCount: 0, unsubscribedCount: 0 };
   }
 
@@ -2023,31 +2231,92 @@ async function processSesNotification(
   const newsletterTag = getSesTagValue(notification.mail?.tags, "newsletterId");
   const newsletterId =
     newsletterTag && isValidUuid(newsletterTag) ? newsletterTag : null;
+  const sendTag = getSesTagValue(notification.mail?.tags, "sendId");
+  const sendId = sendTag && isValidUuid(sendTag) ? sendTag : null;
+  const recipientHash = getSesTagValue(notification.mail?.tags, "recipientHash");
   const providerMessageId =
     typeof notification.mail?.messageId === "string"
       ? notification.mail.messageId
       : null;
-  const eventType =
-    notificationType === "Complaint"
-      ? "complaint"
-      : `bounce:${bounceType || "unknown"}`;
+  const eventType = (() => {
+    switch (notificationType) {
+      case "Complaint":
+        return "complaint";
+      case "Bounce":
+        return `bounce:${bounceType || "unknown"}`;
+      case "DeliveryDelay":
+        return "deliveryDelayed";
+      case "Delivery":
+        return "delivered";
+      case "Reject":
+        return "rejected";
+      case "Send":
+        return "providerSend";
+      default:
+        return notificationType;
+    }
+  })();
   const recipients = getSesNotificationRecipients(notification);
   const providerPayload = JSON.stringify(notification);
+
+  if (newsletterId && sendId && recipientHash) {
+    const status = (() => {
+      switch (notificationType) {
+        case "Send":
+          return "providerAccepted";
+        case "Delivery":
+          return "delivered";
+        case "DeliveryDelay":
+          return "deliveryDelayed";
+        case "Bounce":
+          return "bounced";
+        case "Complaint":
+          return "complained";
+        case "Reject":
+          return "failed";
+        default:
+          return null;
+      }
+    })() as NewsletterSendRecipientStatus | null;
+    if (status) {
+      const detail =
+        notificationType === "Reject"
+          ? asNullableString(notification.reject?.reason)
+          : notificationType === "DeliveryDelay"
+            ? asNullableString(notification.deliveryDelay?.delayType)
+            : notificationType === "Bounce"
+              ? bounceType || null
+              : null;
+      await updateNewsletterSendRecipientStatus(env, {
+        sendId,
+        newsletterId,
+        recipientHash,
+        status,
+        eventType,
+        message: detail,
+        providerMessageId,
+        providerPayload,
+        failureType: notificationType === "Reject" ? "provider" : null,
+      });
+    }
+  }
 
   let recordedCount = 0;
   let unsubscribedCount = 0;
   for (const email of recipients) {
-    await recordSuppressionEvent(db, {
-      email,
-      newsletterId,
-      eventType,
-      providerMessageId,
-      providerPayload,
-    });
-    recordedCount += 1;
+    if (notificationType === "Bounce" || notificationType === "Complaint") {
+      await recordSuppressionEvent(env.DB, {
+        email,
+        newsletterId,
+        eventType,
+        providerMessageId,
+        providerPayload,
+      });
+      recordedCount += 1;
+    }
 
     if (shouldUnsubscribe && newsletterId) {
-      await markSubscriberUnsubscribed(db, email, newsletterId);
+      await markSubscriberUnsubscribed(env.DB, email, newsletterId);
       unsubscribedCount += 1;
     }
   }
@@ -2466,8 +2735,9 @@ function buildNewsletterListHeaders(
   newsletterId: string,
   recipientHash: string,
   oneClickUrl: string,
+  sendId?: string,
 ): EmailHeader[] {
-  return [
+  const headers = [
     { name: "List-Unsubscribe", value: `<${oneClickUrl}>` },
     {
       name: "List-Unsubscribe-Post",
@@ -2480,16 +2750,756 @@ function buildNewsletterListHeaders(
     { name: "X-Newsletter-ID", value: newsletterId },
     { name: "X-Recipient-Hash", value: recipientHash },
   ];
+  if (sendId) {
+    headers.push({ name: "X-LetterDrop-Send-ID", value: sendId });
+  }
+  return headers;
 }
 
 function buildNewsletterEmailTags(
   newsletterId: string,
   recipientHash: string,
+  sendId?: string,
 ): EmailTag[] {
-  return [
+  const tags = [
     { name: "newsletterId", value: newsletterId },
     { name: "recipientHash", value: recipientHash },
   ];
+  if (sendId) {
+    tags.push({ name: "sendId", value: sendId });
+  }
+  return tags;
+}
+
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function asNumber(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendSummary {
+  return {
+    id: String(row.id ?? ""),
+    newsletterId: String(row.newsletterId ?? row.newsletter_id ?? ""),
+    subject: String(row.subject ?? ""),
+    sourceMessageId: asNullableString(row.sourceMessageId ?? row.source_message_id),
+    status: String(row.status ?? "queued") as NewsletterSendStatus,
+    recipientCount: asNumber(row.recipientCount ?? row.recipient_count),
+    queuedCount: asNumber(row.queuedCount ?? row.queued_count),
+    queueFailedCount: asNumber(row.queueFailedCount ?? row.queue_failed_count),
+    providerAcceptedCount: asNumber(row.providerAcceptedCount ?? row.provider_accepted_count),
+    deliveredCount: asNumber(row.deliveredCount ?? row.delivered_count),
+    deliveryDelayedCount: asNumber(row.deliveryDelayedCount ?? row.delivery_delayed_count),
+    bouncedCount: asNumber(row.bouncedCount ?? row.bounced_count),
+    complainedCount: asNumber(row.complainedCount ?? row.complained_count),
+    failedCount: asNumber(row.failedCount ?? row.failed_count),
+    deadLetteredCount: asNumber(row.deadLetteredCount ?? row.dead_lettered_count),
+    lastError: asNullableString(row.lastError ?? row.last_error),
+    createdAt: String(row.createdAt ?? ""),
+    updatedAt: String(row.updatedAt ?? ""),
+    completedAt: asNullableString(row.completedAt ?? row.completed_at),
+  };
+}
+
+function mapNewsletterSendRecipient(row: Record<string, unknown>): NewsletterSendRecipient {
+  return {
+    id: String(row.id ?? ""),
+    sendId: String(row.sendId ?? row.send_id ?? ""),
+    newsletterId: String(row.newsletterId ?? row.newsletter_id ?? ""),
+    email: String(row.email ?? ""),
+    recipientHash: String(row.recipientHash ?? row.recipient_hash ?? ""),
+    status: String(row.status ?? "queued") as NewsletterSendRecipientStatus,
+    attempts: asNumber(row.attempts),
+    providerMessageId: asNullableString(row.providerMessageId ?? row.provider_message_id),
+    lastError: asNullableString(row.lastError ?? row.last_error),
+    queuedAt: asNullableString(row.queuedAt ?? row.queued_at),
+    sendingAt: asNullableString(row.sendingAt ?? row.sending_at),
+    providerAcceptedAt: asNullableString(row.providerAcceptedAt ?? row.provider_accepted_at),
+    deliveryDelayedAt: asNullableString(row.deliveryDelayedAt ?? row.delivery_delayed_at),
+    deliveredAt: asNullableString(row.deliveredAt ?? row.delivered_at),
+    bouncedAt: asNullableString(row.bouncedAt ?? row.bounced_at),
+    complainedAt: asNullableString(row.complainedAt ?? row.complained_at),
+    failedAt: asNullableString(row.failedAt ?? row.failed_at),
+    deadLetteredAt: asNullableString(row.deadLetteredAt ?? row.dead_lettered_at),
+    updatedAt: String(row.updatedAt ?? ""),
+  };
+}
+
+function mapNewsletterSendEvent(row: Record<string, unknown>): NewsletterSendEvent {
+  return {
+    id: asNumber(row.id),
+    sendId: String(row.sendId ?? row.send_id ?? ""),
+    newsletterId: String(row.newsletterId ?? row.newsletter_id ?? ""),
+    recipientId: asNullableString(row.recipientId ?? row.recipient_id),
+    recipientHash: asNullableString(row.recipientHash ?? row.recipient_hash),
+    email: asNullableString(row.email),
+    eventType: String(row.eventType ?? row.event_type ?? ""),
+    recipientStatus: asNullableString(row.recipientStatus ?? row.recipient_status) as
+      | NewsletterSendRecipientStatus
+      | null,
+    sendStatus: asNullableString(row.sendStatus ?? row.send_status) as
+      | NewsletterSendStatus
+      | null,
+    message: asNullableString(row.message),
+    providerMessageId: asNullableString(row.providerMessageId ?? row.provider_message_id),
+    createdAt: String(row.createdAt ?? ""),
+  };
+}
+
+async function getNewsletterSendSummary(
+  db: D1Database,
+  sendId: string,
+): Promise<NewsletterSendSummary | null> {
+  const row = await db
+    .prepare(
+      `SELECT id,
+              newsletter_id AS newsletterId,
+              subject,
+              source_message_id AS sourceMessageId,
+              status,
+              recipient_count AS recipientCount,
+              queued_count AS queuedCount,
+              queue_failed_count AS queueFailedCount,
+              provider_accepted_count AS providerAcceptedCount,
+              delivered_count AS deliveredCount,
+              delivery_delayed_count AS deliveryDelayedCount,
+              bounced_count AS bouncedCount,
+              complained_count AS complainedCount,
+              failed_count AS failedCount,
+              dead_lettered_count AS deadLetteredCount,
+              last_error AS lastError,
+              createdAt,
+              updatedAt,
+              completedAt
+       FROM NewsletterSend
+       WHERE id = ?`,
+    )
+    .bind(sendId)
+    .first<Record<string, unknown>>();
+  return row ? mapNewsletterSendSummary(row) : null;
+}
+
+async function getNewsletterSendRecipientByHash(
+  db: D1Database,
+  sendId: string,
+  recipientHash: string,
+): Promise<NewsletterSendRecipient | null> {
+  const row = await db
+    .prepare(
+      `SELECT id,
+              send_id AS sendId,
+              newsletter_id AS newsletterId,
+              email,
+              recipient_hash AS recipientHash,
+              status,
+              attempts,
+              provider_message_id AS providerMessageId,
+              last_error AS lastError,
+              queuedAt,
+              sendingAt,
+              providerAcceptedAt,
+              deliveryDelayedAt,
+              deliveredAt,
+              bouncedAt,
+              complainedAt,
+              failedAt,
+              deadLetteredAt,
+              updatedAt
+       FROM NewsletterSendRecipient
+       WHERE send_id = ? AND recipient_hash = ?`,
+    )
+    .bind(sendId, recipientHash)
+    .first<Record<string, unknown>>();
+  return row ? mapNewsletterSendRecipient(row) : null;
+}
+
+async function getNewsletterSendRecipients(
+  db: D1Database,
+  sendId: string,
+): Promise<NewsletterSendRecipient[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT id,
+              send_id AS sendId,
+              newsletter_id AS newsletterId,
+              email,
+              recipient_hash AS recipientHash,
+              status,
+              attempts,
+              provider_message_id AS providerMessageId,
+              last_error AS lastError,
+              queuedAt,
+              sendingAt,
+              providerAcceptedAt,
+              deliveryDelayedAt,
+              deliveredAt,
+              bouncedAt,
+              complainedAt,
+              failedAt,
+              deadLetteredAt,
+              updatedAt
+       FROM NewsletterSendRecipient
+       WHERE send_id = ?
+       ORDER BY email COLLATE NOCASE`,
+    )
+    .bind(sendId)
+    .all<Record<string, unknown>>();
+  return results.map(mapNewsletterSendRecipient);
+}
+
+async function getNewsletterSendEvents(
+  db: D1Database,
+  sendId: string,
+  afterEventId = 0,
+): Promise<NewsletterSendEvent[]> {
+  const events: NewsletterSendEvent[] = [];
+  let cursor = afterEventId;
+
+  while (true) {
+    const { results } = await db
+      .prepare(
+        `SELECT id,
+                send_id AS sendId,
+                newsletter_id AS newsletterId,
+                recipient_id AS recipientId,
+                recipient_hash AS recipientHash,
+                email,
+                event_type AS eventType,
+                recipient_status AS recipientStatus,
+                send_status AS sendStatus,
+                message,
+                provider_message_id AS providerMessageId,
+                createdAt
+         FROM NewsletterSendEvent
+         WHERE send_id = ? AND id > ?
+         ORDER BY id ASC
+         LIMIT ?`,
+      )
+      .bind(sendId, cursor, NEWSLETTER_SEND_EVENT_PAGE_SIZE)
+      .all<Record<string, unknown>>();
+    const page = results.map(mapNewsletterSendEvent);
+    events.push(...page);
+    if (page.length < NEWSLETTER_SEND_EVENT_PAGE_SIZE) {
+      break;
+    }
+    cursor = page[page.length - 1].id;
+  }
+
+  return events;
+}
+
+async function listNewsletterSendSummaries(
+  db: D1Database,
+  newsletterId: string,
+): Promise<NewsletterSendSummary[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT id,
+              newsletter_id AS newsletterId,
+              subject,
+              source_message_id AS sourceMessageId,
+              status,
+              recipient_count AS recipientCount,
+              queued_count AS queuedCount,
+              queue_failed_count AS queueFailedCount,
+              provider_accepted_count AS providerAcceptedCount,
+              delivered_count AS deliveredCount,
+              delivery_delayed_count AS deliveryDelayedCount,
+              bounced_count AS bouncedCount,
+              complained_count AS complainedCount,
+              failed_count AS failedCount,
+              dead_lettered_count AS deadLetteredCount,
+              last_error AS lastError,
+              createdAt,
+              updatedAt,
+              completedAt
+       FROM NewsletterSend
+       WHERE newsletter_id = ?
+       ORDER BY createdAt DESC
+       LIMIT 50`,
+    )
+    .bind(newsletterId)
+    .all<Record<string, unknown>>();
+  return results.map(mapNewsletterSendSummary);
+}
+
+async function createNewsletterSend(
+  db: D1Database,
+  input: {
+    sendId: string;
+    newsletterId: string;
+    subject: string;
+    sourceMessageId: string | null;
+    recipientCount: number;
+    now: string;
+  },
+): Promise<NewsletterSendSummary> {
+  await db
+    .prepare(
+      `INSERT INTO NewsletterSend (
+         id, newsletter_id, subject, source_message_id, status,
+         recipient_count, queued_count, queue_failed_count, provider_accepted_count,
+         delivered_count, delivery_delayed_count, bounced_count, complained_count,
+         failed_count, dead_lettered_count, createdAt, updatedAt
+       )
+       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)`,
+    )
+    .bind(
+      input.sendId,
+      input.newsletterId,
+      input.subject,
+      input.sourceMessageId,
+      "queued",
+      input.recipientCount,
+      input.now,
+      input.now,
+    )
+    .run();
+  const send = await getNewsletterSendSummary(db, input.sendId);
+  if (!send) {
+    throw new Error("Failed to create newsletter send record");
+  }
+  return send;
+}
+
+async function insertNewsletterSendRecipient(
+  db: D1Database,
+  input: {
+    sendId: string;
+    newsletterId: string;
+    email: string;
+    recipientHash: string;
+    now: string;
+  },
+): Promise<NewsletterSendRecipient> {
+  const recipientId = crypto.randomUUID();
+  await db
+    .prepare(
+      `INSERT INTO NewsletterSendRecipient (
+         id, send_id, newsletter_id, email, recipient_hash, status, attempts,
+         queuedAt, updatedAt
+       )
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+    )
+    .bind(
+      recipientId,
+      input.sendId,
+      input.newsletterId,
+      input.email,
+      input.recipientHash,
+      "queued",
+      input.now,
+      input.now,
+    )
+    .run();
+  const recipient = await getNewsletterSendRecipientByHash(
+    db,
+    input.sendId,
+    input.recipientHash,
+  );
+  if (!recipient) {
+    throw new Error("Failed to create newsletter send recipient record");
+  }
+  return recipient;
+}
+
+async function recordNewsletterSendEvent(
+  db: D1Database,
+  input: {
+    sendId: string;
+    newsletterId: string;
+    recipient?: NewsletterSendRecipient | null;
+    eventType: string;
+    recipientStatus?: NewsletterSendRecipientStatus | null;
+    sendStatus?: NewsletterSendStatus | null;
+    message?: string | null;
+    providerMessageId?: string | null;
+    providerPayload?: string | null;
+    now: string;
+  },
+): Promise<NewsletterSendEvent> {
+  const result = await db
+    .prepare(
+      `INSERT INTO NewsletterSendEvent (
+         send_id, newsletter_id, recipient_id, recipient_hash, email,
+         event_type, recipient_status, send_status, message,
+         provider_message_id, provider_payload, createdAt
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      input.sendId,
+      input.newsletterId,
+      input.recipient?.id ?? null,
+      input.recipient?.recipientHash ?? null,
+      input.recipient?.email ?? null,
+      input.eventType,
+      input.recipientStatus ?? null,
+      input.sendStatus ?? null,
+      input.message ?? null,
+      input.providerMessageId ?? null,
+      input.providerPayload?.slice(0, MAX_SUPPRESSION_PAYLOAD_LENGTH) ?? null,
+      input.now,
+    )
+    .run();
+  const row = await db
+    .prepare(
+      `SELECT id,
+              send_id AS sendId,
+              newsletter_id AS newsletterId,
+              recipient_id AS recipientId,
+              recipient_hash AS recipientHash,
+              email,
+              event_type AS eventType,
+              recipient_status AS recipientStatus,
+              send_status AS sendStatus,
+              message,
+              provider_message_id AS providerMessageId,
+              createdAt
+       FROM NewsletterSendEvent
+       WHERE id = ?`,
+    )
+    .bind(result.meta.last_row_id)
+    .first<Record<string, unknown>>();
+  if (!row) {
+    throw new Error("Failed to read newsletter send event record");
+  }
+  return mapNewsletterSendEvent(row);
+}
+
+function completedAtValue(
+  status: NewsletterSendStatus,
+  existingCompletedAt: string | null,
+  now: string,
+): string | null {
+  if (status === "completed" || status === "completedWithFailures") {
+    return existingCompletedAt ?? now;
+  }
+  return null;
+}
+
+async function refreshNewsletterSendSummary(
+  db: D1Database,
+  sendId: string,
+  now: string,
+  lastError: string | null = null,
+): Promise<NewsletterSendSummary> {
+  const counts = await db
+    .prepare(
+      `SELECT COUNT(*) AS recipientCount,
+              SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queuedCount,
+              SUM(CASE WHEN status = 'failed' AND failure_type = 'queue' THEN 1 ELSE 0 END) AS queueFailedCount,
+              SUM(CASE WHEN status = 'providerAccepted' THEN 1 ELSE 0 END) AS providerAcceptedCount,
+              SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS deliveredCount,
+              SUM(CASE WHEN status = 'deliveryDelayed' THEN 1 ELSE 0 END) AS deliveryDelayedCount,
+              SUM(CASE WHEN status = 'bounced' THEN 1 ELSE 0 END) AS bouncedCount,
+              SUM(CASE WHEN status = 'complained' THEN 1 ELSE 0 END) AS complainedCount,
+              SUM(CASE WHEN status = 'failed' AND (failure_type IS NULL OR failure_type != 'queue') THEN 1 ELSE 0 END) AS failedCount,
+              SUM(CASE WHEN status = 'deadLettered' THEN 1 ELSE 0 END) AS deadLetteredCount,
+              SUM(CASE WHEN status IN ('queued', 'sending', 'providerAccepted', 'deliveryDelayed', 'retrying') THEN 1 ELSE 0 END) AS activeCount
+       FROM NewsletterSendRecipient
+       WHERE send_id = ?`,
+    )
+    .bind(sendId)
+    .first<Record<string, unknown>>();
+  const existing = await getNewsletterSendSummary(db, sendId);
+  if (!counts || !existing) {
+    throw new Error("Newsletter send not found");
+  }
+
+  const activeCount = asNumber(counts.activeCount);
+  const queueFailedCount = asNumber(counts.queueFailedCount);
+  const failedCount = asNumber(counts.failedCount);
+  const deadLetteredCount = asNumber(counts.deadLetteredCount);
+  const status: NewsletterSendStatus =
+    activeCount > 0
+      ? "sending"
+      : queueFailedCount + failedCount + deadLetteredCount > 0
+        ? "completedWithFailures"
+        : "completed";
+  const completedAt = completedAtValue(status, existing.completedAt, now);
+
+  await db
+    .prepare(
+      `UPDATE NewsletterSend
+       SET status = ?,
+           recipient_count = ?,
+           queued_count = ?,
+           queue_failed_count = ?,
+           provider_accepted_count = ?,
+           delivered_count = ?,
+           delivery_delayed_count = ?,
+           bounced_count = ?,
+           complained_count = ?,
+           failed_count = ?,
+           dead_lettered_count = ?,
+           last_error = COALESCE(?, last_error),
+           updatedAt = ?,
+           completedAt = ?
+       WHERE id = ?`,
+    )
+    .bind(
+      status,
+      asNumber(counts.recipientCount),
+      asNumber(counts.queuedCount),
+      queueFailedCount,
+      asNumber(counts.providerAcceptedCount),
+      asNumber(counts.deliveredCount),
+      asNumber(counts.deliveryDelayedCount),
+      asNumber(counts.bouncedCount),
+      asNumber(counts.complainedCount),
+      failedCount,
+      deadLetteredCount,
+      lastError,
+      now,
+      completedAt,
+      sendId,
+    )
+    .run();
+
+  const send = await getNewsletterSendSummary(db, sendId);
+  if (!send) {
+    throw new Error("Newsletter send not found after refresh");
+  }
+  return send;
+}
+
+function timestampColumnForStatus(
+  status: NewsletterSendRecipientStatus,
+): string | null {
+  switch (status) {
+    case "sending":
+      return "sendingAt";
+    case "providerAccepted":
+      return "providerAcceptedAt";
+    case "deliveryDelayed":
+      return "deliveryDelayedAt";
+    case "delivered":
+      return "deliveredAt";
+    case "bounced":
+      return "bouncedAt";
+    case "complained":
+      return "complainedAt";
+    case "failed":
+      return "failedAt";
+    case "deadLettered":
+      return "deadLetteredAt";
+    case "queued":
+      return "queuedAt";
+    case "retrying":
+      return null;
+  }
+}
+
+function terminalRecipientStatusRank(
+  status: NewsletterSendRecipientStatus,
+): number | null {
+  switch (status) {
+    case "delivered":
+      return 10;
+    case "failed":
+      return 20;
+    case "bounced":
+      return 30;
+    case "complained":
+      return 40;
+    case "deadLettered":
+      return 50;
+    case "queued":
+    case "sending":
+    case "providerAccepted":
+    case "deliveryDelayed":
+    case "retrying":
+      return null;
+  }
+}
+
+function shouldApplyRecipientStatusTransition(
+  currentStatus: NewsletterSendRecipientStatus,
+  nextStatus: NewsletterSendRecipientStatus,
+): boolean {
+  const currentRank = terminalRecipientStatusRank(currentStatus);
+  const nextRank = terminalRecipientStatusRank(nextStatus);
+  if (nextRank === null) {
+    return currentRank === null;
+  }
+  if (currentRank === null) {
+    return true;
+  }
+  return nextRank >= currentRank;
+}
+
+async function updateNewsletterSendRecipientStatus(
+  env: Bindings,
+  input: {
+    sendId: string;
+    newsletterId: string;
+    recipientHash: string;
+    status: NewsletterSendRecipientStatus;
+    eventType: string;
+    message?: string | null;
+    providerMessageId?: string | null;
+    providerPayload?: string | null;
+    failureType?: string | null;
+  },
+): Promise<{
+  send: NewsletterSendSummary;
+  recipient: NewsletterSendRecipient;
+  event: NewsletterSendEvent;
+} | null> {
+  const existing = await getNewsletterSendRecipientByHash(
+    env.DB,
+    input.sendId,
+    input.recipientHash,
+  );
+  if (!existing || existing.newsletterId !== input.newsletterId) {
+    return null;
+  }
+
+  const now = new Date().toISOString();
+  if (!shouldApplyRecipientStatusTransition(existing.status, input.status)) {
+    const send = await getNewsletterSendSummary(env.DB, input.sendId);
+    if (!send) {
+      return null;
+    }
+    const event = await recordNewsletterSendEvent(env.DB, {
+      sendId: input.sendId,
+      newsletterId: input.newsletterId,
+      recipient: existing,
+      eventType: input.eventType,
+      recipientStatus: existing.status,
+      sendStatus: send.status,
+      message: input.message ?? null,
+      providerMessageId: input.providerMessageId ?? existing.providerMessageId,
+      providerPayload: input.providerPayload ?? null,
+      now,
+    });
+    await broadcastNewsletterSendMessage(env, input.sendId, {
+      type: "sendEvent",
+      event,
+      send,
+      recipient: existing,
+    });
+    return { send, recipient: existing, event };
+  }
+
+  const timestampColumn = timestampColumnForStatus(input.status);
+  const timestampAssignment = timestampColumn ? `${timestampColumn} = ?,` : "";
+  const timestampValues = timestampColumn ? [now] : [];
+  const attempts =
+    input.status === "sending" ? existing.attempts + 1 : existing.attempts;
+  const lastError =
+    input.status === "retrying" ||
+    input.status === "failed" ||
+    input.status === "deadLettered"
+      ? input.message ?? existing.lastError
+      : null;
+
+  await env.DB.prepare(
+    `UPDATE NewsletterSendRecipient
+     SET status = ?,
+         attempts = ?,
+         provider_message_id = ?,
+         last_error = ?,
+         failure_type = ?,
+         ${timestampAssignment}
+         updatedAt = ?
+     WHERE send_id = ? AND recipient_hash = ?`,
+  )
+    .bind(
+      input.status,
+      attempts,
+      input.providerMessageId ?? existing.providerMessageId,
+      lastError,
+      input.failureType ?? null,
+      ...timestampValues,
+      now,
+      input.sendId,
+      input.recipientHash,
+    )
+    .run();
+
+  const recipient = await getNewsletterSendRecipientByHash(
+    env.DB,
+    input.sendId,
+    input.recipientHash,
+  );
+  if (!recipient) {
+    return null;
+  }
+  const send = await refreshNewsletterSendSummary(
+    env.DB,
+    input.sendId,
+    now,
+    lastError,
+  );
+  const event = await recordNewsletterSendEvent(env.DB, {
+    sendId: input.sendId,
+    newsletterId: input.newsletterId,
+    recipient,
+    eventType: input.eventType,
+    recipientStatus: input.status,
+    sendStatus: send.status,
+    message: input.message ?? null,
+    providerMessageId: input.providerMessageId ?? recipient.providerMessageId,
+    providerPayload: input.providerPayload ?? null,
+    now,
+  });
+  await broadcastNewsletterSendMessage(env, input.sendId, {
+    type: "sendEvent",
+    event,
+    send,
+    recipient,
+  });
+  return { send, recipient, event };
+}
+
+async function broadcastNewsletterSendMessage(
+  env: Bindings,
+  sendId: string,
+  message: NewsletterSendStreamMessage,
+): Promise<void> {
+  if (!env.SEND_STATUS_BROKER) {
+    return;
+  }
+  try {
+    const stub = env.SEND_STATUS_BROKER.getByName(sendId);
+    const response = await stub.fetch(
+      new Request("https://send-status-broker/broadcast", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(message),
+      }),
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Send status broadcast failed with status ${response.status}`,
+      );
+    }
+  } catch (error: unknown) {
+    logError("broadcast-newsletter-send-status", error);
+  }
+}
+
+function parsePublishSourceMessageRecord(
+  value: string | null,
+): PublishSourceMessageRecord | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as PublishSourceMessageRecord;
+    return parsed && typeof parsed === "object" ? parsed : { fileName: value };
+  } catch {
+    return { fileName: value };
+  }
 }
 
 async function getPublishSourceMessageKey(
@@ -2528,17 +3538,28 @@ async function publishNewsletter(
   const sourceMessageKey = sourceMessageId
     ? await getPublishSourceMessageKey(input.newsletterId, sourceMessageId)
     : null;
-  if (sourceMessageKey && (await env.KV.get(sourceMessageKey))) {
+  const sourceMessageRecord = sourceMessageKey
+    ? parsePublishSourceMessageRecord(await env.KV.get(sourceMessageKey))
+    : null;
+  if (sourceMessageRecord) {
+    const send = sourceMessageRecord.sendId
+      ? await getNewsletterSendSummary(env.DB, sourceMessageRecord.sendId)
+      : null;
     return {
       ok: true,
       newsletterId: input.newsletterId,
       subject,
+      sendId: sourceMessageRecord.sendId,
+      send: send ?? undefined,
       queuedCount: 0,
+      queueFailedCount: 0,
       duplicate: true,
     };
   }
 
   const timestamp = Date.now();
+  const now = new Date().toISOString();
+  const sendId = crypto.randomUUID();
   const fileName = `newsletters/${input.newsletterId}/${timestamp}.html`;
   const textFileName = `newsletters/${input.newsletterId}/${timestamp}.txt`;
 
@@ -2546,21 +3567,80 @@ async function publishNewsletter(
   await env.R2.put(textFileName, text);
 
   const subscribers = await getSubscribers(input.newsletterId, env.DB);
+  let send = await createNewsletterSend(env.DB, {
+    sendId,
+    newsletterId: input.newsletterId,
+    subject,
+    sourceMessageId,
+    recipientCount: subscribers.length,
+    now,
+  });
+  await recordNewsletterSendEvent(env.DB, {
+    sendId,
+    newsletterId: input.newsletterId,
+    eventType: "sendCreated",
+    sendStatus: send.status,
+    message: `Created send for ${subscribers.length} subscriber(s).`,
+    now,
+  });
 
+  let queuedCount = 0;
+  let queueFailedCount = 0;
   for (const subscriber of subscribers) {
-    await env.QUEUE.send({
-      email: subscriber.email,
+    const recipientHash = await sha256Hex(`${sendId}:${subscriber.email}`);
+    const recipient = await insertNewsletterSendRecipient(env.DB, {
+      sendId,
       newsletterId: input.newsletterId,
-      subject,
-      fileName,
-      textFileName,
+      email: subscriber.email,
+      recipientHash,
+      now,
     });
+    await recordNewsletterSendEvent(env.DB, {
+      sendId,
+      newsletterId: input.newsletterId,
+      recipient,
+      eventType: "recipientQueued",
+      recipientStatus: "queued",
+      sendStatus: send.status,
+      message: "Recipient queued for delivery.",
+      now,
+    });
+
+    try {
+      await env.QUEUE.send({
+        email: subscriber.email,
+        newsletterId: input.newsletterId,
+        subject,
+        fileName,
+        textFileName,
+        sendId,
+        recipientHash,
+      });
+      queuedCount += 1;
+    } catch (error: unknown) {
+      queueFailedCount += 1;
+      await updateNewsletterSendRecipientStatus(env, {
+        sendId,
+        newsletterId: input.newsletterId,
+        recipientHash,
+        status: "failed",
+        eventType: "queueFailed",
+        message:
+          error instanceof Error ? error.message : "Failed to enqueue recipient.",
+        failureType: "queue",
+      });
+    }
   }
+  send = await refreshNewsletterSendSummary(env.DB, sendId, new Date().toISOString());
 
   if (sourceMessageKey) {
-    await env.KV.put(sourceMessageKey, fileName, {
-      expirationTtl: PUBLISH_SOURCE_MESSAGE_TTL_SECONDS,
-    });
+    await env.KV.put(
+      sourceMessageKey,
+      JSON.stringify({ sendId, fileName } satisfies PublishSourceMessageRecord),
+      {
+        expirationTtl: PUBLISH_SOURCE_MESSAGE_TTL_SECONDS,
+      },
+    );
   }
 
   return {
@@ -2569,7 +3649,10 @@ async function publishNewsletter(
     subject,
     fileName,
     textFileName,
-    queuedCount: subscribers.length,
+    sendId,
+    send,
+    queuedCount,
+    queueFailedCount,
     duplicate: false,
   };
 }
@@ -2605,7 +3688,78 @@ async function publishNewsletterEmail(
     sourceMessageId: input.sourceMessageId,
     allowEmptySubject: true,
     allowBlankContent: input.allowBlankContent,
-  });
+	  });
+	}
+
+export class SendStatusBroker {
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Bindings,
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/broadcast") {
+      const message = (await request.json()) as NewsletterSendStreamMessage;
+      for (const socket of this.state.getWebSockets()) {
+        try {
+          socket.send(JSON.stringify(message));
+        } catch {
+          socket.close(1011, "Failed to send status update");
+        }
+      }
+      return Response.json({ message: "Broadcast sent" });
+    }
+
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Expected WebSocket", { status: 426 });
+    }
+
+    const sendId = url.searchParams.get("sendId") ?? "";
+    const afterEventId = Math.max(
+      0,
+      Number(url.searchParams.get("afterEventId") ?? "0") || 0,
+    );
+    if (!isValidUuid(sendId)) {
+      return new Response("Invalid sendId", { status: 400 });
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    this.state.acceptWebSocket(server);
+    server.send(JSON.stringify({ type: "connected", sendId }));
+
+    const events = await getNewsletterSendEvents(
+      this.env.DB,
+      sendId,
+      afterEventId,
+    );
+    for (const event of events) {
+      const send = await getNewsletterSendSummary(this.env.DB, event.sendId);
+      const recipient = event.recipientHash
+        ? await getNewsletterSendRecipientByHash(
+            this.env.DB,
+            event.sendId,
+            event.recipientHash,
+          )
+        : null;
+      server.send(JSON.stringify({
+        type: "sendEvent",
+        event,
+        send: send ?? undefined,
+        recipient: recipient ?? undefined,
+      }));
+    }
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(socket: WebSocket, message: ArrayBuffer | string) {
+    if (message === "ping") {
+      socket.send("pong");
+    }
+  }
 }
 
 export default {
@@ -2659,13 +3813,41 @@ export default {
     batch: MessageBatch<NewsletterQueueMessage>,
     env: Bindings,
   ): Promise<void> {
+    const isDeadLetterBatch = batch.queue.endsWith("-dlq");
     for (const message of batch.messages) {
-      const { email, subject, newsletterId, fileName, textFileName } =
+      const { email, subject, newsletterId, fileName, textFileName, sendId } =
         message.body;
+      const trackedRecipientHash = message.body.recipientHash;
+
+      if (isDeadLetterBatch) {
+        if (sendId && trackedRecipientHash) {
+          await updateNewsletterSendRecipientStatus(env, {
+            sendId,
+            newsletterId,
+            recipientHash: trackedRecipientHash,
+            status: "deadLettered",
+            eventType: "deadLettered",
+            message: "Cloudflare Queue moved this recipient to the dead-letter queue.",
+            failureType: "deadLettered",
+          });
+        }
+        continue;
+      }
 
       console.log(`Sending email to ${email} for newsletter ${newsletterId}`);
 
       try {
+        if (sendId && trackedRecipientHash) {
+          await updateNewsletterSendRecipientStatus(env, {
+            sendId,
+            newsletterId,
+            recipientHash: trackedRecipientHash,
+            status: "sending",
+            eventType: "sending",
+            message: "Sending recipient email.",
+          });
+        }
+
         const object = await env.R2.get(fileName);
         if (!object) throw new Error("Failed to get HTML content from R2");
 
@@ -2680,7 +3862,8 @@ export default {
         const origin = getPublicOrigin(env);
         const oneClickUrl = `${origin}/api/subscribe/list-unsubscribe/${unsubscribeToken}`;
         const visibleUnsubscribeUrl = `${origin}/api/subscribe/unsubscribe/${unsubscribeToken}`;
-        const recipientHash = await sha256Hex(`${newsletterId}:${email}`);
+        const recipientHash =
+          trackedRecipientHash ?? (await sha256Hex(`${newsletterId}:${email}`));
         const deliverableHtml = appendUnsubscribeFooterToHtml(
           htmlContent,
           visibleUnsubscribeUrl,
@@ -2701,15 +3884,46 @@ export default {
               newsletterId,
               recipientHash,
               oneClickUrl,
+              sendId,
             ),
-            tags: buildNewsletterEmailTags(newsletterId, recipientHash),
+            tags: buildNewsletterEmailTags(newsletterId, recipientHash, sendId),
           },
         );
+        if (sendId && trackedRecipientHash) {
+          try {
+            await updateNewsletterSendRecipientStatus(env, {
+              sendId,
+              newsletterId,
+              recipientHash: trackedRecipientHash,
+              status: "providerAccepted",
+              eventType: "providerAccepted",
+              message: "SES accepted the email for delivery.",
+              providerMessageId: messageId ?? null,
+            });
+          } catch (trackingError: unknown) {
+            logError("track-provider-accepted", trackingError);
+          }
+        }
         console.log(
           `Email sent to ${email}${messageId ? ` with SES message ${messageId}` : ""}`,
         );
       } catch (error: unknown) {
         console.error(`Failed to send email to ${email}:`, error);
+        if (sendId && trackedRecipientHash) {
+          try {
+            await updateNewsletterSendRecipientStatus(env, {
+              sendId,
+              newsletterId,
+              recipientHash: trackedRecipientHash,
+              status: "retrying",
+              eventType: "retrying",
+              message:
+                error instanceof Error ? error.message : "Recipient send failed.",
+            });
+          } catch (trackingError: unknown) {
+            logError("track-retrying", trackingError);
+          }
+        }
         message.retry();
       }
     }

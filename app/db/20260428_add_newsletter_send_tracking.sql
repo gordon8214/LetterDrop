@@ -1,48 +1,4 @@
--- schema.sql
-
-CREATE TABLE Newsletter (
-    id TEXT PRIMARY KEY,
-    title TEXT,
-    description TEXT,
-    logo TEXT,
-    subscribable BOOLEAN,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE Subscriber (
-    email TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    newsletter_id TEXT,
-    isSubscribed BOOLEAN,
-    upsertedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (email, newsletter_id),
-    FOREIGN KEY (newsletter_id) REFERENCES Newsletter(id)
-);
-
-CREATE TABLE AbuseEvent (
-    id TEXT PRIMARY KEY,
-    bucket TEXT NOT NULL,
-    key_hash TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_abuse_event_lookup ON AbuseEvent(bucket, key_hash, createdAt);
-
-CREATE TABLE SuppressionEvent (
-    id TEXT PRIMARY KEY,
-    email TEXT NOT NULL,
-    newsletter_id TEXT,
-    event_type TEXT NOT NULL,
-    provider_message_id TEXT,
-    provider_payload TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_suppression_event_lookup ON SuppressionEvent(email, newsletter_id, createdAt);
-
-CREATE TABLE NewsletterSend (
+CREATE TABLE IF NOT EXISTS NewsletterSend (
     id TEXT PRIMARY KEY,
     newsletter_id TEXT NOT NULL,
     subject TEXT NOT NULL,
@@ -65,9 +21,9 @@ CREATE TABLE NewsletterSend (
     FOREIGN KEY (newsletter_id) REFERENCES Newsletter(id)
 );
 
-CREATE INDEX idx_newsletter_send_lookup ON NewsletterSend(newsletter_id, createdAt);
+CREATE INDEX IF NOT EXISTS idx_newsletter_send_lookup ON NewsletterSend(newsletter_id, createdAt);
 
-CREATE TABLE NewsletterSendRecipient (
+CREATE TABLE IF NOT EXISTS NewsletterSendRecipient (
     id TEXT PRIMARY KEY,
     send_id TEXT NOT NULL,
     newsletter_id TEXT NOT NULL,
@@ -94,9 +50,9 @@ CREATE TABLE NewsletterSendRecipient (
     UNIQUE(send_id, recipient_hash)
 );
 
-CREATE INDEX idx_newsletter_send_recipient_provider ON NewsletterSendRecipient(provider_message_id);
+CREATE INDEX IF NOT EXISTS idx_newsletter_send_recipient_provider ON NewsletterSendRecipient(provider_message_id);
 
-CREATE TABLE NewsletterSendEvent (
+CREATE TABLE IF NOT EXISTS NewsletterSendEvent (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     send_id TEXT NOT NULL,
     newsletter_id TEXT NOT NULL,
@@ -115,4 +71,4 @@ CREATE TABLE NewsletterSendEvent (
     FOREIGN KEY (recipient_id) REFERENCES NewsletterSendRecipient(id)
 );
 
-CREATE INDEX idx_newsletter_send_event_stream ON NewsletterSendEvent(send_id, id);
+CREATE INDEX IF NOT EXISTS idx_newsletter_send_event_stream ON NewsletterSendEvent(send_id, id);
