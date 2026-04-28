@@ -443,6 +443,26 @@ function internalServerError(c: AppContext, scope: string, error: unknown) {
   return c.json({ error: INTERNAL_ERROR_MESSAGE }, 500);
 }
 
+function jsonResponseWithStatus(
+  body: Record<string, unknown>,
+  status: number,
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function getJsonStringField(
+  body: Record<string, unknown>,
+  field: string,
+): string | null {
+  const value = body[field];
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
 async function readRequestBytesWithLimit(
   request: Request,
   maxBytes: number,
@@ -1241,6 +1261,47 @@ app.get("/api/newsletter/publish-config", async (c) => {
   }
 
   return c.json({ emailAddress });
+});
+
+app.get("/api/newsletter/ses-diagnostics", async (c) => {
+  const notificationSharedSecret = getNotificationSharedSecret(c.env);
+  if (!notificationSharedSecret) {
+    logError(
+      "ses-diagnostics",
+      new Error("NOTIFICATION_SHARED_SECRET secret is not configured"),
+    );
+    return c.json({ error: "Notification service unavailable" }, 503);
+  }
+
+  try {
+    const response = await c.env.NOTIFICATION.fetch(
+      new Request(`${NOTIFICATION_BASE_URL}/diagnostics/ses`, {
+        method: "GET",
+        headers: {
+          [NOTIFICATION_AUTH_HEADER]: notificationSharedSecret,
+        },
+      }),
+    );
+    const body = await response.json<unknown>().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return c.json({ error: "Invalid SES diagnostics response" }, 502);
+    }
+
+    const jsonBody = body as Record<string, unknown>;
+    if (!response.ok) {
+      const error =
+        getJsonStringField(jsonBody, "detail") ??
+        getJsonStringField(jsonBody, "error") ??
+        getJsonStringField(jsonBody, "message") ??
+        `Notification service returned HTTP ${response.status}`;
+      return jsonResponseWithStatus({ error }, response.status);
+    }
+
+    return c.json(jsonBody);
+  } catch (error: unknown) {
+    logError("ses-diagnostics", error);
+    return c.json({ error: "SES diagnostics unavailable" }, 502);
+  }
 });
 
 app.post("/api/newsletter/:newsletterId/publish", async (c) => {

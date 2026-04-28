@@ -824,6 +824,7 @@ describe('admin auth middleware', () => {
       '/api/newsletter',
       `/api/newsletter/${NEWSLETTER_ID}`,
       '/api/newsletter/publish-config',
+      '/api/newsletter/ses-diagnostics',
       `/api/newsletter/${NEWSLETTER_ID}/publish`,
       `/api/newsletter/${NEWSLETTER_ID}/subscribers`,
       `/api/newsletter/${NEWSLETTER_ID}/offline`,
@@ -884,6 +885,80 @@ describe('publish config', () => {
     expect(response.status).toBe(503)
     await expect(response.json()).resolves.toEqual({
       error: 'Publish email address unavailable',
+    })
+  })
+})
+
+describe('SES diagnostics admin endpoint', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('proxies SES diagnostics through the notification service binding', async () => {
+    const { env, notificationFetch } = createEnv()
+    const diagnostics = {
+      ok: true,
+      region: 'us-west-1',
+      fromAddress: 'contact@habengirma.com',
+      configurationSetName: 'haben-letterdrop',
+      checks: [
+        {
+          id: 'account',
+          label: 'SES account',
+          status: 'passed',
+          message: 'SES account sending is enabled with production access.',
+        },
+      ],
+    }
+    notificationFetch.mockResolvedValueOnce(new Response(JSON.stringify(diagnostics), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const response = await app.request('https://example.com/api/newsletter/ses-diagnostics', {
+      headers: { Authorization: 'Bearer admin-token' },
+    }, env)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual(diagnostics)
+    const request = notificationFetch.mock.calls[0]?.[0] as Request
+    expect(request.url).toBe('http://haben-notification/diagnostics/ses')
+    expect(request.method).toBe('GET')
+    expect(request.headers.get('X-LetterDrop-Notification-Token')).toBe('notification-secret')
+  })
+
+  it('fails closed when the notification shared secret is missing', async () => {
+    const { env, notificationFetch } = createEnv()
+    env.NOTIFICATION_SHARED_SECRET = ''
+
+    const response = await app.request('https://example.com/api/newsletter/ses-diagnostics', {
+      headers: { Authorization: 'Bearer admin-token' },
+    }, env)
+
+    expect(response.status).toBe(503)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Notification service unavailable',
+    })
+    expect(notificationFetch).not.toHaveBeenCalled()
+  })
+
+  it('returns notification diagnostics errors to the admin client', async () => {
+    const { env, notificationFetch } = createEnv()
+    notificationFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+      message: 'error',
+      detail: 'Email sender unavailable',
+    }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const response = await app.request('https://example.com/api/newsletter/ses-diagnostics', {
+      headers: { Authorization: 'Bearer admin-token' },
+    }, env)
+
+    expect(response.status).toBe(503)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Email sender unavailable',
     })
   })
 })
