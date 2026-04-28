@@ -53,6 +53,83 @@ paths:
         '500':
           description: Server error
 
+  /api/newsletter/publish-config:
+    get:
+      summary: Get newsletter publish configuration
+      description: Get the email address used to publish newsletters
+      security:
+        - AdminBearerAuth: []
+      responses:
+        '200':
+          description: Publish configuration retrieved successfully
+          schema:
+            $ref: '#/definitions/PublishConfig'
+        '503':
+          description: Publish email address is not configured
+
+  /api/newsletter/{newsletterId}/publish:
+    post:
+      summary: Publish a newsletter directly
+      description: Accept direct newsletter content from an authenticated admin client and enqueue delivery to subscribers.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+          format: uuid
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/DirectPublishNewsletterRequest'
+      responses:
+        '200':
+          description: Newsletter publish accepted
+          schema:
+            $ref: '#/definitions/PublishNewsletterResponse'
+        '400':
+          description: Invalid newsletter ID or publish payload
+        '401':
+          description: Missing or invalid admin bearer token
+        '404':
+          description: Newsletter not found
+        '413':
+          description: Publish payload is too large
+        '500':
+          description: Server error
+
+  /api/publish/google-workspace:
+    post:
+      summary: Publish a newsletter from Google Workspace
+      description: Accept a parsed Gmail message from the Google Workspace Apps Script bridge and enqueue delivery to subscribers.
+      security:
+        - PublishBridgeBearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/GoogleWorkspacePublishRequest'
+      responses:
+        '200':
+          description: Newsletter publish accepted
+          schema:
+            $ref: '#/definitions/PublishNewsletterResponse'
+        '400':
+          description: Invalid publish payload
+        '401':
+          description: Missing or invalid publish bridge bearer token
+        '403':
+          description: Sender is not in ALLOWED_EMAILS
+        '413':
+          description: Publish payload is too large
+        '503':
+          description: Publish bridge token is not configured
+        '500':
+          description: Server error
+
   /api/newsletter/{newsletterId}:
     get:
       summary: Get a single newsletter
@@ -446,6 +523,79 @@ definitions:
         type: string
         format: date-time
 
+  PublishConfig:
+    type: object
+    properties:
+      emailAddress:
+        type: string
+        format: email
+
+  GoogleWorkspacePublishRequest:
+    type: object
+    required:
+      - from
+      - subject
+      - html
+      - text
+    properties:
+      from:
+        type: string
+        description: Gmail sender header value, for example "Name <sender@example.com>".
+      subject:
+        type: string
+        description: Subject containing the [Newsletter-ID:<uuid>] tag.
+      html:
+        type: string
+        description: HTML body returned by GmailApp.getBody().
+      text:
+        type: string
+        description: Plain text body returned by GmailApp.getPlainBody().
+      messageId:
+        type: string
+        description: Gmail message ID used for duplicate suppression.
+      sourceMessageId:
+        type: string
+        description: Alternate source message ID used for duplicate suppression.
+      receivedAt:
+        type: string
+        format: date-time
+        description: Gmail received timestamp. Accepted for observability; not required for publishing.
+
+  DirectPublishNewsletterRequest:
+    type: object
+    required:
+      - subject
+      - html
+      - text
+    properties:
+      subject:
+        type: string
+        description: Newsletter subject without the [Newsletter-ID:<uuid>] tag.
+      html:
+        type: string
+        description: HTML body to send to subscribers.
+      text:
+        type: string
+        description: Plain text body used for validation and future plain-text delivery support.
+      sourceMessageId:
+        type: string
+        description: Optional idempotency key used for duplicate suppression.
+
+  PublishNewsletterResponse:
+    type: object
+    properties:
+      newsletterId:
+        type: string
+        format: uuid
+      subject:
+        type: string
+      fileName:
+        type: string
+      queuedCount:
+        type: integer
+      duplicate:
+        type: boolean
+
   Subscriber:
     type: object
     properties:
@@ -481,3 +631,8 @@ securityDefinitions:
     in: header
     name: Authorization
     description: Bearer token required by Worker-level admin auth middleware.
+  PublishBridgeBearerAuth:
+    type: apiKey
+    in: header
+    name: Authorization
+    description: Bearer token required by the Google Workspace publish bridge.

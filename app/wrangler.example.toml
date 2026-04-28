@@ -5,6 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 ALLOWED_EMAILS = "replace-with-allowed-emails"
+PUBLISH_EMAIL_ADDRESS = "replace-with-publish-email-address"
 TURNSTILE_SITE_KEY = "replace-with-turnstile-site-key"
 
 [[services]]

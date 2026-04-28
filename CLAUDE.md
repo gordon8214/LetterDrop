@@ -35,7 +35,7 @@ The Worker uses five Cloudflare bindings, all defined in `wrangler.toml`:
 
 - **Admin API** (`/api/newsletter*`): Bearer token auth (`ADMIN_API_TOKEN` secret) + Cloudflare Access headers. Fail-closed design.
 - **Public subscription** (`/newsletter/:id`): Turnstile CAPTCHA + 3-tier rate limiting (pre-Turnstile IP throttle, post-Turnstile IP throttle, per-target throttle). Tokens stored in KV with TTL.
-- **Email ingest**: Cloudflare Email Worker receives mail -> parsed with `postal-mime` -> stored in R2 -> fan-out via Queue -> delivered via NOTIFICATION service binding.
+- **Email ingest**: Cloudflare Email Worker receives mail, or the Google Workspace bridge posts parsed Gmail messages to `/api/publish/google-workspace`; both paths store HTML in R2, fan out via Queue, and deliver via the NOTIFICATION service binding.
 - **Queue consumer**: Reads HTML from R2 -> sends to each subscriber via NOTIFICATION.
 
 ### Database Migrations
@@ -48,8 +48,8 @@ wrangler d1 execute <db_name> --remote --file db/<migration>.sql
 ### Configuration
 
 - `app/wrangler.toml` is **gitignored** (contains real resource IDs). Copy from `app/wrangler.example.toml`.
-- Secrets (`ADMIN_API_TOKEN`, `TURNSTILE_SECRET_KEY`) are set via `wrangler secret put`.
-- Variables (`ALLOWED_EMAILS`, `TURNSTILE_SITE_KEY`) are set in `wrangler.toml` `[vars]`.
+- Secrets (`ADMIN_API_TOKEN`, `PUBLISH_BRIDGE_TOKEN`, `TURNSTILE_SECRET_KEY`) are set via `wrangler secret put`.
+- Variables (`ALLOWED_EMAILS`, `PUBLISH_EMAIL_ADDRESS`, `TURNSTILE_SITE_KEY`) are set in `wrangler.toml` `[vars]`.
 
 ### Security Model
 

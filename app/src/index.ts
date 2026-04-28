@@ -9,6 +9,8 @@ type Bindings = {
   R2: R2Bucket;
   QUEUE: Queue;
   ALLOWED_EMAILS: string;
+  PUBLISH_EMAIL_ADDRESS: string;
+  PUBLISH_BRIDGE_TOKEN: string;
   ADMIN_API_TOKEN: string;
   TURNSTILE_SECRET_KEY: string;
   TURNSTILE_SITE_KEY: string;
@@ -30,6 +32,48 @@ type SubscriptionTokenPayload = {
   lastName?: string | null;
 };
 
+type PublishNewsletterInput = {
+  newsletterId: string;
+  subject: unknown;
+  html: unknown;
+  text: unknown;
+  sourceMessageId?: unknown;
+  allowEmptySubject?: boolean;
+  allowBlankContent?: boolean;
+};
+
+type PublishNewsletterEmailInput = {
+  from: unknown;
+  subject: unknown;
+  html: unknown;
+  text: unknown;
+  sourceMessageId?: unknown;
+  allowBlankContent?: boolean;
+};
+
+type PublishNewsletterEmailSuccess = {
+  ok: true;
+  newsletterId: string;
+  subject: string;
+  fileName?: string;
+  queuedCount: number;
+  duplicate: boolean;
+};
+
+type PublishNewsletterEmailFailure = {
+  ok: false;
+  status: 400 | 403;
+  error: string;
+};
+
+type PublishNewsletterEmailResult =
+  | PublishNewsletterEmailSuccess
+  | PublishNewsletterEmailFailure;
+
+type LimitedJsonObjectResult =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; response: Response };
+
 const NOTIFICATION_BASE_URL = "http://haben-notification";
 const D1_BATCH_LIMIT = 100;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -45,6 +89,8 @@ const POST_TURNSTILE_IP_MAX_REQUESTS = 20;
 const POST_TURNSTILE_TARGET_MAX_REQUESTS = 3;
 const POST_TURNSTILE_WINDOW_SECONDS = 60 * 60;
 const MISSING_ABUSE_EVENT_TABLE_FRAGMENT = "no such table: AbuseEvent";
+const PUBLISH_SOURCE_MESSAGE_TTL_SECONDS = 60 * 60 * 24 * 30;
+const MAX_PUBLISH_REQUEST_BYTES = 5 * 1024 * 1024;
 
 let hasLoggedMissingAbuseEventMigration = false;
 
@@ -83,6 +129,54 @@ function normalizeEmail(value: unknown): string | null {
   }
   const normalized = value.trim().toLowerCase();
   return EMAIL_REGEX.test(normalized) ? normalized : null;
+}
+
+function normalizeNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function extractEmailAddress(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const angleAddressMatch = value.match(/<([^<>]+)>/);
+  if (angleAddressMatch) {
+    return normalizeEmail(angleAddressMatch[1]);
+  }
+
+  return normalizeEmail(value);
+}
+
+function getAllowedSenderEmails(env: Bindings): string[] {
+  return env.ALLOWED_EMAILS.split(",")
+    .map((email) => normalizeEmail(email))
+    .filter((email): email is string => Boolean(email));
+}
+
+function parseNewsletterEmailSubject(
+  subject: string,
+): { newsletterId: string; subject: string } | null {
+  const newsletterIdMatch = subject.match(
+    /\[Newsletter-ID:([0-9a-f-]{36})\]/i,
+  );
+  if (!newsletterIdMatch) {
+    return null;
+  }
+  const newsletterId = newsletterIdMatch[1];
+
+  if (!isValidUuid(newsletterId)) {
+    return null;
+  }
+
+  return {
+    newsletterId,
+    subject: subject.replace(newsletterIdMatch[0], "").trim(),
+  };
 }
 
 function isValidUuid(value: string): boolean {
@@ -136,6 +230,91 @@ function logError(scope: string, error: unknown) {
 function internalServerError(c: AppContext, scope: string, error: unknown) {
   logError(scope, error);
   return c.json({ error: INTERNAL_ERROR_MESSAGE }, 500);
+}
+
+async function readRequestBytesWithLimit(
+  request: Request,
+  maxBytes: number,
+): Promise<Uint8Array | null> {
+  const reader = request.body?.getReader();
+  if (!reader) {
+    return new Uint8Array();
+  }
+
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+
+  const result = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+async function readLimitedJsonObject(
+  c: AppContext,
+): Promise<LimitedJsonObjectResult> {
+  const contentLength = Number(c.req.header("Content-Length") ?? "0");
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > MAX_PUBLISH_REQUEST_BYTES
+  ) {
+    return {
+      ok: false,
+      response: c.json({ error: "Request body too large" }, 413),
+    };
+  }
+
+  const bodyBytes = await readRequestBytesWithLimit(
+    c.req.raw,
+    MAX_PUBLISH_REQUEST_BYTES,
+  );
+  if (!bodyBytes) {
+    return {
+      ok: false,
+      response: c.json({ error: "Request body too large" }, 413),
+    };
+  }
+
+  try {
+    const parsedBody = JSON.parse(new TextDecoder().decode(bodyBytes)) as unknown;
+    if (
+      !parsedBody ||
+      typeof parsedBody !== "object" ||
+      Array.isArray(parsedBody)
+    ) {
+      return {
+        ok: false,
+        response: c.json({ error: "Invalid JSON payload" }, 400),
+      };
+    }
+
+    return { ok: true, body: parsedBody as Record<string, unknown> };
+  } catch (error: unknown) {
+    if (error instanceof SyntaxError) {
+      return {
+        ok: false,
+        response: c.json({ error: "Invalid JSON payload" }, 400),
+      };
+    }
+    throw error;
+  }
 }
 
 function parseSubscriptionToken(
@@ -414,6 +593,108 @@ app.get("/api/newsletter", async (c) => {
     return c.json({ newsletters: results, pagination: { page, limit, total } });
   } catch (error: unknown) {
     return internalServerError(c, "list-newsletters", error);
+  }
+});
+
+app.get("/api/newsletter/publish-config", async (c) => {
+  const emailAddress = normalizeEmail(c.env.PUBLISH_EMAIL_ADDRESS);
+  if (!emailAddress) {
+    return c.json({ error: "Publish email address unavailable" }, 503);
+  }
+
+  return c.json({ emailAddress });
+});
+
+app.post("/api/newsletter/:newsletterId/publish", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+
+  try {
+    const newsletter = await c.env.DB.prepare(
+      `SELECT id FROM Newsletter WHERE id = ?`,
+    )
+      .bind(newsletterId)
+      .first<{ id: string }>();
+
+    if (!newsletter) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
+
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const body = parsedBody.body;
+
+    const result = await publishNewsletter(c.env, {
+      newsletterId,
+      subject: body.subject,
+      html: body.html,
+      text: body.text,
+      sourceMessageId: body.sourceMessageId,
+    });
+
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+
+    return c.json({
+      newsletterId: result.newsletterId,
+      subject: result.subject,
+      fileName: result.fileName,
+      queuedCount: result.queuedCount,
+      duplicate: result.duplicate,
+    });
+  } catch (error: unknown) {
+    return internalServerError(c, "publish-newsletter-direct", error);
+  }
+});
+
+app.post("/api/publish/google-workspace", async (c) => {
+  const bridgeToken = c.env.PUBLISH_BRIDGE_TOKEN?.trim();
+  if (!bridgeToken) {
+    logError(
+      "publish-bridge-auth",
+      new Error("PUBLISH_BRIDGE_TOKEN secret is not configured"),
+    );
+    return c.json({ error: "Publish bridge unavailable" }, 503);
+  }
+
+  const requestToken = getBearerToken(c.req.header("Authorization"));
+  if (!requestToken || !timingSafeEqual(requestToken, bridgeToken)) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const body = parsedBody.body;
+
+    const result = await publishNewsletterEmail(c.env, {
+      from: body.from,
+      subject: body.subject,
+      html: body.html,
+      text: body.text,
+      sourceMessageId: body.sourceMessageId ?? body.messageId,
+    });
+
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+
+    return c.json({
+      newsletterId: result.newsletterId,
+      subject: result.subject,
+      fileName: result.fileName,
+      queuedCount: result.queuedCount,
+      duplicate: result.duplicate,
+    });
+  } catch (error: unknown) {
+    return internalServerError(c, "publish-google-workspace", error);
   }
 });
 
@@ -1286,6 +1567,117 @@ async function getSubscribers(
   return results as { email: string }[];
 }
 
+async function getPublishSourceMessageKey(
+  newsletterId: string,
+  sourceMessageId: string,
+): Promise<string> {
+  return `publish-source-message:${newsletterId}:${await sha256Hex(sourceMessageId)}`;
+}
+
+async function publishNewsletter(
+  env: Bindings,
+  input: PublishNewsletterInput,
+): Promise<PublishNewsletterEmailResult> {
+  if (typeof input.subject !== "string") {
+    return { ok: false, status: 400, error: "Subject is required" };
+  }
+  const subject = input.subject.trim();
+  if (!input.allowEmptySubject && subject.length === 0) {
+    return { ok: false, status: 400, error: "Subject is required" };
+  }
+
+  const html = typeof input.html === "string" ? input.html : "";
+  const text = typeof input.text === "string" ? input.text : "";
+  const hasContent = input.allowBlankContent
+    ? html.length > 0 && text.length > 0
+    : html.trim().length > 0 && text.trim().length > 0;
+  if (!hasContent) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Email html and text are required",
+    };
+  }
+
+  const sourceMessageId = normalizeNonEmptyString(input.sourceMessageId);
+  const sourceMessageKey = sourceMessageId
+    ? await getPublishSourceMessageKey(input.newsletterId, sourceMessageId)
+    : null;
+  if (sourceMessageKey && (await env.KV.get(sourceMessageKey))) {
+    return {
+      ok: true,
+      newsletterId: input.newsletterId,
+      subject,
+      queuedCount: 0,
+      duplicate: true,
+    };
+  }
+
+  const fileName = `newsletters/${input.newsletterId}/${Date.now()}.html`;
+
+  await env.R2.put(fileName, html);
+
+  const subscribers = await getSubscribers(input.newsletterId, env.DB);
+
+  for (const subscriber of subscribers) {
+    await env.QUEUE.send({
+      email: subscriber.email,
+      newsletterId: input.newsletterId,
+      subject,
+      fileName,
+    });
+  }
+
+  if (sourceMessageKey) {
+    await env.KV.put(sourceMessageKey, fileName, {
+      expirationTtl: PUBLISH_SOURCE_MESSAGE_TTL_SECONDS,
+    });
+  }
+
+  return {
+    ok: true,
+    newsletterId: input.newsletterId,
+    subject,
+    fileName,
+    queuedCount: subscribers.length,
+    duplicate: false,
+  };
+}
+
+async function publishNewsletterEmail(
+  env: Bindings,
+  input: PublishNewsletterEmailInput,
+): Promise<PublishNewsletterEmailResult> {
+  const sender = extractEmailAddress(input.from);
+  if (!sender || !getAllowedSenderEmails(env).includes(sender)) {
+    return { ok: false, status: 403, error: "Sender not allowed" };
+  }
+
+  const rawSubject = normalizeNonEmptyString(input.subject);
+  if (!rawSubject) {
+    return { ok: false, status: 400, error: "Subject is required" };
+  }
+
+  const parsedSubject = parseNewsletterEmailSubject(rawSubject);
+  if (!parsedSubject) {
+    return {
+      ok: false,
+      status: 400,
+      error: "No Newsletter ID found in subject",
+    };
+  }
+
+  return publishNewsletter(env, {
+    newsletterId: parsedSubject.newsletterId,
+    subject: parsedSubject.subject,
+    html: input.html,
+    text: input.text,
+    sourceMessageId: input.sourceMessageId,
+    allowEmptySubject: true,
+    allowBlankContent: input.allowBlankContent,
+  });
+}
+
 export default {
   fetch: app.fetch,
   async email(
@@ -1293,30 +1685,17 @@ export default {
     env: Bindings,
     ctx: ExecutionContext,
   ) {
-    const allowedEmails = env.ALLOWED_EMAILS.split(",")
-      .map((email) => email.trim().toLowerCase())
-      .filter((email) => email.length > 0);
-    const sender = message.from.trim().toLowerCase();
-
-    if (allowedEmails.indexOf(sender) === -1) {
-      message.setReject("Address not allowed");
-      return;
-    }
-
     const subject = message.headers.get("subject") ?? "";
 
     console.log(`Processing email with subject: ${subject}`);
 
-    const newsletterIdMatch = subject.match(
-      /\[Newsletter-ID:([a-f0-9-]{36})\]/,
-    );
-    const newsletterId = newsletterIdMatch ? newsletterIdMatch[1] : null;
+    const sender = extractEmailAddress(message.from);
+    if (!sender || !getAllowedSenderEmails(env).includes(sender)) {
+      message.setReject("Address not allowed");
+      return;
+    }
 
-    const realSubject = subject
-      .replace(/\[Newsletter-ID:[a-f0-9-]{36}\]/, "")
-      .trim();
-
-    if (!newsletterId) {
+    if (!parseNewsletterEmailSubject(subject)) {
       message.setReject("No Newsletter ID found in subject");
       return;
     }
@@ -1328,20 +1707,22 @@ export default {
       console.error(`Can not parse email`);
       return;
     }
+    const result = await publishNewsletterEmail(env, {
+      from: message.from,
+      subject,
+      html: parsedEmail.html,
+      text: parsedEmail.text,
+      sourceMessageId: message.headers.get("message-id") ?? undefined,
+      allowBlankContent: true,
+    });
 
-    const fileName = `newsletters/${newsletterId}/${Date.now()}.html`;
-
-    await env.R2.put(fileName, parsedEmail.html);
-
-    const subscribers = await getSubscribers(newsletterId, env.DB);
-
-    for (const subscriber of subscribers) {
-      await env.QUEUE.send({
-        email: subscriber.email,
-        newsletterId,
-        subject: realSubject,
-        fileName,
-      });
+    if (!result.ok) {
+      if (result.status === 403) {
+        message.setReject("Address not allowed");
+        return;
+      }
+      message.setReject(result.error);
+      return;
     }
   },
   async queue(

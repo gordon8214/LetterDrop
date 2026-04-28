@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { forbiddenPatterns } from './wrangler-definitions.mjs'
+import { forbiddenPatterns, requiredBindings } from './wrangler-definitions.mjs'
 
 const wranglerFile = resolve(process.cwd(), 'wrangler.toml')
 
@@ -15,7 +15,14 @@ if (!existsSync(wranglerFile)) {
 const content = readFileSync(wranglerFile, 'utf8')
 const lines = content.split('\n')
 
+const missing = []
 const violations = []
+
+for (const { key, label } of requiredBindings) {
+  if (!content.includes(key)) {
+    missing.push(label)
+  }
+}
 
 for (let index = 0; index < lines.length; index += 1) {
   const line = lines[index]
@@ -28,6 +35,14 @@ for (let index = 0; index < lines.length; index += 1) {
       })
     }
   }
+}
+
+if (missing.length > 0) {
+  console.error('app/wrangler.toml is missing required bindings:')
+  for (const label of missing) {
+    console.error(`  - ${label}`)
+  }
+  process.exit(1)
 }
 
 if (violations.length > 0) {

@@ -48,14 +48,52 @@ __NOTE:__ The newsletter page link pattern is `https://<<your-domain>>/newslette
 
 ### Publish a newsletter
 
-The LetterDrop use the Cloudflare Email Worker to send emails. And there is a `ALLOWED_EMAILS` variable to control who can send newsletters. You can use the Cloudflare dashboard to update the variable.
+LetterDrop can publish newsletters from the admin API or from inbound email.
 
-After that, you can publish a newsletter by sending your newsletter content to this specific email address. And the Email Worker will send the newsletter to all subscribers.
+To publish directly through the admin API, send the newsletter content to `/api/newsletter/:id/publish` with the admin bearer token:
+
+```bash
+curl --request POST \
+  --url https://newsletter.habengirma.com/api/newsletter/9080f810-e0f7-43aa-bac8-8d1cb3ceeff4/publish \
+  --header 'Authorization: Bearer <ADMIN_API_TOKEN>' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "subject": "BMPI Weekly Newsletter - 20240623",
+    "html": "<h1>Hello subscribers</h1>",
+    "text": "Hello subscribers",
+    "sourceMessageId": "optional-idempotency-key"
+  }'
+```
+
+LetterDrop can also publish newsletters from inbound email. The `ALLOWED_EMAILS` variable controls who can send newsletters through the inbound email paths.
+
+If Cloudflare Email Routing is available, send newsletter content to the Email Routing address that triggers this Worker.
+
+If inbound email is hosted in Google Workspace, use the Google Workspace bridge in `app/integrations/google-workspace-publish-bridge.gs`. Create a publish mailbox or alias, for example `publish@habengirma.com`, let the Apps Script read that mailbox, and have it POST matching Gmail messages to `/api/publish/google-workspace`.
 
 __NOTE:__
 
 - You should config the Email Worker to let it can be triggered by the specific email address. Please refer to the [Cloudflare Email Worker](https://developers.cloudflare.com/email-routing/setup/email-routing-addresses/) to know how to do it.
-- The newsletter email subject should be `[Newsletter-ID:<<the-newsletter-id>>]<<your-newsletter-title>>`, e.g. `[Newsletter-ID:9080f810-e0f7-43aa-bac8-8d1cb3ceeff4]BMPI Weekly Newsletter - 20240623`.
+- Set `PUBLISH_EMAIL_ADDRESS` to the address users should send newsletter drafts to. Admin clients use `/api/newsletter/publish-config` to prefill compose windows.
+- Set `PUBLISH_BRIDGE_TOKEN` as a Worker secret only when using the Google Workspace bridge. Store the same value in the Apps Script property `LETTERDROP_PUBLISH_TOKEN`.
+- Inbound email subjects should be `[Newsletter-ID:<<the-newsletter-id>>]<<your-newsletter-title>>`, e.g. `[Newsletter-ID:9080f810-e0f7-43aa-bac8-8d1cb3ceeff4]BMPI Weekly Newsletter - 20240623`. Direct API publish requests use the newsletter ID from the path and do not need this subject tag.
+
+#### Google Workspace bridge setup
+
+1. Create a Google Workspace mailbox, alias, or group for publishing, for example `publish@habengirma.com`.
+2. Generate a random bridge token and set it as a Worker secret:
+
+```bash
+cd app
+npx wrangler secret put PUBLISH_BRIDGE_TOKEN
+```
+
+3. Copy `app/integrations/google-workspace-publish-bridge.gs` into an Apps Script project owned by the account that receives the publish messages.
+4. Set these Apps Script properties:
+   - `LETTERDROP_PUBLISH_ENDPOINT`: `https://newsletter.habengirma.com/api/publish/google-workspace`
+   - `LETTERDROP_PUBLISH_TOKEN`: the same value as `PUBLISH_BRIDGE_TOKEN`
+   - `LETTERDROP_PUBLISH_TO`: the publish mailbox or alias, for example `publish@habengirma.com`
+5. Run `createLetterDropPublishTrigger()` once in Apps Script to process matching messages every five minutes.
 
 ## How to deploy?
 
@@ -81,11 +119,13 @@ cp app/wrangler.example.toml app/wrangler.toml
 ### Variables
 
 - `ALLOWED_EMAILS`: Comma-separated sender allowlist for the email worker.
+- `PUBLISH_EMAIL_ADDRESS`: Email address that receives newsletter drafts. This can be a Cloudflare Email Routing address or a Google Workspace mailbox/alias used by the bridge.
 - `TURNSTILE_SITE_KEY`: Public site key for Cloudflare Turnstile.
 
 ### Secrets
 
 - `ADMIN_API_TOKEN`: Required bearer token for all `/api/newsletter*` admin APIs.
+- `PUBLISH_BRIDGE_TOKEN`: Required bearer token for `/api/publish/google-workspace` only.
 - `TURNSTILE_SECRET_KEY`: Secret key used to verify Turnstile tokens server-side.
 
 ### Deploy safety checks
