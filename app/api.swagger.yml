@@ -56,7 +56,7 @@ paths:
   /api/newsletter/publish-config:
     get:
       summary: Get newsletter publish configuration
-      description: Get the email address used to publish newsletters
+      description: Get the email address and sender display name used to publish newsletters.
       security:
         - AdminBearerAuth: []
       responses:
@@ -64,6 +64,26 @@ paths:
           description: Publish configuration retrieved successfully
           schema:
             $ref: '#/definitions/PublishConfig'
+        '503':
+          description: Publish email address is not configured
+    put:
+      summary: Update newsletter publish configuration
+      description: Update the sender display name used for future newsletter sends.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/UpdatePublishConfigRequest'
+      responses:
+        '200':
+          description: Publish configuration updated successfully
+          schema:
+            $ref: '#/definitions/PublishConfig'
+        '400':
+          description: Invalid publish configuration
         '503':
           description: Publish email address is not configured
 
@@ -704,6 +724,24 @@ definitions:
       emailAddress:
         type: string
         format: email
+      fromName:
+        type: string
+        x-nullable: true
+        maxLength: 120
+        pattern: '^[^\r\n<>]*$'
+        description: Optional sender display name used in the From header.
+
+  UpdatePublishConfigRequest:
+    type: object
+    required:
+      - fromName
+    properties:
+      fromName:
+        type: string
+        x-nullable: true
+        maxLength: 120
+        pattern: '^[^\r\n<>]*$'
+        description: Sender display name. Blank or null clears the display name.
 
   GoogleWorkspacePublishRequest:
     type: object

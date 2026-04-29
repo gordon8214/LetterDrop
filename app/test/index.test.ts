@@ -939,7 +939,68 @@ describe('publish config', () => {
     }, env)
 
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toEqual({ emailAddress: 'publish@example.com' })
+    await expect(response.json()).resolves.toEqual({
+      emailAddress: 'publish@example.com',
+      fromName: null,
+    })
+  })
+
+  it('stores, returns, and clears the sender display name', async () => {
+    const { env } = createEnv()
+
+    const saveResponse = await app.request('https://example.com/api/newsletter/publish-config', {
+      method: 'PUT',
+      headers: {
+        Authorization: 'Bearer admin-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fromName: '  Haben Girma  ' }),
+    }, env)
+    const getResponse = await app.request('https://example.com/api/newsletter/publish-config', {
+      headers: { Authorization: 'Bearer admin-token' },
+    }, env)
+    const clearResponse = await app.request('https://example.com/api/newsletter/publish-config', {
+      method: 'PUT',
+      headers: {
+        Authorization: 'Bearer admin-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fromName: '   ' }),
+    }, env)
+
+    expect(saveResponse.status).toBe(200)
+    await expect(saveResponse.json()).resolves.toEqual({
+      emailAddress: 'publish@example.com',
+      fromName: 'Haben Girma',
+    })
+    expect(getResponse.status).toBe(200)
+    await expect(getResponse.json()).resolves.toEqual({
+      emailAddress: 'publish@example.com',
+      fromName: 'Haben Girma',
+    })
+    expect(clearResponse.status).toBe(200)
+    await expect(clearResponse.json()).resolves.toEqual({
+      emailAddress: 'publish@example.com',
+      fromName: null,
+    })
+  })
+
+  it('rejects invalid sender display names', async () => {
+    const { env } = createEnv()
+
+    const response = await app.request('https://example.com/api/newsletter/publish-config', {
+      method: 'PUT',
+      headers: {
+        Authorization: 'Bearer admin-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fromName: 'Bad <Name>' }),
+    }, env)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({
+      error: 'fromName contains invalid characters',
+    })
   })
 
   it('returns 503 when the publish email address is missing or invalid', async () => {
@@ -1194,6 +1255,31 @@ describe('direct newsletter publish endpoint', () => {
     }))
     expect(db.newsletterSends.get(result.sendId)?.queuedCount).toBe(1)
     expect(db.newsletterSendRecipients.size).toBe(1)
+  })
+
+  it('snapshots the configured sender display name onto queued recipients', async () => {
+    const { env, db, queueSend } = createEnv()
+    await env.KV.put('publish-config', JSON.stringify({ fromName: 'Haben Girma' }))
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(response.status).toBe(200)
+    expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
+      email: 'first@example.com',
+      fromName: 'Haben Girma',
+    }))
   })
 
   it('does not requeue a direct publish source message that was already processed', async () => {
@@ -1857,6 +1943,7 @@ describe('newsletter queue delivery', () => {
       subject: 'Deliverability test',
       fileName,
       textFileName,
+      fromName: 'Haben Girma',
     })
 
     await worker.queue(batch, env)
@@ -1867,6 +1954,7 @@ describe('newsletter queue delivery', () => {
     expect(request.headers.get('X-LetterDrop-Notification-Token')).toBe('notification-secret')
     const body = await getNotificationRequestBody(notificationFetch)
     expect(body.mail_to).toBe('first@example.com')
+    expect(body.from_name).toBe('Haben Girma')
     expect(body.subject).toBe('Deliverability test')
     expect(String(body.txt)).toContain('Plain text body')
     expect(String(body.txt)).toContain('Unsubscribe: https://newsletter.example.com/api/subscribe/unsubscribe/')

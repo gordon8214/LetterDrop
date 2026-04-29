@@ -55,9 +55,14 @@ type EmailTag = {
 };
 
 type SendEmailOptions = {
+  fromName?: string | null;
   headers?: EmailHeader[];
   tags?: EmailTag[];
   onProviderRequestStarted?: () => void;
+};
+
+type StoredPublishConfig = {
+  fromName: string | null;
 };
 
 type PublishNewsletterInput = {
@@ -112,6 +117,7 @@ type NewsletterQueueMessage = {
   subject: string;
   fileName: string;
   textFileName?: string;
+  fromName?: string | null;
   sendId?: string;
   recipientHash?: string;
 };
@@ -249,6 +255,7 @@ type SesNotification = {
 
 const NOTIFICATION_BASE_URL = "http://haben-notification";
 const NOTIFICATION_AUTH_HEADER = "X-LetterDrop-Notification-Token";
+const PUBLISH_CONFIG_KV_KEY = "publish-config";
 const DEFAULT_PUBLIC_ORIGIN = "https://newsletter.habengirma.com";
 const D1_BATCH_LIMIT = 100;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -265,6 +272,7 @@ const POST_TURNSTILE_TARGET_MAX_REQUESTS = 3;
 const POST_TURNSTILE_WINDOW_SECONDS = 60 * 60;
 const MISSING_ABUSE_EVENT_TABLE_FRAGMENT = "no such table: AbuseEvent";
 const MAX_PUBLISH_REQUEST_BYTES = 5 * 1024 * 1024;
+const MAX_FROM_NAME_LENGTH = 120;
 const MAX_SUPPRESSION_PAYLOAD_LENGTH = 20_000;
 const NEWSLETTER_SEND_EVENT_PAGE_SIZE = 500;
 
@@ -313,6 +321,62 @@ function normalizeNonEmptyString(value: unknown): string | null {
   }
   const normalized = value.trim();
   return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeFromNameForStorage(
+  value: unknown,
+): { ok: true; fromName: string | null } | { ok: false; error: string } {
+  if (value === null) {
+    return { ok: true, fromName: null };
+  }
+  if (typeof value !== "string") {
+    return { ok: false, error: "fromName must be a string or null" };
+  }
+
+  const fromName = value.trim();
+  if (fromName.length === 0) {
+    return { ok: true, fromName: null };
+  }
+  if (fromName.length > MAX_FROM_NAME_LENGTH) {
+    return { ok: false, error: "fromName must be 120 characters or fewer" };
+  }
+  if (/[\r\n<>]/.test(fromName)) {
+    return { ok: false, error: "fromName contains invalid characters" };
+  }
+  return { ok: true, fromName };
+}
+
+function parseStoredPublishConfig(value: string | null): StoredPublishConfig {
+  if (!value) {
+    return { fromName: null };
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { fromName: null };
+    }
+    const fromName = (parsed as Record<string, unknown>).fromName;
+    const normalized = normalizeFromNameForStorage(fromName ?? null);
+    return { fromName: normalized.ok ? normalized.fromName : null };
+  } catch {
+    return { fromName: null };
+  }
+}
+
+async function getPublishConfig(env: Bindings): Promise<StoredPublishConfig> {
+  return parseStoredPublishConfig(await env.KV.get(PUBLISH_CONFIG_KV_KEY));
+}
+
+async function storePublishConfig(
+  env: Bindings,
+  config: StoredPublishConfig,
+): Promise<void> {
+  if (!config.fromName) {
+    await env.KV.delete(PUBLISH_CONFIG_KV_KEY);
+    return;
+  }
+  await env.KV.put(PUBLISH_CONFIG_KV_KEY, JSON.stringify(config));
 }
 
 function getPublicOrigin(env: Bindings): string {
@@ -1262,7 +1326,40 @@ app.get("/api/newsletter/publish-config", async (c) => {
     return c.json({ error: "Publish email address unavailable" }, 503);
   }
 
-  return c.json({ emailAddress });
+  try {
+    const publishConfig = await getPublishConfig(c.env);
+    return c.json({ emailAddress, fromName: publishConfig.fromName });
+  } catch (error: unknown) {
+    return internalServerError(c, "get-publish-config", error);
+  }
+});
+
+app.put("/api/newsletter/publish-config", async (c) => {
+  const emailAddress = normalizeEmail(c.env.PUBLISH_EMAIL_ADDRESS);
+  if (!emailAddress) {
+    return c.json({ error: "Publish email address unavailable" }, 503);
+  }
+
+  try {
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+
+    if (!Object.hasOwn(parsedBody.body, "fromName")) {
+      return c.json({ error: "fromName is required" }, 400);
+    }
+
+    const normalized = normalizeFromNameForStorage(parsedBody.body.fromName);
+    if (!normalized.ok) {
+      return c.json({ error: normalized.error }, 400);
+    }
+
+    await storePublishConfig(c.env, { fromName: normalized.fromName });
+    return c.json({ emailAddress, fromName: normalized.fromName });
+  } catch (error: unknown) {
+    return internalServerError(c, "update-publish-config", error);
+  }
 });
 
 app.get("/api/newsletter/ses-diagnostics", async (c) => {
@@ -2400,10 +2497,15 @@ const sendEmail = async (
     subject: string;
     txt: string;
     html: string;
+    from_name?: string;
     headers?: EmailHeader[];
     tags?: EmailTag[];
   } = { mail_to: email, subject, txt, html };
 
+  const fromName = normalizeFromNameForStorage(options.fromName ?? null);
+  if (fromName.ok && fromName.fromName) {
+    body.from_name = fromName.fromName;
+  }
   if (options.headers && options.headers.length > 0) {
     body.headers = options.headers;
   }
@@ -3730,6 +3832,7 @@ async function publishNewsletter(
   await env.R2.put(textFileName, text);
 
   const subscribers = await getSubscribers(input.newsletterId, env.DB);
+  const publishConfig = await getPublishConfig(env);
   let send: NewsletterSendSummary;
   try {
     send = await createNewsletterSend(env.DB, {
@@ -3792,7 +3895,7 @@ async function publishNewsletter(
     });
 
     try {
-      await env.QUEUE.send({
+      const queueMessage: NewsletterQueueMessage = {
         email: subscriber.email,
         newsletterId: input.newsletterId,
         subject,
@@ -3800,7 +3903,11 @@ async function publishNewsletter(
         textFileName,
         sendId,
         recipientHash,
-      });
+      };
+      if (publishConfig.fromName) {
+        queueMessage.fromName = publishConfig.fromName;
+      }
+      await env.QUEUE.send(queueMessage);
       queuedCount += 1;
     } catch (error: unknown) {
       queueFailedCount += 1;
@@ -3989,7 +4096,7 @@ export default {
   ): Promise<void> {
     const isDeadLetterBatch = batch.queue.endsWith("-dlq");
     for (const message of batch.messages) {
-      const { email, subject, newsletterId, fileName, textFileName, sendId } =
+      const { email, subject, newsletterId, fileName, textFileName, fromName, sendId } =
         message.body;
       const trackedRecipientHash = message.body.recipientHash;
 
@@ -4058,6 +4165,7 @@ export default {
           deliverableText,
           deliverableHtml,
           {
+            fromName,
             headers: buildNewsletterListHeaders(
               newsletterId,
               recipientHash,
