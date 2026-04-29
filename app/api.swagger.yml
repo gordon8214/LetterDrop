@@ -712,6 +712,7 @@ definitions:
       - subject
       - html
       - text
+      - sourceMessageId
     properties:
       from:
         type: string
@@ -730,7 +731,7 @@ definitions:
         description: Gmail message ID used for duplicate suppression.
       sourceMessageId:
         type: string
-        description: Alternate source message ID used for duplicate suppression.
+        description: Required idempotency key used for duplicate suppression. messageId is accepted as a legacy alias.
       receivedAt:
         type: string
         format: date-time
@@ -742,6 +743,7 @@ definitions:
       - subject
       - html
       - text
+      - sourceMessageId
     properties:
       subject:
         type: string
@@ -754,7 +756,7 @@ definitions:
         description: Plain text body used for validation and future plain-text delivery support.
       sourceMessageId:
         type: string
-        description: Optional idempotency key used for duplicate suppression.
+        description: Required idempotency key used for duplicate suppression.
 
   PublishNewsletterResponse:
     type: object
@@ -820,6 +822,8 @@ definitions:
         type: integer
       deadLetteredCount:
         type: integer
+      needsReviewCount:
+        type: integer
       lastError:
         type: string
       createdAt:
@@ -862,6 +866,7 @@ definitions:
           - retrying
           - failed
           - deadLettered
+          - needsReview
       attempts:
         type: integer
       providerMessageId:
@@ -893,6 +898,9 @@ definitions:
         type: string
         format: date-time
       deadLetteredAt:
+        type: string
+        format: date-time
+      needsReviewAt:
         type: string
         format: date-time
       updatedAt:

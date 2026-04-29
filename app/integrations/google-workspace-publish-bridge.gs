@@ -84,6 +84,7 @@ function postMessageToLetterDrop(endpoint, token, message) {
       subject: message.getSubject(),
       html: message.getBody(),
       text: message.getPlainBody(),
+      sourceMessageId: message.getId(),
       messageId: message.getId(),
       receivedAt: message.getDate().toISOString()
     }),

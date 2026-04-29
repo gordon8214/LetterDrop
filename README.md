@@ -61,7 +61,7 @@ curl --request POST \
     "subject": "BMPI Weekly Newsletter - 20240623",
     "html": "<h1>Hello subscribers</h1>",
     "text": "Hello subscribers",
-    "sourceMessageId": "optional-idempotency-key"
+    "sourceMessageId": "required-idempotency-key"
   }'
 ```
 

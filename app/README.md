@@ -158,6 +158,6 @@ The `haben-letterdrop` SES configuration set must publish `Send`, `Reject`, `Del
 
 ## Send tracking
 
-Publishing creates a durable `sendId`, persists aggregate and recipient-level D1 rows, and queues each recipient with `sendId` plus `recipientHash`. The queue consumer updates recipient status as messages move through `queued`, `sending`, `providerAccepted`, `retrying`, `failed`, and `deadLettered`; SES SNS events can later move rows to `deliveryDelayed`, `delivered`, `bounced`, or `complained`.
+Publishing creates a durable `sendId`, persists aggregate and recipient-level D1 rows, and queues each recipient with `sendId` plus `recipientHash`. The queue consumer updates recipient status as messages move through `queued`, `sending`, `providerAccepted`, `retrying`, `failed`, `deadLettered`, and `needsReview`; SES SNS events can later move rows to `deliveryDelayed`, `delivered`, `bounced`, or `complained`. Reusing a `sourceMessageId` for the same newsletter returns the existing send permanently instead of queueing duplicate emails.
 
 The admin API exposes recent send history at `GET /api/newsletter/:newsletterId/sends`, full snapshots at `GET /api/newsletter/:newsletterId/sends/:sendId`, and live WebSocket updates at `GET /api/newsletter/:newsletterId/sends/:sendId/stream?afterEventId=<id>`. The WebSocket is backed by the `SendStatusBroker` Durable Object and uses the same Cloudflare Access plus admin bearer auth as the rest of the admin API.

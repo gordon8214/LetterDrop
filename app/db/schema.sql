@@ -58,6 +58,7 @@ CREATE TABLE NewsletterSend (
     complained_count INTEGER NOT NULL DEFAULT 0,
     failed_count INTEGER NOT NULL DEFAULT 0,
     dead_lettered_count INTEGER NOT NULL DEFAULT 0,
+    needs_review_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -66,6 +67,9 @@ CREATE TABLE NewsletterSend (
 );
 
 CREATE INDEX idx_newsletter_send_lookup ON NewsletterSend(newsletter_id, createdAt);
+CREATE UNIQUE INDEX idx_newsletter_send_source_message
+ON NewsletterSend(newsletter_id, source_message_id)
+WHERE source_message_id IS NOT NULL;
 
 CREATE TABLE NewsletterSendRecipient (
     id TEXT PRIMARY KEY,
@@ -87,6 +91,7 @@ CREATE TABLE NewsletterSendRecipient (
     complainedAt DATETIME,
     failedAt DATETIME,
     deadLetteredAt DATETIME,
+    needsReviewAt DATETIME,
     updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (send_id) REFERENCES NewsletterSend(id),
     FOREIGN KEY (newsletter_id) REFERENCES Newsletter(id),

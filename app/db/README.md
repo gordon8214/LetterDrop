@@ -23,3 +23,9 @@ wrangler d1 execute <d1_database_name> --remote --file db/20260223_add_abuse_eve
 ```bash
 wrangler d1 execute <d1_database_name> --remote --file db/20260428_add_newsletter_send_tracking.sql
 ```
+
+## Run duplicate-safe send tracking migration on existing database
+
+```bash
+wrangler d1 execute <d1_database_name> --remote --file db/20260429_add_duplicate_safe_send_tracking.sql
+```
