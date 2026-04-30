@@ -150,6 +150,22 @@ type NewsletterRecipientQueueMessage = {
   recipientHash?: string;
 };
 
+type NewsletterRecipientQueueEntry = {
+  email: string;
+  recipientHash: string;
+};
+
+type NewsletterRecipientBatchQueueMessage = {
+  kind: "recipientBatch";
+  newsletterId: string;
+  subject: string;
+  fileName: string;
+  textFileName?: string;
+  fromName?: string | null;
+  sendId: string;
+  recipients: NewsletterRecipientQueueEntry[];
+};
+
 type NewsletterFanoutQueueMessage = {
   kind: "fanout";
   newsletterId: string;
@@ -165,6 +181,7 @@ type NewsletterFanoutQueueMessage = {
 
 type NewsletterQueueMessage =
   | NewsletterRecipientQueueMessage
+  | NewsletterRecipientBatchQueueMessage
   | NewsletterFanoutQueueMessage;
 
 type NewsletterSendStatus =
@@ -3617,6 +3634,12 @@ function isFanoutQueueMessage(
   return "kind" in message && message.kind === "fanout";
 }
 
+function isRecipientBatchQueueMessage(
+  message: NewsletterQueueMessage,
+): message is NewsletterRecipientBatchQueueMessage {
+  return "kind" in message && message.kind === "recipientBatch";
+}
+
 function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendSummary {
   return {
     id: String(row.id ?? ""),
@@ -5095,19 +5118,20 @@ async function processNewsletterFanoutMessage(
     )
   )));
 
-  await env.QUEUE.sendBatch(recipients.map((recipient) => ({
-    body: {
-      kind: "recipient",
-      email: recipient.email,
+  await env.QUEUE.sendBatch([{
+    body: buildRecipientBatchQueueMessage({
       newsletterId: message.newsletterId,
       subject: message.subject,
       fileName: message.fileName,
       textFileName: message.textFileName,
       fromName: message.fromName,
       sendId: message.sendId,
-      recipientHash: recipient.recipientHash,
-    } satisfies NewsletterRecipientQueueMessage,
-  })));
+      recipients: recipients.map((recipient) => ({
+        email: recipient.email,
+        recipientHash: recipient.recipientHash,
+      })),
+    }),
+  }]);
 
   const nextCursorEmail = subscribers[subscribers.length - 1].email;
   const completed = subscribers.length < NEWSLETTER_FANOUT_CHUNK_SIZE;
@@ -5352,8 +5376,290 @@ async function publishNewsletterEmail(
     sourceMessageId: input.sourceMessageId,
     allowEmptySubject: true,
     allowBlankContent: input.allowBlankContent,
-	  });
-	}
+  });
+}
+
+type NewsletterRecipientDeliveryInput = {
+  email: string;
+  newsletterId: string;
+  subject: string;
+  fileName: string;
+  textFileName?: string;
+  fromName?: string | null;
+  sendId?: string;
+  recipientHash?: string;
+};
+
+type NewsletterRecipientBatchMetadata = {
+  newsletterId: string;
+  subject: string;
+  fileName: string;
+  textFileName?: string;
+  fromName?: string | null;
+  sendId: string;
+};
+
+function buildRecipientBatchQueueMessage(
+  input: NewsletterRecipientBatchMetadata & {
+    recipients: NewsletterRecipientQueueEntry[];
+  },
+): NewsletterRecipientBatchQueueMessage {
+  return {
+    kind: "recipientBatch",
+    newsletterId: input.newsletterId,
+    subject: input.subject,
+    fileName: input.fileName,
+    textFileName: input.textFileName,
+    fromName: input.fromName,
+    sendId: input.sendId,
+    recipients: input.recipients,
+  };
+}
+
+async function enqueueNewsletterRecipientBatch(
+  env: Bindings,
+  input: NewsletterRecipientBatchMetadata & {
+    recipients: NewsletterRecipientQueueEntry[];
+    delaySeconds?: number;
+  },
+): Promise<void> {
+  if (input.recipients.length === 0) {
+    return;
+  }
+
+  await env.QUEUE.send(
+    buildRecipientBatchQueueMessage(input),
+    input.delaySeconds ? { delaySeconds: input.delaySeconds } : undefined,
+  );
+}
+
+async function enqueueRecipientBatchFollowUps(
+  env: Bindings,
+  metadata: NewsletterRecipientBatchMetadata,
+  retryRecipient: NewsletterRecipientQueueEntry,
+  remainingRecipients: NewsletterRecipientQueueEntry[],
+): Promise<void> {
+  await enqueueNewsletterRecipientBatch(env, {
+    ...metadata,
+    recipients: [retryRecipient],
+    delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS,
+  });
+  await enqueueNewsletterRecipientBatch(env, {
+    ...metadata,
+    recipients: remainingRecipients,
+    delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS,
+  });
+}
+
+async function markNewsletterRecipientDeadLettered(
+  env: Bindings,
+  input: {
+    sendId?: string;
+    newsletterId: string;
+    recipientHash?: string;
+    includeQueued?: boolean;
+  },
+): Promise<void> {
+  if (!input.sendId || !input.recipientHash) {
+    return;
+  }
+
+  const recipient = await getNewsletterSendRecipientByHash(
+    env.DB,
+    input.sendId,
+    input.recipientHash,
+  );
+  if (
+    !recipient ||
+    recipient.newsletterId !== input.newsletterId ||
+    !(
+      recipient.status === "sending" ||
+      recipient.status === "retrying" ||
+      (input.includeQueued !== false && recipient.status === "queued")
+    )
+  ) {
+    return;
+  }
+
+  await updateNewsletterSendRecipientStatus(env, {
+    sendId: input.sendId,
+    newsletterId: input.newsletterId,
+    recipientHash: input.recipientHash,
+    status: "deadLettered",
+    eventType: "deadLettered",
+    message: "Cloudflare Queue moved this recipient to the dead-letter queue.",
+    failureType: "deadLettered",
+  });
+}
+
+async function handleRecipientBatchDeadLetter(
+  env: Bindings,
+  metadata: NewsletterRecipientBatchMetadata,
+  recipients: NewsletterRecipientQueueEntry[],
+): Promise<void> {
+  const queuedRecipients: NewsletterRecipientQueueEntry[] = [];
+  for (const recipient of recipients) {
+    const existing = await getNewsletterSendRecipientByHash(
+      env.DB,
+      metadata.sendId,
+      recipient.recipientHash,
+    );
+    if (!existing || existing.newsletterId !== metadata.newsletterId) {
+      continue;
+    }
+    if (existing.status === "queued") {
+      queuedRecipients.push(recipient);
+      continue;
+    }
+    await markNewsletterRecipientDeadLettered(env, {
+      sendId: metadata.sendId,
+      newsletterId: metadata.newsletterId,
+      recipientHash: recipient.recipientHash,
+      includeQueued: false,
+    });
+  }
+
+  await enqueueNewsletterRecipientBatch(env, {
+    ...metadata,
+    recipients: queuedRecipients,
+    delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS,
+  });
+}
+
+async function processNewsletterRecipientDelivery(
+  env: Bindings,
+  input: NewsletterRecipientDeliveryInput,
+): Promise<{ retry: boolean }> {
+  const {
+    email,
+    subject,
+    newsletterId,
+    fileName,
+    textFileName,
+    fromName,
+    sendId,
+    recipientHash: trackedRecipientHash,
+  } = input;
+
+  console.log(`Sending email to ${email} for newsletter ${newsletterId}`);
+
+  try {
+    if (sendId && trackedRecipientHash) {
+      const started = await beginNewsletterSendRecipientAttempt(env, {
+        sendId,
+        newsletterId,
+        recipientHash: trackedRecipientHash,
+      });
+      if (!started) {
+        console.log(
+          `Skipping duplicate queue delivery for ${email} on send ${sendId}`,
+        );
+        return { retry: false };
+      }
+    }
+
+    const object = await env.R2.get(fileName);
+    if (!object) throw new Error("Failed to get HTML content from R2");
+
+    const htmlContent = await object.text();
+    const textObject = textFileName ? await env.R2.get(textFileName) : null;
+    const textContent = textObject ? await textObject.text() : "";
+    const unsubscribeToken = await createUnsubscribeToken(
+      env,
+      email,
+      newsletterId,
+    );
+    const origin = getPublicOrigin(env);
+    const oneClickUrl = `${origin}/api/subscribe/list-unsubscribe/${unsubscribeToken}`;
+    const visibleUnsubscribeUrl = `${origin}/api/subscribe/unsubscribe/${unsubscribeToken}`;
+    const recipientHash =
+      trackedRecipientHash ?? (await sha256Hex(`${newsletterId}:${email}`));
+    const deliverableHtml = appendUnsubscribeFooterToHtml(
+      htmlContent,
+      visibleUnsubscribeUrl,
+    );
+    const deliverableText = appendUnsubscribeFooterToText(
+      textContent,
+      visibleUnsubscribeUrl,
+    );
+
+    const messageId = await sendEmail(
+      env,
+      email,
+      subject,
+      deliverableText,
+      deliverableHtml,
+      {
+        fromName,
+        headers: buildNewsletterListHeaders(
+          newsletterId,
+          recipientHash,
+          oneClickUrl,
+          sendId,
+        ),
+        tags: buildNewsletterEmailTags(newsletterId, recipientHash, sendId),
+        idempotencyKey: sendId
+          ? `newsletter:${sendId}:${recipientHash}`
+          : null,
+      },
+    );
+    if (sendId && trackedRecipientHash) {
+      try {
+        await updateNewsletterSendRecipientStatus(env, {
+          sendId,
+          newsletterId,
+          recipientHash: trackedRecipientHash,
+          status: "providerAccepted",
+          eventType: "providerAccepted",
+          message: "SES accepted the email for delivery.",
+          providerMessageId: messageId ?? null,
+        });
+      } catch (trackingError: unknown) {
+        logError("track-provider-accepted", trackingError);
+        try {
+          await updateNewsletterSendRecipientStatus(env, {
+            sendId,
+            newsletterId,
+            recipientHash: trackedRecipientHash,
+            status: "needsReview",
+            eventType: "needsReview",
+            message:
+              "SES accepted the email, but recording provider acceptance failed. "
+              + errorMessage(trackingError, "Provider acceptance tracking failed."),
+            providerMessageId: messageId ?? null,
+            failureType: "needsReview",
+          });
+        } catch (reviewError: unknown) {
+          logError("track-needs-review-after-provider-accepted", reviewError);
+        }
+      }
+    }
+    console.log(
+      `Email sent to ${email}${messageId ? ` with SES message ${messageId}` : ""}`,
+    );
+  } catch (error: unknown) {
+    console.error(`Failed to send email to ${email}:`, error);
+    const shouldRetry = shouldRetryRecipientError(error);
+    if (sendId && trackedRecipientHash) {
+      try {
+        await updateNewsletterSendRecipientStatus(env, {
+          sendId,
+          newsletterId,
+          recipientHash: trackedRecipientHash,
+          status: shouldRetry ? "retrying" : "needsReview",
+          eventType: shouldRetry ? "retrying" : "needsReview",
+          message: errorMessage(error, "Recipient send failed."),
+          failureType: shouldRetry ? null : "needsReview",
+        });
+      } catch (trackingError: unknown) {
+        logError(shouldRetry ? "track-retrying" : "track-needs-review", trackingError);
+      }
+    }
+    return { retry: shouldRetry };
+  }
+
+  return { retry: false };
+}
 
 export class SendStatusBroker {
   constructor(
@@ -5493,142 +5799,79 @@ export default {
         continue;
       }
 
+      if (isRecipientBatchQueueMessage(message.body)) {
+        const {
+          newsletterId,
+          subject,
+          fileName,
+          textFileName,
+          fromName,
+          sendId,
+          recipients,
+        } = message.body;
+        const metadata: NewsletterRecipientBatchMetadata = {
+          newsletterId,
+          subject,
+          fileName,
+          textFileName,
+          fromName,
+          sendId,
+        };
+
+        if (isDeadLetterBatch) {
+          await handleRecipientBatchDeadLetter(env, metadata, recipients);
+          continue;
+        }
+
+        for (const [index, recipient] of recipients.entries()) {
+          const result = await processNewsletterRecipientDelivery(env, {
+            email: recipient.email,
+            ...metadata,
+            recipientHash: recipient.recipientHash,
+          });
+          if (result.retry) {
+            try {
+              await enqueueRecipientBatchFollowUps(
+                env,
+                metadata,
+                recipient,
+                recipients.slice(index + 1),
+              );
+            } catch (error: unknown) {
+              logError("newsletter-recipient-requeue", error);
+              message.retry({ delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS });
+            }
+            break;
+          }
+        }
+        continue;
+      }
+
       const { email, subject, newsletterId, fileName, textFileName, fromName, sendId } =
         message.body;
       const trackedRecipientHash = message.body.recipientHash;
 
       if (isDeadLetterBatch) {
-        if (sendId && trackedRecipientHash) {
-          await updateNewsletterSendRecipientStatus(env, {
-            sendId,
-            newsletterId,
-            recipientHash: trackedRecipientHash,
-            status: "deadLettered",
-            eventType: "deadLettered",
-            message: "Cloudflare Queue moved this recipient to the dead-letter queue.",
-            failureType: "deadLettered",
-          });
-        }
+        await markNewsletterRecipientDeadLettered(env, {
+          sendId,
+          newsletterId,
+          recipientHash: trackedRecipientHash,
+        });
         continue;
       }
 
-      console.log(`Sending email to ${email} for newsletter ${newsletterId}`);
-
-      try {
-        if (sendId && trackedRecipientHash) {
-          const started = await beginNewsletterSendRecipientAttempt(env, {
-            sendId,
-            newsletterId,
-            recipientHash: trackedRecipientHash,
-          });
-          if (!started) {
-            console.log(
-              `Skipping duplicate queue delivery for ${email} on send ${sendId}`,
-            );
-            continue;
-          }
-        }
-
-        const object = await env.R2.get(fileName);
-        if (!object) throw new Error("Failed to get HTML content from R2");
-
-        const htmlContent = await object.text();
-        const textObject = textFileName ? await env.R2.get(textFileName) : null;
-        const textContent = textObject ? await textObject.text() : "";
-        const unsubscribeToken = await createUnsubscribeToken(
-          env,
-          email,
-          newsletterId,
-        );
-        const origin = getPublicOrigin(env);
-        const oneClickUrl = `${origin}/api/subscribe/list-unsubscribe/${unsubscribeToken}`;
-        const visibleUnsubscribeUrl = `${origin}/api/subscribe/unsubscribe/${unsubscribeToken}`;
-        const recipientHash =
-          trackedRecipientHash ?? (await sha256Hex(`${newsletterId}:${email}`));
-        const deliverableHtml = appendUnsubscribeFooterToHtml(
-          htmlContent,
-          visibleUnsubscribeUrl,
-        );
-        const deliverableText = appendUnsubscribeFooterToText(
-          textContent,
-          visibleUnsubscribeUrl,
-        );
-
-        const messageId = await sendEmail(
-          env,
-          email,
-          subject,
-          deliverableText,
-          deliverableHtml,
-          {
-            fromName,
-            headers: buildNewsletterListHeaders(
-              newsletterId,
-              recipientHash,
-              oneClickUrl,
-              sendId,
-            ),
-            tags: buildNewsletterEmailTags(newsletterId, recipientHash, sendId),
-            idempotencyKey: sendId
-              ? `newsletter:${sendId}:${recipientHash}`
-              : null,
-          },
-        );
-        if (sendId && trackedRecipientHash) {
-          try {
-            await updateNewsletterSendRecipientStatus(env, {
-              sendId,
-              newsletterId,
-              recipientHash: trackedRecipientHash,
-              status: "providerAccepted",
-              eventType: "providerAccepted",
-              message: "SES accepted the email for delivery.",
-              providerMessageId: messageId ?? null,
-            });
-          } catch (trackingError: unknown) {
-            logError("track-provider-accepted", trackingError);
-            try {
-              await updateNewsletterSendRecipientStatus(env, {
-                sendId,
-                newsletterId,
-                recipientHash: trackedRecipientHash,
-                status: "needsReview",
-                eventType: "needsReview",
-                message:
-                  "SES accepted the email, but recording provider acceptance failed. "
-                  + errorMessage(trackingError, "Provider acceptance tracking failed."),
-                providerMessageId: messageId ?? null,
-                failureType: "needsReview",
-              });
-            } catch (reviewError: unknown) {
-              logError("track-needs-review-after-provider-accepted", reviewError);
-            }
-          }
-        }
-        console.log(
-          `Email sent to ${email}${messageId ? ` with SES message ${messageId}` : ""}`,
-        );
-      } catch (error: unknown) {
-        console.error(`Failed to send email to ${email}:`, error);
-        const shouldRetry = shouldRetryRecipientError(error);
-        if (sendId && trackedRecipientHash) {
-          try {
-            await updateNewsletterSendRecipientStatus(env, {
-              sendId,
-              newsletterId,
-              recipientHash: trackedRecipientHash,
-              status: shouldRetry ? "retrying" : "needsReview",
-              eventType: shouldRetry ? "retrying" : "needsReview",
-              message: errorMessage(error, "Recipient send failed."),
-              failureType: shouldRetry ? null : "needsReview",
-            });
-          } catch (trackingError: unknown) {
-            logError(shouldRetry ? "track-retrying" : "track-needs-review", trackingError);
-          }
-        }
-        if (shouldRetry) {
-          message.retry({ delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS });
-        }
+      const result = await processNewsletterRecipientDelivery(env, {
+        email,
+        newsletterId,
+        subject,
+        fileName,
+        textFileName,
+        fromName,
+        sendId,
+        recipientHash: trackedRecipientHash,
+      });
+      if (result.retry) {
+        message.retry({ delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS });
       }
     }
   },

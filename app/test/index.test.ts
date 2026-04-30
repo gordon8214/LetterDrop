@@ -1190,6 +1190,27 @@ async function drainFirstFanoutJob(
   return batchMessages.map((entry) => entry.body)
 }
 
+function recipientEntriesFromQueueBody(body: Record<string, unknown>) {
+  if (body.kind === 'recipientBatch') {
+    return body.recipients as Array<{ email: string; recipientHash: string }>
+  }
+  return [{
+    email: String(body.email ?? ''),
+    recipientHash: String(body.recipientHash ?? ''),
+  }]
+}
+
+function firstRecipientHashFromQueueBody(body: Record<string, unknown>) {
+  return recipientEntriesFromQueueBody(body)[0]?.recipientHash ?? ''
+}
+
+function notificationSuccessResponse(messageId = 'ses-message-id') {
+  return new Response(JSON.stringify({ message: 'success', messageId }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
 async function getNotificationRequestBody(notificationFetch: ReturnType<typeof vi.fn>) {
   const request = notificationFetch.mock.calls.at(-1)?.[0] as Request
   return request.json() as Promise<Record<string, unknown>>
@@ -1663,9 +1684,13 @@ describe('direct newsletter publish endpoint', () => {
     const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
     expect(recipientMessages).toHaveLength(1)
     expect(recipientMessages[0]).toEqual(expect.objectContaining({
-      kind: 'recipient',
-      email: 'first@example.com',
-      recipientHash: expect.any(String),
+      kind: 'recipientBatch',
+      recipients: [
+        expect.objectContaining({
+          email: 'first@example.com',
+          recipientHash: expect.any(String),
+        }),
+      ],
     }))
     expect(db.newsletterSends.get(result.sendId)?.queuedCount).toBe(1)
     expect(db.newsletterSendRecipients.size).toBe(1)
@@ -1694,6 +1719,39 @@ describe('direct newsletter publish endpoint', () => {
       kind: 'fanout',
       fromName: 'Haben Girma',
     }))
+  })
+
+  it('queues exactly one recipient batch for a full fanout chunk', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv()
+    for (let index = 0; index < 15; index += 1) {
+      const email = `subscriber-${String(index).padStart(2, '0')}@example.com`
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    expect(response.status).toBe(200)
+
+    const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+
+    expect(queueSendBatch).toHaveBeenCalledTimes(1)
+    expect(recipientMessages).toHaveLength(1)
+    expect(recipientMessages[0]).toEqual(expect.objectContaining({
+      kind: 'recipientBatch',
+      sendId: expect.any(String),
+      recipients: expect.any(Array),
+    }))
+    expect(recipientEntriesFromQueueBody(recipientMessages[0])).toHaveLength(15)
   })
 
   it('dry-runs large publishes without storing content or queueing work', async () => {
@@ -1771,15 +1829,24 @@ describe('direct newsletter publish endpoint', () => {
       fanoutIndex += 1
     }
 
-    const recipientMessageCount = queueSendBatch.mock.calls.reduce((sum, call) => (
+    const recipientBatchMessageCount = queueSendBatch.mock.calls.reduce((sum, call) => (
       sum + (call[0] as Array<unknown>).length
     ), 0)
-    const maxFanoutBatchSize = Math.max(...queueSendBatch.mock.calls.map((call) => (
-      (call[0] as Array<unknown>).length
+    const recipientCount = queueSendBatch.mock.calls.reduce((sum, call) => (
+      sum + (call[0] as Array<{ body: Record<string, unknown> }>).reduce(
+        (batchSum, entry) => batchSum + recipientEntriesFromQueueBody(entry.body).length,
+        0
+      )
+    ), 0)
+    const maxRecipientBatchSize = Math.max(...queueSendBatch.mock.calls.flatMap((call) => (
+      (call[0] as Array<{ body: Record<string, unknown> }>).map((entry) =>
+        recipientEntriesFromQueueBody(entry.body).length
+      )
     )))
     expect(queueSendBatch).toHaveBeenCalledTimes(334)
-    expect(recipientMessageCount).toBe(5000)
-    expect(maxFanoutBatchSize).toBeLessThanOrEqual(15)
+    expect(recipientBatchMessageCount).toBe(334)
+    expect(recipientCount).toBe(5000)
+    expect(maxRecipientBatchSize).toBeLessThanOrEqual(15)
     expect(Math.max(...operationCounts)).toBeLessThanOrEqual(50)
     expect(db.newsletterSendRecipients.size).toBe(5000)
     expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
@@ -2025,7 +2092,9 @@ describe('direct newsletter publish endpoint', () => {
     const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
 
     expect(result.recipientCount).toBe(1)
-    expect(recipientMessages.map((message) => message.email)).toEqual(['first@example.com'])
+    expect(recipientMessages.flatMap(recipientEntriesFromQueueBody).map((recipient) => (
+      recipient.email
+    ))).toEqual(['first@example.com'])
   })
 
   it('counts only unfanned subscribers when a later fanout job dead-letters', async () => {
@@ -2052,9 +2121,8 @@ describe('direct newsletter publish endpoint', () => {
     const firstFanout = createQueueBatch(firstFanoutBody)
     await worker.queue(firstFanout.batch, env)
     const recipientBatch = queueSendBatch.mock.calls[0][0] as Array<{ body: Record<string, unknown> }>
-    for (const entry of recipientBatch.slice(0, 3)) {
-      await worker.queue(createQueueBatch(entry.body).batch, env)
-    }
+    expect(recipientBatch).toHaveLength(1)
+    await worker.queue(createQueueBatch(recipientBatch[0].body).batch, env)
 
     const nextFanoutBody = queueSend.mock.calls.at(-1)?.[0] as Record<string, unknown>
     const deadLetteredFanout = createQueueBatch(nextFanoutBody, 'letterdrop-test-dlq')
@@ -2062,8 +2130,9 @@ describe('direct newsletter publish endpoint', () => {
 
     expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
       recipientCount: 20,
-      queuedCount: 12,
+      queuedCount: 0,
       fanoutQueuedCount: 15,
+      providerAcceptedCount: 15,
       queueFailedCount: 5,
     }))
   })
@@ -2998,6 +3067,7 @@ describe('newsletter queue delivery', () => {
       db,
       notificationFetch,
       sendStatusBrokerFetch,
+      queueSend,
       queueBody: recipientMessages[0],
       sendId: String(result.sendId),
     }
@@ -3072,7 +3142,7 @@ describe('newsletter queue delivery', () => {
 
     expect(message.retry).not.toHaveBeenCalled()
     const request = notificationFetch.mock.calls[0][0] as Request
-    const expectedIdempotencyKey = `newsletter:${sendId}:${queueBody.recipientHash}`
+    const expectedIdempotencyKey = `newsletter:${sendId}:${firstRecipientHashFromQueueBody(queueBody)}`
     expect(request.headers.get('Idempotency-Key')).toBe(expectedIdempotencyKey)
     const body = await getNotificationRequestBody(notificationFetch)
     expect(body.idempotency_key).toBe(expectedIdempotencyKey)
@@ -3097,6 +3167,172 @@ describe('newsletter queue delivery', () => {
       new URL((call[0] as Request).url).pathname
     )
     expect(broadcastPaths.every((path) => path === '/broadcast')).toBe(true)
+  })
+
+  it('sends every recipient in a recipient batch and updates tracking', async () => {
+    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv()
+    for (const email of ['first@example.com', 'second@example.com']) {
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+    const { batch, message } = createQueueBatch(queueBody)
+    notificationFetch.mockClear()
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).not.toHaveBeenCalled()
+    expect(notificationFetch).toHaveBeenCalledTimes(2)
+    expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => (
+      recipient.status
+    ))).toEqual(['providerAccepted', 'providerAccepted'])
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      queuedCount: 0,
+      providerAcceptedCount: 2,
+    }))
+  })
+
+  it('requeues retryable recipient batch failures and resumes unsent recipients', async () => {
+    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv()
+    for (const email of ['first@example.com', 'second@example.com', 'third@example.com']) {
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+    const firstDelivery = createQueueBatch(queueBody)
+    queueSend.mockClear()
+    notificationFetch.mockClear()
+    notificationFetch
+      .mockResolvedValueOnce(notificationSuccessResponse('ses-first'))
+      .mockResolvedValueOnce(new Response('sender throttled', { status: 429 }))
+
+    await worker.queue(firstDelivery.batch, env)
+
+    expect(firstDelivery.message.retry).not.toHaveBeenCalled()
+    expect(notificationFetch).toHaveBeenCalledTimes(2)
+    expect(queueSend).toHaveBeenCalledTimes(2)
+    expect(queueSend.mock.calls.map((call) => call[1])).toEqual([
+      { delaySeconds: 60 },
+      { delaySeconds: 60 },
+    ])
+    expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => (
+      recipient.status
+    ))).toEqual(['providerAccepted', 'retrying', 'queued'])
+
+    notificationFetch.mockClear()
+    const retryBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const remainingBody = queueSend.mock.calls[1][0] as Record<string, unknown>
+    const retryDelivery = createQueueBatch(retryBody)
+    const remainingDelivery = createQueueBatch(remainingBody)
+    await worker.queue(retryDelivery.batch, env)
+    await worker.queue(remainingDelivery.batch, env)
+
+    expect(retryDelivery.message.retry).not.toHaveBeenCalled()
+    expect(remainingDelivery.message.retry).not.toHaveBeenCalled()
+    expect(notificationFetch).toHaveBeenCalledTimes(2)
+    expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => ({
+      email: recipient.email,
+      status: recipient.status,
+      attempts: recipient.attempts,
+    }))).toEqual([
+      { email: 'first@example.com', status: 'providerAccepted', attempts: 1 },
+      { email: 'second@example.com', status: 'providerAccepted', attempts: 2 },
+      { email: 'third@example.com', status: 'providerAccepted', attempts: 1 },
+    ])
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      queuedCount: 0,
+      retryingCount: 0,
+      providerAcceptedCount: 3,
+    }))
+  })
+
+  it('isolates repeated batch failures so unrelated recipients do not share retry budget', async () => {
+    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv()
+    for (const email of ['first@example.com', 'second@example.com', 'third@example.com']) {
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+    queueSend.mockClear()
+    notificationFetch.mockClear()
+    notificationFetch.mockResolvedValueOnce(new Response('sender throttled', { status: 429 }))
+
+    const firstDelivery = createQueueBatch(queueBody)
+    await worker.queue(firstDelivery.batch, env)
+
+    expect(firstDelivery.message.retry).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(2)
+    expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => (
+      recipient.status
+    ))).toEqual(['retrying', 'queued', 'queued'])
+
+    const remainingAfterFirstFailure = queueSend.mock.calls[1][0] as Record<string, unknown>
+    queueSend.mockClear()
+    notificationFetch.mockClear()
+    notificationFetch.mockResolvedValueOnce(new Response('sender throttled', { status: 429 }))
+
+    const secondDelivery = createQueueBatch(remainingAfterFirstFailure)
+    await worker.queue(secondDelivery.batch, env)
+
+    expect(secondDelivery.message.retry).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(2)
+    expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => (
+      recipient.status
+    ))).toEqual(['retrying', 'retrying', 'queued'])
+
+    const isolatedSecondRetry = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const secondRetryDlq = createQueueBatch(isolatedSecondRetry, 'haben-letterdrop-dlq')
+    await worker.queue(secondRetryDlq.batch, env)
+
+    expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => ({
+      email: recipient.email,
+      status: recipient.status,
+    }))).toEqual([
+      { email: 'first@example.com', status: 'retrying' },
+      { email: 'second@example.com', status: 'deadLettered' },
+      { email: 'third@example.com', status: 'queued' },
+    ])
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      deadLetteredCount: 1,
+      retryingCount: 1,
+      queuedCount: 1,
+    }))
   })
 
   it('does not retry after SES accepts when provider-accepted tracking fails', async () => {
@@ -3137,13 +3373,20 @@ describe('newsletter queue delivery', () => {
   })
 
   it('retries tracked recipients when the notification service throttles before provider acceptance', async () => {
-    const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
+    const { env, db, notificationFetch, queueSend, queueBody, sendId } = await publishTrackedNewsletter()
+    queueSend.mockClear()
     notificationFetch.mockResolvedValueOnce(new Response('sender throttled', { status: 429 }))
     const { batch, message } = createQueueBatch(queueBody)
 
     await worker.queue(batch, env)
 
-    expect(message.retry).toHaveBeenCalledTimes(1)
+    expect(message.retry).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend.mock.calls[0][0]).toEqual(expect.objectContaining({
+      kind: 'recipientBatch',
+      recipients: [expect.objectContaining({ email: 'first@example.com' })],
+    }))
+    expect(queueSend.mock.calls[0][1]).toEqual({ delaySeconds: 60 })
     const recipient = Array.from(db.newsletterSendRecipients.values())[0]
     expect(recipient).toEqual(expect.objectContaining({
       status: 'retrying',
@@ -3197,7 +3440,7 @@ describe('newsletter queue delivery', () => {
           tags: {
             newsletterId: [NEWSLETTER_ID],
             sendId: [sendId],
-            recipientHash: [queueBody.recipientHash],
+            recipientHash: [firstRecipientHashFromQueueBody(queueBody)],
           },
         },
         delivery: {
@@ -3217,7 +3460,8 @@ describe('newsletter queue delivery', () => {
   })
 
   it('keeps retrying tracked recipients when delivery fails before provider contact', async () => {
-    const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
+    const { env, db, notificationFetch, queueSend, queueBody, sendId } = await publishTrackedNewsletter()
+    queueSend.mockClear()
     const { batch, message } = createQueueBatch({
       ...queueBody,
       fileName: `newsletters/${NEWSLETTER_ID}/missing.html`,
@@ -3226,7 +3470,9 @@ describe('newsletter queue delivery', () => {
     await worker.queue(batch, env)
 
     expect(notificationFetch).not.toHaveBeenCalled()
-    expect(message.retry).toHaveBeenCalledTimes(1)
+    expect(message.retry).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend.mock.calls[0][1]).toEqual({ delaySeconds: 60 })
     const recipient = Array.from(db.newsletterSendRecipients.values())[0]
     expect(recipient).toEqual(expect.objectContaining({
       status: 'retrying',
@@ -3240,14 +3486,17 @@ describe('newsletter queue delivery', () => {
   })
 
   it('keeps retrying tracked recipients when notification preflight fails', async () => {
-    const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
+    const { env, db, notificationFetch, queueSend, queueBody, sendId } = await publishTrackedNewsletter()
+    queueSend.mockClear()
     env.NOTIFICATION_SHARED_SECRET = ''
     const { batch, message } = createQueueBatch(queueBody)
 
     await worker.queue(batch, env)
 
     expect(notificationFetch).not.toHaveBeenCalled()
-    expect(message.retry).toHaveBeenCalledTimes(1)
+    expect(message.retry).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend.mock.calls[0][1]).toEqual({ delaySeconds: 60 })
     const recipient = Array.from(db.newsletterSendRecipients.values())[0]
     expect(recipient).toEqual(expect.objectContaining({
       status: 'retrying',
@@ -3280,16 +3529,71 @@ describe('newsletter queue delivery', () => {
   it('marks tracked recipients dead-lettered from the DLQ consumer', async () => {
     const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
     notificationFetch.mockClear()
-    const { batch } = createQueueBatch(queueBody, 'haben-letterdrop-dlq')
+    const recipient = recipientEntriesFromQueueBody(queueBody)[0]
+    const { batch } = createQueueBatch({
+      kind: 'recipient',
+      email: recipient.email,
+      newsletterId: queueBody.newsletterId,
+      subject: queueBody.subject,
+      fileName: queueBody.fileName,
+      textFileName: queueBody.textFileName,
+      fromName: queueBody.fromName,
+      sendId: queueBody.sendId,
+      recipientHash: recipient.recipientHash,
+    }, 'haben-letterdrop-dlq')
 
     await worker.queue(batch, env)
 
     expect(notificationFetch).not.toHaveBeenCalled()
-    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
-    expect(recipient.status).toBe('deadLettered')
+    const trackedRecipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(trackedRecipient.status).toBe('deadLettered')
     expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
       status: 'completedWithFailures',
       deadLetteredCount: 1,
+    }))
+  })
+
+  it('requeues unattempted batch recipients from the DLQ consumer', async () => {
+    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv()
+    for (const email of ['first@example.com', 'second@example.com']) {
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+    const { batch } = createQueueBatch(queueBody, 'haben-letterdrop-dlq')
+    queueSend.mockClear()
+    notificationFetch.mockClear()
+
+    await worker.queue(batch, env)
+
+    expect(notificationFetch).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend.mock.calls[0][0]).toEqual(expect.objectContaining({
+      kind: 'recipientBatch',
+      recipients: [
+        expect.objectContaining({ email: 'first@example.com' }),
+        expect.objectContaining({ email: 'second@example.com' }),
+      ],
+    }))
+    expect(queueSend.mock.calls[0][1]).toEqual({ delaySeconds: 60 })
+    expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => (
+      recipient.status
+    ))).toEqual(['queued', 'queued'])
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      status: 'sending',
+      deadLetteredCount: 0,
     }))
   })
 })
@@ -3452,7 +3756,7 @@ describe('SES SNS suppression webhook', () => {
           tags: {
             newsletterId: [NEWSLETTER_ID],
             sendId: [publishResult.sendId],
-            recipientHash: [queueBody.recipientHash],
+            recipientHash: [firstRecipientHashFromQueueBody(queueBody)],
           },
         },
         delivery: {
@@ -3496,7 +3800,7 @@ describe('SES SNS suppression webhook', () => {
     const tags = {
       newsletterId: [NEWSLETTER_ID],
       sendId: [publishResult.sendId],
-      recipientHash: [queueBody.recipientHash],
+      recipientHash: [firstRecipientHashFromQueueBody(queueBody)],
     }
 
     const deliveryResponse = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
@@ -3594,7 +3898,7 @@ describe('SES SNS suppression webhook', () => {
           tags: {
             newsletterId: [NEWSLETTER_ID],
             sendId: [publishResult.sendId],
-            recipientHash: [queueBody.recipientHash],
+            recipientHash: [firstRecipientHashFromQueueBody(queueBody)],
           },
         },
         deliveryDelay: {
