@@ -3,6 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2026-02-23"
 compatibility_flags = ["nodejs_compat"]
 
+[limits]
+cpu_ms = 300_000
+subrequests = 10_000
+
 [vars]
 ALLOWED_EMAILS = "replace-with-allowed-emails"
 PUBLISH_EMAIL_ADDRESS = "replace-with-publish-email-address"
@@ -22,15 +26,15 @@ queue = "replace-with-queue"
 [[queues.consumers]]
 queue = "replace-with-queue"
 max_batch_size = 1
-max_batch_timeout = 30
+max_batch_timeout = 1
 max_retries = 10
-max_concurrency = 1
+max_concurrency = 32
 dead_letter_queue = "replace-with-dead-letter-queue"
 
 [[queues.consumers]]
 queue = "replace-with-dead-letter-queue"
 max_batch_size = 1
-max_batch_timeout = 30
+max_batch_timeout = 1
 max_retries = 0
 
 [[durable_objects.bindings]]

@@ -350,7 +350,9 @@ const NEWSLETTER_SEND_EVENT_PAGE_SIZE = 500;
 const NEWSLETTER_SEND_RECIPIENT_PAGE_SIZE = 100;
 const NEWSLETTER_SEND_MAX_RECIPIENT_PAGE_SIZE = 250;
 const NEWSLETTER_SEND_STREAM_REPLAY_LIMIT = 100;
-const NEWSLETTER_FANOUT_CHUNK_SIZE = 15;
+const NEWSLETTER_FANOUT_PAGE_SIZE = 100;
+const NEWSLETTER_RECIPIENT_BATCH_SIZE = 25;
+const NEWSLETTER_ESTIMATED_SES_SEND_RATE_PER_SECOND = 14;
 const NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS = 60;
 const NEWSLETTER_SEND_RECIPIENT_SEARCH_MAX_BYTES = 256;
 
@@ -1528,7 +1530,13 @@ app.post("/api/newsletter/:newsletterId/publish/dry-run", async (c) => {
       snapshotAt,
     );
     const estimatedFanoutChunks = Math.ceil(
-      recipientCount / NEWSLETTER_FANOUT_CHUNK_SIZE,
+      recipientCount / NEWSLETTER_FANOUT_PAGE_SIZE,
+    );
+    const estimatedRecipientQueueBatches = Math.ceil(
+      recipientCount / NEWSLETTER_RECIPIENT_BATCH_SIZE,
+    );
+    const estimatedSesSendSeconds = Math.ceil(
+      recipientCount / NEWSLETTER_ESTIMATED_SES_SEND_RATE_PER_SECOND,
     );
 
     return c.json({
@@ -1536,10 +1544,14 @@ app.post("/api/newsletter/:newsletterId/publish/dry-run", async (c) => {
       subject: body.subject.trim(),
       recipientCount,
       estimatedFanoutChunks,
-      estimatedRecipientQueueBatches: estimatedFanoutChunks,
-      fanoutChunkSize: NEWSLETTER_FANOUT_CHUNK_SIZE,
+      estimatedRecipientQueueBatches,
+      fanoutChunkSize: NEWSLETTER_FANOUT_PAGE_SIZE,
+      recipientBatchSize: NEWSLETTER_RECIPIENT_BATCH_SIZE,
+      estimatedSesSendRatePerSecond: NEWSLETTER_ESTIMATED_SES_SEND_RATE_PER_SECOND,
+      estimatedSesSendSeconds,
       wouldSendEmail: false,
-      freePlanSafe: true,
+      freePlanSafe: false,
+      paidPlanOptimized: true,
       duplicate: existingSend !== null,
       sendId: existingSend?.id ?? null,
       send: existingSend,
@@ -3088,11 +3100,13 @@ const sendEmail = async (
   }
 
   if (!res.ok) {
+    const errorMetadata = await parseNotificationErrorResponse(res);
     throw new NotificationServiceError(
       `Notification service returned status ${res.status}`,
       res.status,
-      isRetryableNotificationStatus(res.status),
-      true,
+      errorMetadata.retryable ?? isRetryableNotificationStatus(res.status),
+      errorMetadata.providerContacted ?? true,
+      errorMetadata.retryDelaySeconds,
     );
   }
 
@@ -3560,20 +3574,6 @@ function asNumber(value: unknown): number {
   return 0;
 }
 
-function compareEmailCursor(lhs: string | null, rhs: string | null): number {
-  if (!lhs && !rhs) return 0;
-  if (!lhs) return -1;
-  if (!rhs) return 1;
-  return lhs.localeCompare(rhs, undefined, { sensitivity: "base" });
-}
-
-function newestEmailCursor(
-  first: string | null,
-  second: string | null,
-): string | null {
-  return compareEmailCursor(first, second) >= 0 ? first : second;
-}
-
 function boundedInt(
   value: unknown,
   defaultValue: number,
@@ -3622,6 +3622,7 @@ class NotificationServiceError extends Error {
     readonly status: number | null,
     readonly retryable: boolean,
     readonly providerContacted: boolean,
+    readonly retryDelaySeconds: number | null = null,
   ) {
     super(message);
   }
@@ -3629,6 +3630,45 @@ class NotificationServiceError extends Error {
 
 function isRetryableNotificationStatus(status: number): boolean {
   return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function retryDelaySecondsFromValue(value: unknown): number | null {
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string"
+      ? Number(value)
+      : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return Math.max(1, Math.ceil(parsed));
+}
+
+async function parseNotificationErrorResponse(
+  response: Response,
+): Promise<{
+  retryable?: boolean;
+  providerContacted?: boolean;
+  retryDelaySeconds: number | null;
+}> {
+  const retryHeaderDelay = retryDelaySecondsFromValue(response.headers.get("Retry-After"));
+  const body = await response.json<unknown>().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return { retryDelaySeconds: retryHeaderDelay };
+  }
+  const metadata = body as {
+    retryable?: unknown;
+    providerContacted?: unknown;
+    retryAfterSeconds?: unknown;
+  };
+  return {
+    retryable: typeof metadata.retryable === "boolean" ? metadata.retryable : undefined,
+    providerContacted: typeof metadata.providerContacted === "boolean"
+      ? metadata.providerContacted
+      : undefined,
+    retryDelaySeconds:
+      retryDelaySecondsFromValue(metadata.retryAfterSeconds) ?? retryHeaderDelay,
+  };
 }
 
 function shouldRetryRecipientError(error: unknown): boolean {
@@ -3645,6 +3685,13 @@ function shouldRetryRecipientError(error: unknown): boolean {
     return error.retryable;
   }
   return true;
+}
+
+function retryDelaySecondsForRecipientError(error: unknown): number {
+  if (error instanceof NotificationServiceError && error.retryDelaySeconds) {
+    return error.retryDelaySeconds;
+  }
+  return NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS;
 }
 
 function isFanoutQueueMessage(
@@ -4994,7 +5041,7 @@ async function enqueueNewsletterFanoutForSend(
     sendId: send.id,
     sourceMessageId: send.sourceMessageId,
     cursorEmail: send.fanoutCursorEmail,
-    chunkIndex: Math.floor(send.fanoutQueuedCount / NEWSLETTER_FANOUT_CHUNK_SIZE),
+    chunkIndex: Math.floor(send.fanoutQueuedCount / NEWSLETTER_FANOUT_PAGE_SIZE),
   }));
   return true;
 }
@@ -5063,22 +5110,19 @@ async function processNewsletterFanoutMessage(
   if (!send || send.newsletterId !== message.newsletterId) {
     return;
   }
-  if (send.fanoutCompletedAt) {
+  if (send.fanoutCompletedAt && send.queuedCount === 0) {
     return;
   }
   if (!send.fanoutSnapshotAt) {
     throw new Error(`Newsletter send ${send.id} is missing fanout snapshot metadata`);
   }
 
-  const cursorEmail = newestEmailCursor(
-    send.fanoutCursorEmail,
-    normalizeNonEmptyString(message.cursorEmail),
-  );
+  const cursorEmail = normalizeNonEmptyString(message.cursorEmail);
   const subscribers = await getSubscribedSubscriberPage(
     message.newsletterId,
     env.DB,
     cursorEmail,
-    NEWSLETTER_FANOUT_CHUNK_SIZE,
+    NEWSLETTER_FANOUT_PAGE_SIZE,
     send.fanoutSnapshotAt,
   );
   const now = new Date().toISOString();
@@ -5137,23 +5181,12 @@ async function processNewsletterFanoutMessage(
     )
   )));
 
-  await env.QUEUE.sendBatch([{
-    body: buildRecipientBatchQueueMessage({
-      newsletterId: message.newsletterId,
-      subject: message.subject,
-      fileName: message.fileName,
-      textFileName: message.textFileName,
-      fromName: message.fromName,
-      sendId: message.sendId,
-      recipients: recipients.map((recipient) => ({
-        email: recipient.email,
-        recipientHash: recipient.recipientHash,
-      })),
-    }),
-  }]);
-
+  const recipientEntries = recipients.map((recipient) => ({
+    email: recipient.email,
+    recipientHash: recipient.recipientHash,
+  }));
   const nextCursorEmail = subscribers[subscribers.length - 1].email;
-  const completed = subscribers.length < NEWSLETTER_FANOUT_CHUNK_SIZE;
+  const completed = subscribers.length < NEWSLETTER_FANOUT_PAGE_SIZE;
   const { send: updatedSend, advanced } = await advanceNewsletterSendFanout(
     env.DB,
     {
@@ -5165,6 +5198,21 @@ async function processNewsletterFanoutMessage(
       now,
     },
   );
+
+  await env.QUEUE.sendBatch(
+    chunkRecipientEntries(recipientEntries).map((recipientBatch) => ({
+      body: buildRecipientBatchQueueMessage({
+        newsletterId: message.newsletterId,
+        subject: message.subject,
+        fileName: message.fileName,
+        textFileName: message.textFileName,
+        fromName: message.fromName,
+        sendId: message.sendId,
+        recipients: recipientBatch,
+      }),
+    })),
+  );
+
   if (!advanced) {
     return;
   }
@@ -5407,6 +5455,7 @@ type NewsletterRecipientDeliveryInput = {
   fromName?: string | null;
   sendId?: string;
   recipientHash?: string;
+  content?: NewsletterDeliveryContent;
 };
 
 type NewsletterRecipientBatchMetadata = {
@@ -5417,6 +5466,41 @@ type NewsletterRecipientBatchMetadata = {
   fromName?: string | null;
   sendId: string;
 };
+
+type NewsletterDeliveryContent = {
+  html: string;
+  text: string;
+};
+
+async function readNewsletterDeliveryContent(
+  env: Bindings,
+  fileName: string,
+  textFileName?: string,
+): Promise<NewsletterDeliveryContent> {
+  const [object, textObject] = await Promise.all([
+    env.R2.get(fileName),
+    textFileName ? env.R2.get(textFileName) : Promise.resolve(null),
+  ]);
+  if (!object) {
+    throw new Error("Failed to get HTML content from R2");
+  }
+
+  const [html, text] = await Promise.all([
+    object.text(),
+    textObject ? textObject.text() : Promise.resolve(""),
+  ]);
+  return { html, text };
+}
+
+function chunkRecipientEntries(
+  recipients: NewsletterRecipientQueueEntry[],
+): NewsletterRecipientQueueEntry[][] {
+  const batches: NewsletterRecipientQueueEntry[][] = [];
+  for (let index = 0; index < recipients.length; index += NEWSLETTER_RECIPIENT_BATCH_SIZE) {
+    batches.push(recipients.slice(index, index + NEWSLETTER_RECIPIENT_BATCH_SIZE));
+  }
+  return batches;
+}
 
 function buildRecipientBatchQueueMessage(
   input: NewsletterRecipientBatchMetadata & {
@@ -5457,16 +5541,17 @@ async function enqueueRecipientBatchFollowUps(
   metadata: NewsletterRecipientBatchMetadata,
   retryRecipient: NewsletterRecipientQueueEntry,
   remainingRecipients: NewsletterRecipientQueueEntry[],
+  delaySeconds: number,
 ): Promise<void> {
   await enqueueNewsletterRecipientBatch(env, {
     ...metadata,
     recipients: [retryRecipient],
-    delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS,
+    delaySeconds,
   });
   await enqueueNewsletterRecipientBatch(env, {
     ...metadata,
     recipients: remainingRecipients,
-    delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS,
+    delaySeconds,
   });
 }
 
@@ -5548,7 +5633,7 @@ async function handleRecipientBatchDeadLetter(
 async function processNewsletterRecipientDelivery(
   env: Bindings,
   input: NewsletterRecipientDeliveryInput,
-): Promise<{ retry: boolean }> {
+): Promise<{ retry: boolean; retryDelaySeconds: number }> {
   const {
     email,
     subject,
@@ -5558,6 +5643,7 @@ async function processNewsletterRecipientDelivery(
     fromName,
     sendId,
     recipientHash: trackedRecipientHash,
+    content,
   } = input;
 
   console.log(`Sending email to ${email} for newsletter ${newsletterId}`);
@@ -5573,16 +5659,12 @@ async function processNewsletterRecipientDelivery(
         console.log(
           `Skipping duplicate queue delivery for ${email} on send ${sendId}`,
         );
-        return { retry: false };
+        return { retry: false, retryDelaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS };
       }
     }
 
-    const object = await env.R2.get(fileName);
-    if (!object) throw new Error("Failed to get HTML content from R2");
-
-    const htmlContent = await object.text();
-    const textObject = textFileName ? await env.R2.get(textFileName) : null;
-    const textContent = textObject ? await textObject.text() : "";
+    const deliveryContent =
+      content ?? (await readNewsletterDeliveryContent(env, fileName, textFileName));
     const unsubscribeToken = await createUnsubscribeToken(
       env,
       email,
@@ -5594,11 +5676,11 @@ async function processNewsletterRecipientDelivery(
     const recipientHash =
       trackedRecipientHash ?? (await sha256Hex(`${newsletterId}:${email}`));
     const deliverableHtml = appendUnsubscribeFooterToHtml(
-      htmlContent,
+      deliveryContent.html,
       visibleUnsubscribeUrl,
     );
     const deliverableText = appendUnsubscribeFooterToText(
-      textContent,
+      deliveryContent.text,
       visibleUnsubscribeUrl,
     );
 
@@ -5659,6 +5741,7 @@ async function processNewsletterRecipientDelivery(
   } catch (error: unknown) {
     console.error(`Failed to send email to ${email}:`, error);
     const shouldRetry = shouldRetryRecipientError(error);
+    const retryDelaySeconds = retryDelaySecondsForRecipientError(error);
     if (sendId && trackedRecipientHash) {
       try {
         await updateNewsletterSendRecipientStatus(env, {
@@ -5674,10 +5757,10 @@ async function processNewsletterRecipientDelivery(
         logError(shouldRetry ? "track-retrying" : "track-needs-review", trackingError);
       }
     }
-    return { retry: shouldRetry };
+    return { retry: shouldRetry, retryDelaySeconds };
   }
 
-  return { retry: false };
+  return { retry: false, retryDelaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS };
 }
 
 export class SendStatusBroker {
@@ -5842,11 +5925,19 @@ export default {
           continue;
         }
 
+        let content: NewsletterDeliveryContent | undefined;
+        try {
+          content = await readNewsletterDeliveryContent(env, fileName, textFileName);
+        } catch (error: unknown) {
+          logError("newsletter-recipient-batch-content", error);
+        }
+
         for (const [index, recipient] of recipients.entries()) {
           const result = await processNewsletterRecipientDelivery(env, {
             email: recipient.email,
             ...metadata,
             recipientHash: recipient.recipientHash,
+            ...(content ? { content } : {}),
           });
           if (result.retry) {
             try {
@@ -5855,10 +5946,11 @@ export default {
                 metadata,
                 recipient,
                 recipients.slice(index + 1),
+                result.retryDelaySeconds,
               );
             } catch (error: unknown) {
               logError("newsletter-recipient-requeue", error);
-              message.retry({ delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS });
+              message.retry({ delaySeconds: result.retryDelaySeconds });
             }
             break;
           }
@@ -5890,7 +5982,7 @@ export default {
         recipientHash: trackedRecipientHash,
       });
       if (result.retry) {
-        message.retry({ delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS });
+        message.retry({ delaySeconds: result.retryDelaySeconds });
       }
     }
   },

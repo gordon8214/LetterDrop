@@ -12,7 +12,11 @@ export const requiredBindings = [
   { key: 'PUBLISH_EMAIL_ADDRESS', label: 'Var: PUBLISH_EMAIL_ADDRESS' },
   { key: 'PUBLIC_ORIGIN', label: 'Var: PUBLIC_ORIGIN' },
   { key: 'TURNSTILE_SITE_KEY', label: 'Var: TURNSTILE_SITE_KEY' },
+  { key: '[limits]', label: 'Workers paid-plan limits' },
+  { key: 'cpu_ms = 300_000', label: 'Workers CPU limit' },
+  { key: 'subrequests = 10_000', label: 'Workers subrequest limit' },
   { key: '[[queues.consumers]]', label: 'Queue consumer' },
+  { key: 'max_concurrency = 32', label: 'Queue consumer paid-plan concurrency' },
   { key: 'dead_letter_queue', label: 'Dead letter queue' },
   { key: 'new_sqlite_classes = ["SendStatusBroker"]', label: 'Durable Object migration' },
 ]

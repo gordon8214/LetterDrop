@@ -1779,11 +1779,15 @@ describe('direct newsletter publish endpoint', () => {
     expect(result).toEqual(expect.objectContaining({
       newsletterId: NEWSLETTER_ID,
       recipientCount: 5000,
-      estimatedFanoutChunks: 334,
-      estimatedRecipientQueueBatches: 334,
-      fanoutChunkSize: 15,
+      estimatedFanoutChunks: 50,
+      estimatedRecipientQueueBatches: 200,
+      fanoutChunkSize: 100,
+      recipientBatchSize: 25,
+      estimatedSesSendRatePerSecond: 14,
+      estimatedSesSendSeconds: 358,
       wouldSendEmail: false,
-      freePlanSafe: true,
+      freePlanSafe: false,
+      paidPlanOptimized: true,
       duplicate: false,
     }))
     expect(r2Put).not.toHaveBeenCalled()
@@ -1843,11 +1847,11 @@ describe('direct newsletter publish endpoint', () => {
         recipientEntriesFromQueueBody(entry.body).length
       )
     )))
-    expect(queueSendBatch).toHaveBeenCalledTimes(334)
-    expect(recipientBatchMessageCount).toBe(334)
+    expect(queueSendBatch).toHaveBeenCalledTimes(50)
+    expect(recipientBatchMessageCount).toBe(200)
     expect(recipientCount).toBe(5000)
-    expect(maxRecipientBatchSize).toBeLessThanOrEqual(15)
-    expect(Math.max(...operationCounts)).toBeLessThanOrEqual(50)
+    expect(maxRecipientBatchSize).toBeLessThanOrEqual(25)
+    expect(Math.max(...operationCounts)).toBeLessThanOrEqual(125)
     expect(db.newsletterSendRecipients.size).toBe(5000)
     expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
       recipientCount: 5000,
@@ -2024,7 +2028,7 @@ describe('direct newsletter publish endpoint', () => {
     }))
   })
 
-  it('keeps fanout counters idempotent when D1 advance fails after sendBatch', async () => {
+  it('does not enqueue recipient batches until fanout counters advance', async () => {
     const { env, db, queueSend, queueSendBatch } = createEnv({ failFanoutAdvanceOnce: true })
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -2046,7 +2050,7 @@ describe('direct newsletter publish endpoint', () => {
     await worker.queue(firstFanout.batch, env)
 
     expect(firstFanout.message.retry).toHaveBeenCalledTimes(1)
-    expect(queueSendBatch).toHaveBeenCalledTimes(1)
+    expect(queueSendBatch).not.toHaveBeenCalled()
     expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
       queuedCount: 0,
       fanoutQueuedCount: 0,
@@ -2056,9 +2060,51 @@ describe('direct newsletter publish endpoint', () => {
     await worker.queue(secondFanout.batch, env)
 
     expect(secondFanout.message.retry).not.toHaveBeenCalled()
-    expect(queueSendBatch).toHaveBeenCalledTimes(2)
+    expect(queueSendBatch).toHaveBeenCalledTimes(1)
     expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
       queuedCount: 1,
+      fanoutQueuedCount: 1,
+      fanoutCompletedAt: expect.any(String),
+    }))
+  })
+
+  it('keeps counters correct when recipient delivery starts immediately after enqueue', async () => {
+    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    const fanoutBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const fanout = createQueueBatch(fanoutBody)
+    notificationFetch.mockClear()
+    queueSendBatch.mockImplementationOnce(async (entries: Array<{ body: Record<string, unknown> }>) => {
+      expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+        queuedCount: 1,
+        fanoutQueuedCount: 1,
+      }))
+      const delivery = createQueueBatch(entries[0].body)
+      await worker.queue(delivery.batch, env)
+      expect(delivery.message.retry).not.toHaveBeenCalled()
+    })
+
+    await worker.queue(fanout.batch, env)
+
+    expect(fanout.message.retry).not.toHaveBeenCalled()
+    expect(queueSendBatch).toHaveBeenCalledTimes(1)
+    expect(notificationFetch).toHaveBeenCalledTimes(1)
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      queuedCount: 0,
+      providerAcceptedCount: 1,
       fanoutQueuedCount: 1,
       fanoutCompletedAt: expect.any(String),
     }))
@@ -2099,8 +2145,8 @@ describe('direct newsletter publish endpoint', () => {
 
   it('counts only unfanned subscribers when a later fanout job dead-letters', async () => {
     const { env, db, queueSend, queueSendBatch } = createEnv()
-    for (let index = 0; index < 20; index += 1) {
-      const email = `subscriber-${String(index).padStart(2, '0')}@example.com`
+    for (let index = 0; index < 120; index += 1) {
+      const email = `subscriber-${String(index).padStart(3, '0')}@example.com`
       db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
         email,
         newsletterId: NEWSLETTER_ID,
@@ -2121,19 +2167,21 @@ describe('direct newsletter publish endpoint', () => {
     const firstFanout = createQueueBatch(firstFanoutBody)
     await worker.queue(firstFanout.batch, env)
     const recipientBatch = queueSendBatch.mock.calls[0][0] as Array<{ body: Record<string, unknown> }>
-    expect(recipientBatch).toHaveLength(1)
-    await worker.queue(createQueueBatch(recipientBatch[0].body).batch, env)
+    expect(recipientBatch).toHaveLength(4)
+    for (const entry of recipientBatch) {
+      await worker.queue(createQueueBatch(entry.body).batch, env)
+    }
 
     const nextFanoutBody = queueSend.mock.calls.at(-1)?.[0] as Record<string, unknown>
     const deadLetteredFanout = createQueueBatch(nextFanoutBody, 'letterdrop-test-dlq')
     await worker.queue(deadLetteredFanout.batch, env)
 
     expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
-      recipientCount: 20,
+      recipientCount: 120,
       queuedCount: 0,
-      fanoutQueuedCount: 15,
-      providerAcceptedCount: 15,
-      queueFailedCount: 5,
+      fanoutQueuedCount: 100,
+      providerAcceptedCount: 100,
+      queueFailedCount: 20,
     }))
   })
 
@@ -3224,7 +3272,7 @@ describe('newsletter queue delivery', () => {
   })
 
   it('sends every recipient in a recipient batch and updates tracking', async () => {
-    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv()
+    const { env, db, notificationFetch, queueSend, queueSendBatch, r2Get } = createEnv()
     for (const email of ['first@example.com', 'second@example.com']) {
       db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
         email,
@@ -3249,6 +3297,11 @@ describe('newsletter queue delivery', () => {
 
     expect(message.retry).not.toHaveBeenCalled()
     expect(notificationFetch).toHaveBeenCalledTimes(2)
+    expect(r2Get).toHaveBeenCalledTimes(2)
+    expect(r2Get.mock.calls.map(([key]) => key)).toEqual([
+      expect.stringMatching(/\.html$/),
+      expect.stringMatching(/\.txt$/),
+    ])
     expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => (
       recipient.status
     ))).toEqual(['providerAccepted', 'providerAccepted'])
@@ -3282,7 +3335,14 @@ describe('newsletter queue delivery', () => {
     notificationFetch.mockClear()
     notificationFetch
       .mockResolvedValueOnce(notificationSuccessResponse('ses-first'))
-      .mockResolvedValueOnce(new Response('sender throttled', { status: 429 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        message: 'error',
+        detail: 'sender throttled',
+        retryAfterSeconds: 1,
+      }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      }))
 
     await worker.queue(firstDelivery.batch, env)
 
@@ -3290,8 +3350,8 @@ describe('newsletter queue delivery', () => {
     expect(notificationFetch).toHaveBeenCalledTimes(2)
     expect(queueSend).toHaveBeenCalledTimes(2)
     expect(queueSend.mock.calls.map((call) => call[1])).toEqual([
-      { delaySeconds: 60 },
-      { delaySeconds: 60 },
+      { delaySeconds: 1 },
+      { delaySeconds: 1 },
     ])
     expect(Array.from(db.newsletterSendRecipients.values()).map((recipient) => (
       recipient.status
@@ -3429,7 +3489,14 @@ describe('newsletter queue delivery', () => {
   it('retries tracked recipients when the notification service throttles before provider acceptance', async () => {
     const { env, db, notificationFetch, queueSend, queueBody, sendId } = await publishTrackedNewsletter()
     queueSend.mockClear()
-    notificationFetch.mockResolvedValueOnce(new Response('sender throttled', { status: 429 }))
+    notificationFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+      message: 'error',
+      detail: 'sender throttled',
+      retryAfterSeconds: 1,
+    }), {
+      status: 429,
+      headers: { 'Content-Type': 'application/json' },
+    }))
     const { batch, message } = createQueueBatch(queueBody)
 
     await worker.queue(batch, env)
@@ -3440,7 +3507,7 @@ describe('newsletter queue delivery', () => {
       kind: 'recipientBatch',
       recipients: [expect.objectContaining({ email: 'first@example.com' })],
     }))
-    expect(queueSend.mock.calls[0][1]).toEqual({ delaySeconds: 60 })
+    expect(queueSend.mock.calls[0][1]).toEqual({ delaySeconds: 1 })
     const recipient = Array.from(db.newsletterSendRecipients.values())[0]
     expect(recipient).toEqual(expect.objectContaining({
       status: 'retrying',
@@ -3450,6 +3517,39 @@ describe('newsletter queue delivery', () => {
     expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
       status: 'sending',
       queuedCount: 0,
+      retryingCount: 1,
+      needsReviewCount: 0,
+    }))
+  })
+
+  it('retries when the notification rate limiter fails before SES contact', async () => {
+    const { env, db, notificationFetch, queueSend, queueBody, sendId } = await publishTrackedNewsletter()
+    queueSend.mockClear()
+    notificationFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+      message: 'error',
+      detail: 'Email sender rate limiter unavailable',
+      retryable: true,
+      providerContacted: false,
+      retryAfterSeconds: 5,
+    }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const { batch, message } = createQueueBatch(queueBody)
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend.mock.calls[0][1]).toEqual({ delaySeconds: 5 })
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient).toEqual(expect.objectContaining({
+      status: 'retrying',
+      attempts: 1,
+      lastError: 'Notification service returned status 503',
+    }))
+    expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
+      status: 'sending',
       retryingCount: 1,
       needsReviewCount: 0,
     }))

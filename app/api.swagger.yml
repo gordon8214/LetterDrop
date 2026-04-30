@@ -845,10 +845,23 @@ definitions:
         type: integer
       fanoutChunkSize:
         type: integer
+        description: Number of subscribers read and tracked per fanout page.
+      recipientBatchSize:
+        type: integer
+        description: Maximum recipients placed in each delivery queue batch.
+      estimatedSesSendRatePerSecond:
+        type: integer
+        description: SES send-rate quota used for paid-plan duration estimates.
+      estimatedSesSendSeconds:
+        type: integer
+        description: Estimated provider-acceptance time before provider/network overhead.
       wouldSendEmail:
         type: boolean
         description: Always false for this endpoint; no email send work is queued.
       freePlanSafe:
+        type: boolean
+        description: Legacy compatibility flag. False for the paid-plan optimized send path.
+      paidPlanOptimized:
         type: boolean
       duplicate:
         type: boolean
