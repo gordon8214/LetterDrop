@@ -124,6 +124,20 @@ type NewsletterSendEventRecord = {
   createdAt: string
 }
 
+type NewsletterDraftRecord = {
+  id: string
+  newsletterId: string
+  subject: string
+  sourceMessageId: string
+  contentFileName: string
+  textFileName: string
+  status: 'draft' | 'sent'
+  sendId: string | null
+  createdAt: string
+  updatedAt: string
+  sentAt: string | null
+}
+
 class FakeKVNamespace {
   readonly store = new Map<string, string>()
 
@@ -174,6 +188,7 @@ class FakeD1Database {
   readonly newsletterSends = new Map<string, NewsletterSendRecord>()
   readonly newsletterSendRecipients = new Map<string, NewsletterSendRecipientRecord>()
   readonly newsletterSendEvents: NewsletterSendEventRecord[] = []
+  readonly newsletterDrafts = new Map<string, NewsletterDraftRecord>()
   readonly attemptedRateLimitBuckets: string[] = []
   operationCount = 0
 
@@ -276,6 +291,21 @@ class FakeD1Database {
       return (this.newsletterSendEvents.find((event) => event.id === id) ?? null) as T | null
     }
 
+    if (normalized.includes('from newsletterdraft') && normalized.includes('where id = ?')) {
+      const draftId = String(params[0] ?? '')
+      return (this.newsletterDrafts.get(draftId) ?? null) as T | null
+    }
+
+    if (normalized.includes('from newsletterdraft') && normalized.includes('where newsletter_id = ? and source_message_id = ?')) {
+      const newsletterId = String(params[0] ?? '')
+      const sourceMessageId = String(params[1] ?? '')
+      const draft = Array.from(this.newsletterDrafts.values()).find((candidate) => (
+        candidate.newsletterId === newsletterId &&
+        candidate.sourceMessageId === sourceMessageId
+      )) ?? null
+      return draft as T | null
+    }
+
     if (normalized.includes('from newslettersend') && normalized.includes('where id = ?')) {
       const sendId = String(params[0] ?? '')
       return (this.newsletterSends.get(sendId) ?? null) as T | null
@@ -367,6 +397,15 @@ class FakeD1Database {
         .sort((a, b) => a.id - b.id)
         .slice(0, limit)
       return { results: events as T[] }
+    }
+
+    if (normalized.includes('from newsletterdraft') && normalized.includes("where newsletter_id = ? and status = 'draft'")) {
+      const newsletterId = String(params[0] ?? '')
+      const drafts = Array.from(this.newsletterDrafts.values())
+        .filter((draft) => draft.newsletterId === newsletterId && draft.status === 'draft')
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, 50)
+      return { results: drafts as T[] }
     }
 
     if (normalized.includes('from newslettersend') && normalized.includes('where newsletter_id = ?')) {
@@ -527,6 +566,102 @@ class FakeD1Database {
       this.nextNewsletterSendEventId += 1
       this.newsletterSendEvents.push(event)
       return { meta: { changes: 1, last_row_id: event.id } as { changes: number; last_row_id: number } }
+    }
+
+    if (normalized.includes('insert into newsletterdraft')) {
+      const newsletterId = String(params[1] ?? '')
+      const sourceMessageId = String(params[3] ?? '')
+      if (
+        Array.from(this.newsletterDrafts.values()).some((draft) => (
+          draft.newsletterId === newsletterId &&
+          draft.sourceMessageId === sourceMessageId
+        ))
+      ) {
+        throw new Error(
+          'D1_ERROR: UNIQUE constraint failed: NewsletterDraft.newsletter_id, NewsletterDraft.source_message_id'
+        )
+      }
+
+      const draft: NewsletterDraftRecord = {
+        id: String(params[0] ?? ''),
+        newsletterId,
+        subject: String(params[2] ?? ''),
+        sourceMessageId,
+        contentFileName: String(params[4] ?? ''),
+        textFileName: String(params[5] ?? ''),
+        status: 'draft',
+        sendId: null,
+        createdAt: String(params[6] ?? ''),
+        updatedAt: String(params[7] ?? ''),
+        sentAt: null,
+      }
+      this.newsletterDrafts.set(draft.id, draft)
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('update newsletterdraft') && normalized.includes("set status = 'sent'")) {
+      const sendId = params[0] === null ? null : String(params[0] ?? '')
+      const sentAt = String(params[1] ?? '')
+      const updatedAt = String(params[2] ?? '')
+      const draftId = String(params[3] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (draft && draft.status === 'draft') {
+        draft.status = 'sent'
+        draft.sendId = sendId
+        draft.sentAt = sentAt
+        draft.updatedAt = updatedAt
+        return { meta: { changes: 1 } }
+      }
+      return { meta: { changes: 0 } }
+    }
+
+    if (normalized.includes('update newsletterdraft')) {
+      const subject = String(params[0] ?? '')
+      const updatedAt = String(params[1] ?? '')
+      const draftId = String(params[2] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (draft && draft.status === 'draft') {
+        draft.subject = subject
+        draft.updatedAt = updatedAt
+        return { meta: { changes: 1 } }
+      }
+      return { meta: { changes: 0 } }
+    }
+
+    if (normalized.includes('delete from newsletterdraft where id = ?')) {
+      const draftId = String(params[0] ?? '')
+      const deleted = this.newsletterDrafts.delete(draftId)
+      return { meta: { changes: deleted ? 1 : 0 } }
+    }
+
+    if (normalized.includes('delete from newsletterdraft where newsletter_id = ?')) {
+      const newsletterId = String(params[0] ?? '')
+      let changes = 0
+      for (const [draftId, draft] of Array.from(this.newsletterDrafts.entries())) {
+        if (draft.newsletterId === newsletterId) {
+          this.newsletterDrafts.delete(draftId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (normalized.includes('delete from subscriber where newsletter_id = ?')) {
+      const newsletterId = String(params[0] ?? '')
+      let changes = 0
+      for (const [subscriberId, subscriber] of Array.from(this.subscribers.entries())) {
+        if (subscriber.newsletterId === newsletterId) {
+          this.subscribers.delete(subscriberId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (normalized.includes('delete from newsletter where id = ?')) {
+      const newsletterId = String(params[0] ?? '')
+      const deleted = this.newsletters.delete(newsletterId)
+      return { meta: { changes: deleted ? 1 : 0 } }
     }
 
     if (normalized.includes('insert into newslettersend')) {
@@ -825,6 +960,9 @@ function createEnv(options: FakeDatabaseOptions = {}) {
       text: async () => value,
     }
   })
+  const r2Delete = vi.fn(async (key: string) => {
+    r2Objects.delete(key)
+  })
   let shouldFailQueueSend = options.failQueueSendOnce ?? false
   const queueSend = vi.fn(async () => {
     if (shouldFailQueueSend) {
@@ -851,7 +989,7 @@ function createEnv(options: FakeDatabaseOptions = {}) {
       put: r2Put,
       get: r2Get,
       list: vi.fn(async () => ({ objects: [], truncated: false })),
-      delete: vi.fn(),
+      delete: r2Delete,
     } as unknown as R2Bucket,
     QUEUE: {
       send: queueSend,
@@ -880,6 +1018,7 @@ function createEnv(options: FakeDatabaseOptions = {}) {
     notificationFetch,
     r2Put,
     r2Get,
+    r2Delete,
     queueSend,
     queueSendBatch,
     sendStatusBrokerFetch,
@@ -916,6 +1055,43 @@ async function postRawJson(
       ...headers,
     },
     body,
+  }, env)
+}
+
+async function putJson(
+  env: Record<string, unknown>,
+  path: string,
+  body: unknown,
+  headers: Record<string, string> = {}
+) {
+  return app.request(`https://example.com${path}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  }, env)
+}
+
+async function getJson(
+  env: Record<string, unknown>,
+  path: string,
+  headers: Record<string, string> = {}
+) {
+  return app.request(`https://example.com${path}`, {
+    headers,
+  }, env)
+}
+
+async function deleteJson(
+  env: Record<string, unknown>,
+  path: string,
+  headers: Record<string, string> = {}
+) {
+  return app.request(`https://example.com${path}`, {
+    method: 'DELETE',
+    headers,
   }, env)
 }
 
@@ -2124,6 +2300,361 @@ describe('direct newsletter publish endpoint', () => {
       await expect(response.json()).resolves.toEqual({ error: testCase.error })
     }
     expect(queueSend).not.toHaveBeenCalled()
+  })
+})
+
+describe('newsletter draft admin endpoints', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const auth = { Authorization: 'Bearer admin-token' }
+
+  it('rejects unauthenticated draft requests', async () => {
+    const { env } = createEnv()
+
+    const response = await getJson(env, `/api/newsletter/${NEWSLETTER_ID}/drafts`)
+
+    expect(response.status).toBe(401)
+    await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' })
+  })
+
+  it('creates, lists, loads, updates, and deletes active drafts', async () => {
+    const { env, db, r2Put, r2Delete } = createEnv()
+
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Draft title', html: '', text: '' },
+      auth
+    )
+    const created = await createResponse.json()
+
+    expect(createResponse.status).toBe(201)
+    expect(created.draft).toEqual(expect.objectContaining({
+      id: expect.any(String),
+      newsletterId: NEWSLETTER_ID,
+      subject: 'Draft title',
+      sourceMessageId: expect.stringMatching(/^draft:/),
+      status: 'draft',
+    }))
+    expect(r2Put).toHaveBeenCalledWith(created.draft.contentFileName, '')
+    expect(r2Put).toHaveBeenCalledWith(created.draft.textFileName, '')
+
+    const listResponse = await getJson(env, `/api/newsletter/${NEWSLETTER_ID}/drafts`, auth)
+    await expect(listResponse.json()).resolves.toEqual({
+      drafts: [created.draft],
+    })
+
+    const getResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}`,
+      auth
+    )
+    await expect(getResponse.json()).resolves.toEqual({
+      draft: created.draft,
+      html: '',
+      text: '',
+    })
+
+    const updateResponse = await putJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}`,
+      { subject: 'Updated draft', html: '<p>Updated</p>', text: 'Updated' },
+      auth
+    )
+    const updated = await updateResponse.json()
+
+    expect(updateResponse.status).toBe(200)
+    expect(updated).toEqual(expect.objectContaining({
+      draft: expect.objectContaining({
+        id: created.draft.id,
+        subject: 'Updated draft',
+      }),
+      html: '<p>Updated</p>',
+      text: 'Updated',
+    }))
+    expect(db.newsletterDrafts.get(created.draft.id)?.subject).toBe('Updated draft')
+
+    const deleteResponse = await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}`,
+      auth
+    )
+
+    expect(deleteResponse.status).toBe(200)
+    expect(db.newsletterDrafts.has(created.draft.id)).toBe(false)
+    expect(r2Delete).toHaveBeenCalledWith(created.draft.contentFileName)
+    expect(r2Delete).toHaveBeenCalledWith(created.draft.textFileName)
+  })
+
+  it('treats repeated draft creates with the same sourceMessageId as an update', async () => {
+    const { env, db } = createEnv()
+    const firstResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'First title',
+        html: '<p>First</p>',
+        text: 'First',
+        sourceMessageId: 'retry-source-id',
+      },
+      auth
+    )
+    const first = await firstResponse.json()
+
+    const retryResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'Recovered title',
+        html: '<p>Recovered</p>',
+        text: 'Recovered',
+        sourceMessageId: 'retry-source-id',
+      },
+      auth
+    )
+    const retry = await retryResponse.json()
+
+    expect(firstResponse.status).toBe(201)
+    expect(retryResponse.status).toBe(201)
+    expect(retry.draft).toEqual(expect.objectContaining({
+      id: first.draft.id,
+      subject: 'Recovered title',
+      sourceMessageId: 'retry-source-id',
+    }))
+    expect(db.newsletterDrafts.size).toBe(1)
+
+    const getResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${first.draft.id}`,
+      auth
+    )
+    await expect(getResponse.json()).resolves.toEqual(expect.objectContaining({
+      draft: expect.objectContaining({ subject: 'Recovered title' }),
+      html: '<p>Recovered</p>',
+      text: 'Recovered',
+    }))
+  })
+
+  it('deletes draft metadata before deleting a newsletter', async () => {
+    const { env, db } = createEnv()
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'Delete with newsletter',
+        html: '<p>Draft</p>',
+        text: 'Draft',
+        sourceMessageId: 'delete-source-id',
+      },
+      auth
+    )
+    expect(createResponse.status).toBe(201)
+    expect(db.newsletterDrafts.size).toBe(1)
+
+    const deleteResponse = await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}`,
+      auth
+    )
+
+    expect(deleteResponse.status).toBe(200)
+    await expect(deleteResponse.json()).resolves.toEqual({
+      message: 'Newsletter deleted successfully',
+    })
+    expect(db.newsletterDrafts.size).toBe(0)
+    expect(db.newsletters.has(NEWSLETTER_ID)).toBe(false)
+  })
+
+  it('sends a draft with its stable sourceMessageId and hides it from active drafts', async () => {
+    const { env, db, queueSend } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'Draft send',
+        html: '<p>Draft body</p>',
+        text: 'Draft body',
+        sourceMessageId: 'draft-source-id',
+      },
+      auth
+    )
+    const created = await createResponse.json()
+
+    const sendResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}/send`,
+      {},
+      auth
+    )
+    const sent = await sendResponse.json()
+
+    expect(sendResponse.status).toBe(200)
+    expect(sent).toEqual(expect.objectContaining({
+      newsletterId: NEWSLETTER_ID,
+      subject: 'Draft send',
+      sendId: expect.any(String),
+      duplicate: false,
+    }))
+    expect(db.newsletterSends.get(sent.sendId)).toEqual(expect.objectContaining({
+      sourceMessageId: 'draft-source-id',
+    }))
+    expect(db.newsletterDrafts.get(created.draft.id)).toEqual(expect.objectContaining({
+      status: 'sent',
+      sendId: sent.sendId,
+    }))
+    expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'fanout',
+      sourceMessageId: 'draft-source-id',
+    }))
+
+    const listResponse = await getJson(env, `/api/newsletter/${NEWSLETTER_ID}/drafts`, auth)
+    await expect(listResponse.json()).resolves.toEqual({ drafts: [] })
+  })
+
+  it('marks a draft sent when its sourceMessageId is already a send duplicate', async () => {
+    const { env, db } = createEnv()
+    db.newsletterSends.set('existing-send', {
+      id: 'existing-send',
+      newsletterId: NEWSLETTER_ID,
+      subject: 'Already sent',
+      sourceMessageId: 'duplicate-source',
+      status: 'completed',
+      recipientCount: 1,
+      queuedCount: 1,
+      fanoutQueuedCount: 1,
+      sendingCount: 0,
+      retryingCount: 0,
+      queueFailedCount: 0,
+      providerAcceptedCount: 0,
+      deliveredCount: 1,
+      deliveryDelayedCount: 0,
+      bouncedCount: 0,
+      complainedCount: 0,
+      failedCount: 0,
+      deadLetteredCount: 0,
+      needsReviewCount: 0,
+      lastError: null,
+      contentFileName: 'newsletters/duplicate.html',
+      textFileName: 'newsletters/duplicate.txt',
+      fromName: null,
+      fanoutSnapshotAt: '2026-04-30T01:00:00Z',
+      fanoutCursorEmail: null,
+      fanoutCompletedAt: '2026-04-30T01:00:00Z',
+      createdAt: '2026-04-30T01:00:00Z',
+      updatedAt: '2026-04-30T01:00:00Z',
+      completedAt: '2026-04-30T01:00:00Z',
+    })
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'Draft duplicate',
+        html: '<p>Draft body</p>',
+        text: 'Draft body',
+        sourceMessageId: 'duplicate-source',
+      },
+      auth
+    )
+    const created = await createResponse.json()
+
+    const sendResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}/send`,
+      {},
+      auth
+    )
+    const sent = await sendResponse.json()
+
+    expect(sendResponse.status).toBe(200)
+    expect(sent).toEqual(expect.objectContaining({
+      sendId: 'existing-send',
+      duplicate: true,
+    }))
+    expect(db.newsletterDrafts.get(created.draft.id)).toEqual(expect.objectContaining({
+      status: 'sent',
+      sendId: 'existing-send',
+    }))
+  })
+
+  it('returns sent content and creates template drafts with a fresh sourceMessageId', async () => {
+    const { env } = createEnv()
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      auth
+    )
+    const published = await publishResponse.json()
+
+    const contentResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/sends/${published.sendId}/content`,
+      auth
+    )
+    await expect(contentResponse.json()).resolves.toEqual(expect.objectContaining({
+      send: expect.objectContaining({ id: published.sendId }),
+      html: TRACKED_PUBLISH_PAYLOAD.html,
+      text: TRACKED_PUBLISH_PAYLOAD.text,
+    }))
+
+    const templateResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/sends/${published.sendId}/draft`,
+      {},
+      auth
+    )
+    const template = await templateResponse.json()
+
+    expect(templateResponse.status).toBe(201)
+    expect(template).toEqual(expect.objectContaining({
+      draft: expect.objectContaining({
+        subject: TRACKED_PUBLISH_PAYLOAD.subject,
+        sourceMessageId: expect.stringMatching(/^draft:/),
+      }),
+      html: TRACKED_PUBLISH_PAYLOAD.html,
+      text: TRACKED_PUBLISH_PAYLOAD.text,
+    }))
+    expect(template.draft.sourceMessageId).not.toBe(TRACKED_PUBLISH_PAYLOAD.sourceMessageId)
+  })
+
+  it('reports unavailable sent content and enforces newsletter scoping', async () => {
+    const { env } = createEnv()
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      TRACKED_PUBLISH_PAYLOAD,
+      auth
+    )
+    const published = await publishResponse.json()
+
+    const scopedResponse = await getJson(
+      env,
+      `/api/newsletter/${SECOND_NEWSLETTER_ID}/sends/${published.sendId}/content`,
+      auth
+    )
+    expect(scopedResponse.status).toBe(404)
+
+    await env.R2.delete(published.fileName)
+    const missingContentResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/sends/${published.sendId}/draft`,
+      {},
+      auth
+    )
+
+    expect(missingContentResponse.status).toBe(404)
+    await expect(missingContentResponse.json()).resolves.toEqual({
+      error: 'Newsletter send content not found',
+    })
   })
 })
 

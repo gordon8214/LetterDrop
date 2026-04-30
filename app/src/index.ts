@@ -112,6 +112,32 @@ type LimitedJsonObjectResult =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; response: Response };
 
+type NewsletterDraftSummary = {
+  id: string;
+  newsletterId: string;
+  subject: string;
+  sourceMessageId: string;
+  contentFileName: string;
+  textFileName: string;
+  status: "draft" | "sent";
+  sendId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  sentAt: string | null;
+};
+
+type NewsletterDraftContent = {
+  draft: NewsletterDraftSummary;
+  html: string;
+  text: string;
+};
+
+class NewsletterDraftSourceConflictError extends Error {
+  constructor() {
+    super("Newsletter draft sourceMessageId is already associated with a sent draft");
+  }
+}
+
 type NewsletterRecipientQueueMessage = {
   kind?: "recipient";
   email: string;
@@ -1710,6 +1736,260 @@ app.get("/api/newsletter/:newsletterId/sends/:sendId/stream", async (c) => {
   }
 });
 
+app.get("/api/newsletter/:newsletterId/drafts", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+
+  try {
+    if (!(await newsletterExists(c.env.DB, newsletterId))) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
+    const drafts = await listNewsletterDraftSummaries(c.env.DB, newsletterId);
+    return c.json({ drafts });
+  } catch (error: unknown) {
+    return internalServerError(c, "list-newsletter-drafts", error);
+  }
+});
+
+app.post("/api/newsletter/:newsletterId/drafts", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+
+  try {
+    if (!(await newsletterExists(c.env.DB, newsletterId))) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const subject = draftStringField(parsedBody.body, "subject", "");
+    const html = draftStringField(parsedBody.body, "html", "");
+    const text = draftStringField(parsedBody.body, "text", "");
+    if (!subject.ok) return c.json({ error: subject.error }, 400);
+    if (!html.ok) return c.json({ error: html.error }, 400);
+    if (!text.ok) return c.json({ error: text.error }, 400);
+
+    try {
+      const draft = await createNewsletterDraft(c.env, {
+        newsletterId,
+        subject: subject.value,
+        html: html.value,
+        text: text.value,
+        sourceMessageId: normalizeNonEmptyString(parsedBody.body.sourceMessageId),
+      });
+      return c.json({ draft, html: html.value, text: text.value }, 201);
+    } catch (error: unknown) {
+      if (error instanceof NewsletterDraftSourceConflictError) {
+        return c.json({ error: error.message }, 409);
+      }
+      throw error;
+    }
+  } catch (error: unknown) {
+    return internalServerError(c, "create-newsletter-draft", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
+  const { newsletterId, draftId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+    return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+  }
+
+  try {
+    const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+    if (!draft || draft.newsletterId !== newsletterId || draft.status !== "draft") {
+      return c.json({ error: "Newsletter draft not found" }, 404);
+    }
+    const content = await getNewsletterDraftContent(c.env, draft);
+    if (!content) {
+      return c.json({ error: "Newsletter draft content not found" }, 404);
+    }
+    return c.json(content);
+  } catch (error: unknown) {
+    return internalServerError(c, "get-newsletter-draft", error);
+  }
+});
+
+app.put("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
+  const { newsletterId, draftId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+    return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+  }
+
+  try {
+    const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+    if (!draft || draft.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter draft not found" }, 404);
+    }
+    if (draft.status !== "draft") {
+      return c.json({ error: "Newsletter draft has already been sent" }, 409);
+    }
+    const content = await getNewsletterDraftContent(c.env, draft);
+    if (!content) {
+      return c.json({ error: "Newsletter draft content not found" }, 404);
+    }
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const subject = draftStringField(parsedBody.body, "subject", draft.subject);
+    const html = draftStringField(parsedBody.body, "html", content.html);
+    const text = draftStringField(parsedBody.body, "text", content.text);
+    if (!subject.ok) return c.json({ error: subject.error }, 400);
+    if (!html.ok) return c.json({ error: html.error }, 400);
+    if (!text.ok) return c.json({ error: text.error }, 400);
+
+    const updated = await updateNewsletterDraft(c.env, draft, {
+      subject: subject.value,
+      html: html.value,
+      text: text.value,
+    });
+    return c.json({ draft: updated, html: html.value, text: text.value });
+  } catch (error: unknown) {
+    return internalServerError(c, "update-newsletter-draft", error);
+  }
+});
+
+app.delete("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
+  const { newsletterId, draftId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+    return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+  }
+
+  try {
+    const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+    if (!draft || draft.newsletterId !== newsletterId || draft.status !== "draft") {
+      return c.json({ error: "Newsletter draft not found" }, 404);
+    }
+    await c.env.DB.prepare(`DELETE FROM NewsletterDraft WHERE id = ?`)
+      .bind(draftId)
+      .run();
+    await Promise.allSettled([
+      c.env.R2.delete(draft.contentFileName),
+      c.env.R2.delete(draft.textFileName),
+    ]);
+    return c.json({ message: "Newsletter draft deleted successfully" });
+  } catch (error: unknown) {
+    return internalServerError(c, "delete-newsletter-draft", error);
+  }
+});
+
+app.post("/api/newsletter/:newsletterId/drafts/:draftId/send", async (c) => {
+  const { newsletterId, draftId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+    return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+  }
+
+  try {
+    const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+    if (!draft || draft.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter draft not found" }, 404);
+    }
+    if (draft.status !== "draft") {
+      return c.json({ error: "Newsletter draft has already been sent" }, 409);
+    }
+    const content = await getNewsletterDraftContent(c.env, draft);
+    if (!content) {
+      return c.json({ error: "Newsletter draft content not found" }, 404);
+    }
+
+    const result = await publishNewsletter(c.env, {
+      newsletterId,
+      subject: draft.subject,
+      html: content.html,
+      text: content.text,
+      sourceMessageId: draft.sourceMessageId,
+    });
+
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+
+    await markNewsletterDraftSent(c.env.DB, draftId, result.sendId ?? null);
+
+    return c.json({
+      newsletterId: result.newsletterId,
+      subject: result.subject,
+      fileName: result.fileName,
+      textFileName: result.textFileName,
+      sendId: result.sendId,
+      send: result.send,
+      recipientCount: result.recipientCount,
+      queuedCount: result.queuedCount,
+      queueFailedCount: result.queueFailedCount ?? 0,
+      duplicate: result.duplicate,
+    });
+  } catch (error: unknown) {
+    return internalServerError(c, "send-newsletter-draft", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/sends/:sendId/content", async (c) => {
+  const { newsletterId, sendId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(sendId)) {
+    return c.json({ error: "Invalid newsletterId or sendId" }, 400);
+  }
+
+  try {
+    const send = await getNewsletterSendSummary(c.env.DB, sendId);
+    if (!send || send.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter send not found" }, 404);
+    }
+    const [html, text] = await Promise.all([
+      readR2Text(c.env, send.contentFileName),
+      readR2Text(c.env, send.textFileName),
+    ]);
+    if (html === null || text === null) {
+      return c.json({ error: "Newsletter send content not found" }, 404);
+    }
+    return c.json({ send, html, text });
+  } catch (error: unknown) {
+    return internalServerError(c, "get-newsletter-send-content", error);
+  }
+});
+
+app.post("/api/newsletter/:newsletterId/sends/:sendId/draft", async (c) => {
+  const { newsletterId, sendId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(sendId)) {
+    return c.json({ error: "Invalid newsletterId or sendId" }, 400);
+  }
+
+  try {
+    const send = await getNewsletterSendSummary(c.env.DB, sendId);
+    if (!send || send.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter send not found" }, 404);
+    }
+    const [html, text] = await Promise.all([
+      readR2Text(c.env, send.contentFileName),
+      readR2Text(c.env, send.textFileName),
+    ]);
+    if (html === null || text === null) {
+      return c.json({ error: "Newsletter send content not found" }, 404);
+    }
+    try {
+      const draft = await createNewsletterDraft(c.env, {
+        newsletterId,
+        subject: send.subject,
+        html,
+        text,
+      });
+      return c.json({ draft, html, text }, 201);
+    } catch (error: unknown) {
+      if (error instanceof NewsletterDraftSourceConflictError) {
+        return c.json({ error: error.message }, 409);
+      }
+      throw error;
+    }
+  } catch (error: unknown) {
+    return internalServerError(c, "create-newsletter-draft-from-send", error);
+  }
+});
+
 app.post("/api/publish/google-workspace", async (c) => {
   const bridgeToken = c.env.PUBLISH_BRIDGE_TOKEN?.trim();
   if (!bridgeToken) {
@@ -1860,6 +2140,9 @@ app.delete("/api/newsletter/:newsletterId", async (c) => {
     }
 
     await c.env.DB.batch([
+      c.env.DB.prepare(`DELETE FROM NewsletterDraft WHERE newsletter_id = ?`).bind(
+        newsletterId,
+      ),
       c.env.DB.prepare(`DELETE FROM Subscriber WHERE newsletter_id = ?`).bind(
         newsletterId,
       ),
@@ -3366,6 +3649,288 @@ function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendS
     updatedAt: String(row.updatedAt ?? ""),
     completedAt: asNullableString(row.completedAt ?? row.completed_at),
   };
+}
+
+function mapNewsletterDraftSummary(row: Record<string, unknown>): NewsletterDraftSummary {
+  const status = String(row.status ?? "draft") === "sent" ? "sent" : "draft";
+  return {
+    id: String(row.id ?? ""),
+    newsletterId: String(row.newsletterId ?? row.newsletter_id ?? ""),
+    subject: String(row.subject ?? ""),
+    sourceMessageId: String(row.sourceMessageId ?? row.source_message_id ?? ""),
+    contentFileName: String(row.contentFileName ?? row.content_file_name ?? ""),
+    textFileName: String(row.textFileName ?? row.text_file_name ?? ""),
+    status,
+    sendId: asNullableString(row.sendId ?? row.send_id),
+    createdAt: String(row.createdAt ?? ""),
+    updatedAt: String(row.updatedAt ?? ""),
+    sentAt: asNullableString(row.sentAt ?? row.sent_at),
+  };
+}
+
+async function readR2Text(env: Bindings, key: string | null): Promise<string | null> {
+  if (!key) {
+    return null;
+  }
+  const object = await env.R2.get(key);
+  return object ? object.text() : null;
+}
+
+async function newsletterExists(db: D1Database, newsletterId: string): Promise<boolean> {
+  const newsletter = await db
+    .prepare(`SELECT id FROM Newsletter WHERE id = ?`)
+    .bind(newsletterId)
+    .first<{ id: string }>();
+  return Boolean(newsletter);
+}
+
+function draftContentFileName(newsletterId: string, draftId: string): string {
+  return `newsletters/${newsletterId}/drafts/${draftId}.html`;
+}
+
+function draftTextFileName(newsletterId: string, draftId: string): string {
+  return `newsletters/${newsletterId}/drafts/${draftId}.txt`;
+}
+
+function draftStringField(
+  body: Record<string, unknown>,
+  field: string,
+  fallback: string,
+): { ok: true; value: string } | { ok: false; error: string } {
+  const value = body[field];
+  if (value === undefined || value === null) {
+    return { ok: true, value: fallback };
+  }
+  if (typeof value !== "string") {
+    return { ok: false, error: `${field} must be a string` };
+  }
+  return { ok: true, value };
+}
+
+async function listNewsletterDraftSummaries(
+  db: D1Database,
+  newsletterId: string,
+): Promise<NewsletterDraftSummary[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT id,
+              newsletter_id AS newsletterId,
+              subject,
+              source_message_id AS sourceMessageId,
+              content_file_name AS contentFileName,
+              text_file_name AS textFileName,
+              status,
+              send_id AS sendId,
+              createdAt,
+              updatedAt,
+              sentAt
+       FROM NewsletterDraft
+       WHERE newsletter_id = ? AND status = 'draft'
+       ORDER BY updatedAt DESC
+       LIMIT 50`,
+    )
+    .bind(newsletterId)
+    .all<Record<string, unknown>>();
+  return results.map(mapNewsletterDraftSummary);
+}
+
+async function getNewsletterDraftSummary(
+  db: D1Database,
+  draftId: string,
+): Promise<NewsletterDraftSummary | null> {
+  const row = await db
+    .prepare(
+      `SELECT id,
+              newsletter_id AS newsletterId,
+              subject,
+              source_message_id AS sourceMessageId,
+              content_file_name AS contentFileName,
+              text_file_name AS textFileName,
+              status,
+              send_id AS sendId,
+              createdAt,
+              updatedAt,
+              sentAt
+       FROM NewsletterDraft
+       WHERE id = ?`,
+    )
+    .bind(draftId)
+    .first<Record<string, unknown>>();
+  return row ? mapNewsletterDraftSummary(row) : null;
+}
+
+async function getNewsletterDraftBySourceMessageId(
+  db: D1Database,
+  newsletterId: string,
+  sourceMessageId: string,
+): Promise<NewsletterDraftSummary | null> {
+  const row = await db
+    .prepare(
+      `SELECT id,
+              newsletter_id AS newsletterId,
+              subject,
+              source_message_id AS sourceMessageId,
+              content_file_name AS contentFileName,
+              text_file_name AS textFileName,
+              status,
+              send_id AS sendId,
+              createdAt,
+              updatedAt,
+              sentAt
+       FROM NewsletterDraft
+       WHERE newsletter_id = ? AND source_message_id = ?
+       LIMIT 1`,
+    )
+    .bind(newsletterId, sourceMessageId)
+    .first<Record<string, unknown>>();
+  return row ? mapNewsletterDraftSummary(row) : null;
+}
+
+async function getNewsletterDraftContent(
+  env: Bindings,
+  draft: NewsletterDraftSummary,
+): Promise<NewsletterDraftContent | null> {
+  const [html, text] = await Promise.all([
+    readR2Text(env, draft.contentFileName),
+    readR2Text(env, draft.textFileName),
+  ]);
+  if (html === null || text === null) {
+    return null;
+  }
+  return { draft, html, text };
+}
+
+async function createNewsletterDraft(
+  env: Bindings,
+  input: {
+    newsletterId: string;
+    subject: string;
+    html: string;
+    text: string;
+    sourceMessageId?: string | null;
+  },
+): Promise<NewsletterDraftSummary> {
+  const draftId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const contentFileName = draftContentFileName(input.newsletterId, draftId);
+  const textFileName = draftTextFileName(input.newsletterId, draftId);
+  const requestedSourceMessageId = normalizeNonEmptyString(input.sourceMessageId);
+  const sourceMessageId = requestedSourceMessageId ?? `draft:${draftId}`;
+
+  const existingDraft = requestedSourceMessageId
+    ? await getNewsletterDraftBySourceMessageId(
+      env.DB,
+      input.newsletterId,
+      sourceMessageId,
+    )
+    : null;
+  if (existingDraft) {
+    if (existingDraft.status !== "draft") {
+      throw new NewsletterDraftSourceConflictError();
+    }
+    return updateNewsletterDraft(env, existingDraft, input);
+  }
+
+  await Promise.all([
+    env.R2.put(contentFileName, input.html),
+    env.R2.put(textFileName, input.text),
+  ]);
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO NewsletterDraft (
+         id, newsletter_id, subject, source_message_id, content_file_name,
+         text_file_name, status, send_id, createdAt, updatedAt, sentAt
+       )
+       VALUES (?, ?, ?, ?, ?, ?, 'draft', NULL, ?, ?, NULL)`,
+    )
+      .bind(
+        draftId,
+        input.newsletterId,
+        input.subject,
+        sourceMessageId,
+        contentFileName,
+        textFileName,
+        now,
+        now,
+      )
+      .run();
+  } catch (error: unknown) {
+    await Promise.allSettled([
+      env.R2.delete(contentFileName),
+      env.R2.delete(textFileName),
+    ]);
+    if (isNewsletterDraftSourceUniqueError(error)) {
+      const conflictingDraft = await getNewsletterDraftBySourceMessageId(
+        env.DB,
+        input.newsletterId,
+        sourceMessageId,
+      );
+      if (conflictingDraft?.status === "draft") {
+        return updateNewsletterDraft(env, conflictingDraft, input);
+      }
+      if (conflictingDraft) {
+        throw new NewsletterDraftSourceConflictError();
+      }
+    }
+    throw error;
+  }
+
+  const draft = await getNewsletterDraftSummary(env.DB, draftId);
+  if (!draft) {
+    throw new Error("Failed to create newsletter draft");
+  }
+  return draft;
+}
+
+function isNewsletterDraftSourceUniqueError(error: unknown): boolean {
+  return error instanceof Error &&
+    error.message.includes("NewsletterDraft.newsletter_id") &&
+    error.message.includes("NewsletterDraft.source_message_id");
+}
+
+async function updateNewsletterDraft(
+  env: Bindings,
+  draft: NewsletterDraftSummary,
+  input: { subject: string; html: string; text: string },
+): Promise<NewsletterDraftSummary> {
+  const now = new Date().toISOString();
+  await Promise.all([
+    env.R2.put(draft.contentFileName, input.html),
+    env.R2.put(draft.textFileName, input.text),
+  ]);
+  await env.DB.prepare(
+    `UPDATE NewsletterDraft
+     SET subject = ?,
+         updatedAt = ?
+     WHERE id = ? AND status = 'draft'`,
+  )
+    .bind(input.subject, now, draft.id)
+    .run();
+  const updated = await getNewsletterDraftSummary(env.DB, draft.id);
+  if (!updated) {
+    throw new Error("Failed to update newsletter draft");
+  }
+  return updated;
+}
+
+async function markNewsletterDraftSent(
+  db: D1Database,
+  draftId: string,
+  sendId: string | null,
+): Promise<void> {
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE NewsletterDraft
+       SET status = 'sent',
+           send_id = ?,
+           sentAt = ?,
+           updatedAt = ?
+       WHERE id = ? AND status = 'draft'`,
+    )
+    .bind(sendId, now, now, draftId)
+    .run();
 }
 
 function mapNewsletterSendRecipient(row: Record<string, unknown>): NewsletterSendRecipient {

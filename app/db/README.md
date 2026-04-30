@@ -35,3 +35,9 @@ wrangler d1 execute <d1_database_name> --remote --file db/20260429_add_duplicate
 ```bash
 wrangler d1 execute <d1_database_name> --remote --file db/20260429_add_scalable_send_fanout.sql
 ```
+
+## Run newsletter drafts migration on existing database
+
+```bash
+wrangler d1 execute <d1_database_name> --remote --file db/20260430_add_newsletter_drafts.sql
+```
