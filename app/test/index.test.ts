@@ -2589,6 +2589,60 @@ describe('newsletter draft admin endpoints', () => {
     await expect(listResponse.json()).resolves.toEqual({ drafts: [] })
   })
 
+  it('publishes the supplied draft snapshot instead of rereading stale stored content', async () => {
+    const { env, db } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'Stale draft',
+        html: '<p>Stale Ω body</p>',
+        text: 'Stale Ω body',
+        sourceMessageId: 'snapshot-source-id',
+      },
+      auth
+    )
+    const created = await createResponse.json()
+
+    const sendResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}/send`,
+      {
+        subject: 'Clean send',
+        html: '<p>Clean body</p>',
+        text: 'Clean body',
+        sourceMessageId: 'snapshot-source-id',
+      },
+      auth
+    )
+    const sent = await sendResponse.json() as {
+      fileName: string
+      textFileName: string
+      sendId: string
+    }
+    const sentHtml = await env.R2.get(sent.fileName)
+    const sentText = await env.R2.get(sent.textFileName)
+
+    expect(sendResponse.status).toBe(200)
+    await expect(sentHtml?.text()).resolves.toBe('<p>Clean body</p>')
+    await expect(sentText?.text()).resolves.toBe('Clean body')
+    expect(db.newsletterSends.get(sent.sendId)).toEqual(expect.objectContaining({
+      subject: 'Clean send',
+      sourceMessageId: 'snapshot-source-id',
+    }))
+    expect(db.newsletterDrafts.get(created.draft.id)).toEqual(expect.objectContaining({
+      status: 'sent',
+      sendId: sent.sendId,
+    }))
+  })
+
   it('marks a draft sent when its sourceMessageId is already a send duplicate', async () => {
     const { env, db } = createEnv()
     db.newsletterSends.set('existing-send', {

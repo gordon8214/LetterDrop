@@ -1910,16 +1910,35 @@ app.post("/api/newsletter/:newsletterId/drafts/:draftId/send", async (c) => {
     if (draft.status !== "draft") {
       return c.json({ error: "Newsletter draft has already been sent" }, 409);
     }
-    const content = await getNewsletterDraftContent(c.env, draft);
-    if (!content) {
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const body = parsedBody.body;
+    const requestedSourceMessageId = normalizeNonEmptyString(body.sourceMessageId);
+    if (requestedSourceMessageId && requestedSourceMessageId !== draft.sourceMessageId) {
+      return c.json({ error: "sourceMessageId does not match the draft" }, 409);
+    }
+
+    const needsStoredContent = body.html === undefined || body.text === undefined;
+    const content = needsStoredContent
+      ? await getNewsletterDraftContent(c.env, draft)
+      : null;
+    if (needsStoredContent && !content) {
       return c.json({ error: "Newsletter draft content not found" }, 404);
     }
+    const subject = draftStringField(body, "subject", draft.subject);
+    const html = draftStringField(body, "html", content?.html ?? "");
+    const text = draftStringField(body, "text", content?.text ?? "");
+    if (!subject.ok) return c.json({ error: subject.error }, 400);
+    if (!html.ok) return c.json({ error: html.error }, 400);
+    if (!text.ok) return c.json({ error: text.error }, 400);
 
     const result = await publishNewsletter(c.env, {
       newsletterId,
-      subject: draft.subject,
-      html: content.html,
-      text: content.text,
+      subject: subject.value,
+      html: html.value,
+      text: text.value,
       sourceMessageId: draft.sourceMessageId,
     });
 
