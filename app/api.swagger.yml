@@ -120,6 +120,39 @@ paths:
         '500':
           description: Server error
 
+  /api/newsletter/{newsletterId}/publish/dry-run:
+    post:
+      summary: Dry run a direct newsletter publish
+      description: Validate direct newsletter content and return recipient/fanout estimates without storing content, queueing work, or sending email.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+          format: uuid
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/DirectPublishNewsletterRequest'
+      responses:
+        '200':
+          description: Newsletter dry run completed
+          schema:
+            $ref: '#/definitions/PublishNewsletterDryRunResponse'
+        '400':
+          description: Invalid newsletter ID or publish payload
+        '401':
+          description: Missing or invalid admin bearer token
+        '404':
+          description: Newsletter not found
+        '413':
+          description: Publish payload is too large
+        '500':
+          description: Server error
+
   /api/newsletter/{newsletterId}/sends:
     get:
       summary: List newsletter sends
@@ -795,6 +828,37 @@ definitions:
       sourceMessageId:
         type: string
         description: Required idempotency key used for duplicate suppression.
+
+  PublishNewsletterDryRunResponse:
+    type: object
+    properties:
+      newsletterId:
+        type: string
+        format: uuid
+      subject:
+        type: string
+      recipientCount:
+        type: integer
+      estimatedFanoutChunks:
+        type: integer
+      estimatedRecipientQueueBatches:
+        type: integer
+      fanoutChunkSize:
+        type: integer
+      wouldSendEmail:
+        type: boolean
+        description: Always false for this endpoint; no email send work is queued.
+      freePlanSafe:
+        type: boolean
+      duplicate:
+        type: boolean
+      sendId:
+        type: string
+        format: uuid
+        x-nullable: true
+      send:
+        $ref: '#/definitions/NewsletterSendSummary'
+        x-nullable: true
 
   PublishNewsletterResponse:
     type: object
