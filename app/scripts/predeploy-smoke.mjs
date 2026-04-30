@@ -128,12 +128,62 @@ async function checkMigrations(databaseName, envName) {
   }
 
   const subscriberColumns = await queryD1(databaseName, envName, "PRAGMA table_info('Subscriber')")
-  const columnNames = new Set(subscriberColumns.map((column) => String(column.name ?? '')))
-  const missingColumns = ['first_name', 'last_name'].filter((column) => !columnNames.has(column))
+  const subscriberColumnNames = new Set(subscriberColumns.map((column) => String(column.name ?? '')))
+  const missingColumns = [
+    'first_name',
+    'last_name',
+    'subscribed_at',
+    'unsubscribed_at',
+    'deleted_at',
+  ].filter((column) => !subscriberColumnNames.has(column))
 
   if (missingColumns.length > 0) {
     throw new Error(
-      `Missing Subscriber columns: ${missingColumns.join(', ')}. Apply db/20260222_add_subscriber_names.sql before deploy.`
+      `Missing Subscriber columns: ${missingColumns.join(', ')}. Apply the pending db migrations before deploy.`
+    )
+  }
+
+  const sendColumns = await queryD1(databaseName, envName, "PRAGMA table_info('NewsletterSend')")
+  const sendColumnNames = new Set(sendColumns.map((column) => String(column.name ?? '')))
+  const missingSendColumns = [
+    'sending_count',
+    'retrying_count',
+    'fanout_queued_count',
+    'content_file_name',
+    'text_file_name',
+    'from_name',
+    'fanout_snapshot_at',
+    'fanout_cursor_email',
+    'fanout_completed_at',
+  ].filter((column) => !sendColumnNames.has(column))
+
+  if (missingSendColumns.length > 0) {
+    throw new Error(
+      `Missing NewsletterSend columns: ${missingSendColumns.join(', ')}. Apply db/20260429_add_scalable_send_fanout.sql before deploy.`
+    )
+  }
+
+  const indexes = await queryD1(
+    databaseName,
+    envName,
+    `SELECT name FROM sqlite_master
+     WHERE type = 'index'
+       AND name IN (
+         'idx_subscriber_newsletter_snapshot_email',
+         'idx_newsletter_send_recipient_status_email',
+         'idx_newsletter_send_recipient_email'
+       )`
+  )
+  const indexNames = new Set(indexes.map((index) => String(index.name ?? '')))
+  const missingIndexes = [
+    'idx_subscriber_newsletter_snapshot_email',
+    'idx_newsletter_send_recipient_status_email',
+    'idx_newsletter_send_recipient_email',
+  ].filter((index) => !indexNames.has(index))
+
+  if (missingIndexes.length > 0) {
+    throw new Error(
+      `Missing D1 indexes: ${missingIndexes.join(', ')}. Apply db/20260429_add_scalable_send_fanout.sql before deploy.`
     )
   }
 }

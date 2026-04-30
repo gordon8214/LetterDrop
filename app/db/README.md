@@ -29,3 +29,9 @@ wrangler d1 execute <d1_database_name> --remote --file db/20260428_add_newslette
 ```bash
 wrangler d1 execute <d1_database_name> --remote --file db/20260429_add_duplicate_safe_send_tracking.sql
 ```
+
+## Run scalable send fanout migration on existing database
+
+```bash
+wrangler d1 execute <d1_database_name> --remote --file db/20260429_add_scalable_send_fanout.sql
+```

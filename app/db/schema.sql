@@ -17,6 +17,9 @@ CREATE TABLE Subscriber (
     newsletter_id TEXT,
     isSubscribed BOOLEAN,
     upsertedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    subscribed_at DATETIME,
+    unsubscribed_at DATETIME,
+    deleted_at DATETIME,
     PRIMARY KEY (email, newsletter_id),
     FOREIGN KEY (newsletter_id) REFERENCES Newsletter(id)
 );
@@ -50,6 +53,9 @@ CREATE TABLE NewsletterSend (
     status TEXT NOT NULL,
     recipient_count INTEGER NOT NULL DEFAULT 0,
     queued_count INTEGER NOT NULL DEFAULT 0,
+    fanout_queued_count INTEGER NOT NULL DEFAULT 0,
+    sending_count INTEGER NOT NULL DEFAULT 0,
+    retrying_count INTEGER NOT NULL DEFAULT 0,
     queue_failed_count INTEGER NOT NULL DEFAULT 0,
     provider_accepted_count INTEGER NOT NULL DEFAULT 0,
     delivered_count INTEGER NOT NULL DEFAULT 0,
@@ -60,6 +66,12 @@ CREATE TABLE NewsletterSend (
     dead_lettered_count INTEGER NOT NULL DEFAULT 0,
     needs_review_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    content_file_name TEXT,
+    text_file_name TEXT,
+    from_name TEXT,
+    fanout_snapshot_at DATETIME,
+    fanout_cursor_email TEXT,
+    fanout_completed_at DATETIME,
     createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     completedAt DATETIME,
@@ -70,6 +82,10 @@ CREATE INDEX idx_newsletter_send_lookup ON NewsletterSend(newsletter_id, created
 CREATE UNIQUE INDEX idx_newsletter_send_source_message
 ON NewsletterSend(newsletter_id, source_message_id)
 WHERE source_message_id IS NOT NULL;
+CREATE INDEX idx_subscriber_newsletter_subscribed_email
+ON Subscriber(newsletter_id, isSubscribed, email);
+CREATE INDEX idx_subscriber_newsletter_snapshot_email
+ON Subscriber(newsletter_id, email, subscribed_at, unsubscribed_at, deleted_at);
 
 CREATE TABLE NewsletterSendRecipient (
     id TEXT PRIMARY KEY,
@@ -100,6 +116,10 @@ CREATE TABLE NewsletterSendRecipient (
 );
 
 CREATE INDEX idx_newsletter_send_recipient_provider ON NewsletterSendRecipient(provider_message_id);
+CREATE INDEX idx_newsletter_send_recipient_status_email
+ON NewsletterSendRecipient(send_id, status, email);
+CREATE INDEX idx_newsletter_send_recipient_email
+ON NewsletterSendRecipient(send_id, email);
 
 CREATE TABLE NewsletterSendEvent (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -7,7 +7,7 @@ type Bindings = {
   NOTIFICATION: Fetcher;
   KV: KVNamespace;
   R2: R2Bucket;
-  QUEUE: Queue;
+  QUEUE: Queue<NewsletterQueueMessage>;
   SEND_STATUS_BROKER?: DurableObjectNamespace;
   ALLOWED_EMAILS: string;
   PUBLISH_EMAIL_ADDRESS: string;
@@ -58,7 +58,7 @@ type SendEmailOptions = {
   fromName?: string | null;
   headers?: EmailHeader[];
   tags?: EmailTag[];
-  onProviderRequestStarted?: () => void;
+  idempotencyKey?: string | null;
 };
 
 type StoredPublishConfig = {
@@ -92,6 +92,7 @@ type PublishNewsletterEmailSuccess = {
   textFileName?: string;
   sendId?: string;
   send?: NewsletterSendSummary;
+  recipientCount: number;
   queuedCount: number;
   queueFailedCount?: number;
   duplicate: boolean;
@@ -111,7 +112,8 @@ type LimitedJsonObjectResult =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; response: Response };
 
-type NewsletterQueueMessage = {
+type NewsletterRecipientQueueMessage = {
+  kind?: "recipient";
   email: string;
   newsletterId: string;
   subject: string;
@@ -121,6 +123,23 @@ type NewsletterQueueMessage = {
   sendId?: string;
   recipientHash?: string;
 };
+
+type NewsletterFanoutQueueMessage = {
+  kind: "fanout";
+  newsletterId: string;
+  subject: string;
+  fileName: string;
+  textFileName?: string;
+  fromName?: string | null;
+  sendId: string;
+  sourceMessageId: string;
+  cursorEmail?: string | null;
+  chunkIndex: number;
+};
+
+type NewsletterQueueMessage =
+  | NewsletterRecipientQueueMessage
+  | NewsletterFanoutQueueMessage;
 
 type NewsletterSendStatus =
   | "queued"
@@ -150,6 +169,9 @@ type NewsletterSendSummary = {
   status: NewsletterSendStatus;
   recipientCount: number;
   queuedCount: number;
+  fanoutQueuedCount: number;
+  sendingCount: number;
+  retryingCount: number;
   queueFailedCount: number;
   providerAcceptedCount: number;
   deliveredCount: number;
@@ -160,6 +182,12 @@ type NewsletterSendSummary = {
   deadLetteredCount: number;
   needsReviewCount: number;
   lastError: string | null;
+  contentFileName: string | null;
+  textFileName: string | null;
+  fromName: string | null;
+  fanoutSnapshotAt: string | null;
+  fanoutCursorEmail: string | null;
+  fanoutCompletedAt: string | null;
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
@@ -173,6 +201,7 @@ type NewsletterSendRecipient = {
   recipientHash: string;
   status: NewsletterSendRecipientStatus;
   attempts: number;
+  failureType: string | null;
   providerMessageId: string | null;
   lastError: string | null;
   queuedAt: string | null;
@@ -275,6 +304,12 @@ const MAX_PUBLISH_REQUEST_BYTES = 5 * 1024 * 1024;
 const MAX_FROM_NAME_LENGTH = 120;
 const MAX_SUPPRESSION_PAYLOAD_LENGTH = 20_000;
 const NEWSLETTER_SEND_EVENT_PAGE_SIZE = 500;
+const NEWSLETTER_SEND_RECIPIENT_PAGE_SIZE = 100;
+const NEWSLETTER_SEND_MAX_RECIPIENT_PAGE_SIZE = 250;
+const NEWSLETTER_SEND_STREAM_REPLAY_LIMIT = 100;
+const NEWSLETTER_FANOUT_CHUNK_SIZE = 15;
+const NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS = 60;
+const NEWSLETTER_SEND_RECIPIENT_SEARCH_MAX_BYTES = 256;
 
 let hasLoggedMissingAbuseEventMigration = false;
 
@@ -1403,6 +1438,74 @@ app.get("/api/newsletter/ses-diagnostics", async (c) => {
   }
 });
 
+app.post("/api/newsletter/:newsletterId/publish/dry-run", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+
+  try {
+    const newsletter = await c.env.DB.prepare(
+      `SELECT id FROM Newsletter WHERE id = ?`,
+    )
+      .bind(newsletterId)
+      .first<{ id: string }>();
+
+    if (!newsletter) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
+
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const body = parsedBody.body;
+    const sourceMessageId = normalizeNonEmptyString(body.sourceMessageId);
+    if (!sourceMessageId) {
+      return c.json({ error: "sourceMessageId is required" }, 400);
+    }
+    if (typeof body.subject !== "string" || body.subject.trim().length === 0) {
+      return c.json({ error: "Subject is required" }, 400);
+    }
+    const html = typeof body.html === "string" ? body.html : "";
+    const text = typeof body.text === "string" ? body.text : "";
+    if (html.trim().length === 0 || text.trim().length === 0) {
+      return c.json({ error: "Email html and text are required" }, 400);
+    }
+
+    const existingSend = await getNewsletterSendSummaryBySourceMessage(
+      c.env.DB,
+      newsletterId,
+      sourceMessageId,
+    );
+    const snapshotAt = new Date().toISOString();
+    const recipientCount = await countSubscribedSubscribers(
+      newsletterId,
+      c.env.DB,
+      snapshotAt,
+    );
+    const estimatedFanoutChunks = Math.ceil(
+      recipientCount / NEWSLETTER_FANOUT_CHUNK_SIZE,
+    );
+
+    return c.json({
+      newsletterId,
+      subject: body.subject.trim(),
+      recipientCount,
+      estimatedFanoutChunks,
+      estimatedRecipientQueueBatches: estimatedFanoutChunks,
+      fanoutChunkSize: NEWSLETTER_FANOUT_CHUNK_SIZE,
+      wouldSendEmail: false,
+      freePlanSafe: true,
+      duplicate: existingSend !== null,
+      sendId: existingSend?.id ?? null,
+      send: existingSend,
+    });
+  } catch (error: unknown) {
+    return internalServerError(c, "publish-newsletter-dry-run", error);
+  }
+});
+
 app.post("/api/newsletter/:newsletterId/publish", async (c) => {
   const { newsletterId } = c.req.param();
   if (!isValidUuid(newsletterId)) {
@@ -1441,14 +1544,15 @@ app.post("/api/newsletter/:newsletterId/publish", async (c) => {
     return c.json({
       newsletterId: result.newsletterId,
       subject: result.subject,
-	      fileName: result.fileName,
-	      textFileName: result.textFileName,
-	      sendId: result.sendId,
-	      send: result.send,
-	      queuedCount: result.queuedCount,
-	      queueFailedCount: result.queueFailedCount ?? 0,
-	      duplicate: result.duplicate,
-	    });
+      fileName: result.fileName,
+      textFileName: result.textFileName,
+      sendId: result.sendId,
+      send: result.send,
+      recipientCount: result.recipientCount,
+      queuedCount: result.queuedCount,
+      queueFailedCount: result.queueFailedCount ?? 0,
+      duplicate: result.duplicate,
+    });
   } catch (error: unknown) {
     return internalServerError(c, "publish-newsletter-direct", error);
   }
@@ -1479,12 +1583,95 @@ app.get("/api/newsletter/:newsletterId/sends/:sendId", async (c) => {
     if (!send || send.newsletterId !== newsletterId) {
       return c.json({ error: "Newsletter send not found" }, 404);
     }
-    const recipients = await getNewsletterSendRecipients(c.env.DB, sendId);
-    const events = await getNewsletterSendEvents(c.env.DB, sendId);
-    const lastEventId = events.length > 0 ? events[events.length - 1].id : 0;
-    return c.json({ send, recipients, events, lastEventId });
+    const recipientPage = await getNewsletterSendRecipientsPage(c.env.DB, sendId);
+    const events = await getLatestNewsletterSendEvents(c.env.DB, sendId, 100);
+    const lastEventId = await getNewsletterSendLastEventId(c.env.DB, sendId);
+    return c.json({
+      send,
+      recipients: recipientPage.recipients,
+      recipientPagination: recipientPage.pagination,
+      events,
+      lastEventId,
+    });
   } catch (error: unknown) {
     return internalServerError(c, "get-newsletter-send", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/sends/:sendId/recipients", async (c) => {
+  const { newsletterId, sendId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(sendId)) {
+    return c.json({ error: "Invalid newsletterId or sendId" }, 400);
+  }
+
+  try {
+    const send = await getNewsletterSendSummary(c.env.DB, sendId);
+    if (!send || send.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter send not found" }, 404);
+    }
+    const rawStatus = c.req.query("status");
+    if (rawStatus && !isNewsletterSendRecipientStatus(rawStatus)) {
+      return c.json({ error: "Invalid recipient status" }, 400);
+    }
+    const status = isNewsletterSendRecipientStatus(rawStatus) ? rawStatus : null;
+    const query = c.req.query("q") ?? null;
+    if (query && utf8ByteLength(query) > NEWSLETTER_SEND_RECIPIENT_SEARCH_MAX_BYTES) {
+      return c.json(
+        { error: `Recipient search must be ${NEWSLETTER_SEND_RECIPIENT_SEARCH_MAX_BYTES} bytes or fewer` },
+        400,
+      );
+    }
+    const page = await getNewsletterSendRecipientsPage(c.env.DB, sendId, {
+      cursorEmail: c.req.query("cursor") ?? null,
+      limit: boundedInt(
+        c.req.query("limit"),
+        NEWSLETTER_SEND_RECIPIENT_PAGE_SIZE,
+        1,
+        NEWSLETTER_SEND_MAX_RECIPIENT_PAGE_SIZE,
+      ),
+      status,
+      query,
+    });
+    return c.json(page);
+  } catch (error: unknown) {
+    return internalServerError(c, "list-newsletter-send-recipients", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/sends/:sendId/events", async (c) => {
+  const { newsletterId, sendId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(sendId)) {
+    return c.json({ error: "Invalid newsletterId or sendId" }, 400);
+  }
+
+  try {
+    const send = await getNewsletterSendSummary(c.env.DB, sendId);
+    if (!send || send.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter send not found" }, 404);
+    }
+    const afterEventId = Math.max(
+      0,
+      Number(c.req.query("afterEventId") ?? "0") || 0,
+    );
+    const limit = boundedInt(
+      c.req.query("limit"),
+      NEWSLETTER_SEND_EVENT_PAGE_SIZE,
+      1,
+      NEWSLETTER_SEND_EVENT_PAGE_SIZE,
+    );
+    const events = await getNewsletterSendEvents(c.env.DB, sendId, afterEventId, limit);
+    const lastEventId = await getNewsletterSendLastEventId(c.env.DB, sendId);
+    return c.json({
+      events,
+      lastEventId,
+      pagination: {
+        limit,
+        nextAfterEventId: events.length > 0 ? events[events.length - 1].id : null,
+        hasMore: events.length === limit && (events.at(-1)?.id ?? afterEventId) < lastEventId,
+      },
+    });
+  } catch (error: unknown) {
+    return internalServerError(c, "list-newsletter-send-events", error);
   }
 });
 
@@ -1560,14 +1747,15 @@ app.post("/api/publish/google-workspace", async (c) => {
     return c.json({
       newsletterId: result.newsletterId,
       subject: result.subject,
-	      fileName: result.fileName,
-	      textFileName: result.textFileName,
-	      sendId: result.sendId,
-	      send: result.send,
-	      queuedCount: result.queuedCount,
-	      queueFailedCount: result.queueFailedCount ?? 0,
-	      duplicate: result.duplicate,
-	    });
+      fileName: result.fileName,
+      textFileName: result.textFileName,
+      sendId: result.sendId,
+      send: result.send,
+      recipientCount: result.recipientCount,
+      queuedCount: result.queuedCount,
+      queueFailedCount: result.queueFailedCount ?? 0,
+      duplicate: result.duplicate,
+    });
   } catch (error: unknown) {
     return internalServerError(c, "publish-google-workspace", error);
   }
@@ -1725,14 +1913,17 @@ app.get("/api/newsletter/:newsletterId/subscribers", async (c) => {
     }
 
     const countResult = await c.env.DB.prepare(
-      `SELECT COUNT(*) as total FROM Subscriber WHERE newsletter_id = ?`,
+      `SELECT COUNT(*) as total FROM Subscriber WHERE newsletter_id = ? AND deleted_at IS NULL`,
     )
       .bind(newsletterId)
       .first<{ total: number }>();
     const total = countResult?.total ?? 0;
 
     const { results } = await c.env.DB.prepare(
-      `SELECT * FROM Subscriber WHERE newsletter_id = ? ORDER BY upsertedAt DESC LIMIT ? OFFSET ?`,
+      `SELECT * FROM Subscriber
+       WHERE newsletter_id = ? AND deleted_at IS NULL
+       ORDER BY upsertedAt DESC
+       LIMIT ? OFFSET ?`,
     )
       .bind(newsletterId, limit, offset)
       .all();
@@ -1789,17 +1980,30 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
       return c.json({ error: "Newsletter not found" }, 404);
     }
 
+    const now = new Date().toISOString();
     // Chunk into batches to respect D1's 100-statement batch limit
     for (let i = 0; i < normalizedSubscribers.length; i += D1_BATCH_LIMIT) {
       const chunk = normalizedSubscribers.slice(i, i + D1_BATCH_LIMIT);
       const statements = chunk.map(({ email, firstName, lastName }) =>
         c.env.DB.prepare(
-          `INSERT INTO Subscriber (email, first_name, last_name, newsletter_id, isSubscribed) VALUES (?, ?, ?, ?, 1)
+          `INSERT INTO Subscriber (
+             email, first_name, last_name, newsletter_id, isSubscribed,
+             upsertedAt, subscribed_at, unsubscribed_at, deleted_at
+           )
+           VALUES (?, ?, ?, ?, 1, ?, ?, NULL, NULL)
            ON CONFLICT(email, newsletter_id) DO UPDATE SET
              isSubscribed = 1,
              first_name = COALESCE(excluded.first_name, Subscriber.first_name),
-             last_name = COALESCE(excluded.last_name, Subscriber.last_name)`,
-        ).bind(email, firstName, lastName, newsletterId),
+             last_name = COALESCE(excluded.last_name, Subscriber.last_name),
+             upsertedAt = excluded.upsertedAt,
+             subscribed_at = CASE
+               WHEN Subscriber.isSubscribed = 1
+               THEN COALESCE(Subscriber.subscribed_at, excluded.subscribed_at)
+               ELSE excluded.subscribed_at
+             END,
+             unsubscribed_at = NULL,
+             deleted_at = NULL`,
+        ).bind(email, firstName, lastName, newsletterId, now, now),
       );
       await c.env.DB.batch(statements);
     }
@@ -1828,10 +2032,16 @@ app.delete("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
       return c.json({ error: "Subscriber not found" }, 404);
     }
 
+    const now = new Date().toISOString();
     await c.env.DB.prepare(
-      `DELETE FROM Subscriber WHERE email = ? AND newsletter_id = ?`,
+      `UPDATE Subscriber
+       SET isSubscribed = 0,
+           upsertedAt = ?,
+           unsubscribed_at = COALESCE(unsubscribed_at, ?),
+           deleted_at = ?
+       WHERE email = ? AND newsletter_id = ?`,
     )
-      .bind(email, newsletterId)
+      .bind(now, now, now, email, newsletterId)
       .run();
 
     return c.json({ message: "Subscriber removed successfully" });
@@ -1870,15 +2080,28 @@ app.get("/api/subscribe/confirm/:token", async (c) => {
     const firstName = normalizeOptionalName(tokenPayload.firstName);
     const lastName = normalizeOptionalName(tokenPayload.lastName);
 
+    const now = new Date().toISOString();
     // Upsert Subscription
     await c.env.DB.prepare(
-      `INSERT INTO Subscriber (email, first_name, last_name, newsletter_id, isSubscribed) VALUES (?, ?, ?, ?, 1)
+      `INSERT INTO Subscriber (
+         email, first_name, last_name, newsletter_id, isSubscribed,
+         upsertedAt, subscribed_at, unsubscribed_at, deleted_at
+       )
+       VALUES (?, ?, ?, ?, 1, ?, ?, NULL, NULL)
        ON CONFLICT(email, newsletter_id) DO UPDATE SET
          isSubscribed = 1,
          first_name = COALESCE(excluded.first_name, Subscriber.first_name),
-         last_name = COALESCE(excluded.last_name, Subscriber.last_name)`,
+         last_name = COALESCE(excluded.last_name, Subscriber.last_name),
+         upsertedAt = excluded.upsertedAt,
+         subscribed_at = CASE
+           WHEN Subscriber.isSubscribed = 1
+           THEN COALESCE(Subscriber.subscribed_at, excluded.subscribed_at)
+           ELSE excluded.subscribed_at
+         END,
+         unsubscribed_at = NULL,
+         deleted_at = NULL`,
     )
-      .bind(email, firstName, lastName, newsletterId)
+      .bind(email, firstName, lastName, newsletterId, now, now)
       .run();
 
     // Enforce one-time use semantics for confirmation links.
@@ -2500,6 +2723,7 @@ const sendEmail = async (
     from_name?: string;
     headers?: EmailHeader[];
     tags?: EmailTag[];
+    idempotency_key?: string;
   } = { mail_to: email, subject, txt, html };
 
   const fromName = normalizeFromNameForStorage(options.fromName ?? null);
@@ -2511,6 +2735,10 @@ const sendEmail = async (
   }
   if (options.tags && options.tags.length > 0) {
     body.tags = options.tags;
+  }
+  const idempotencyKey = normalizeNonEmptyString(options.idempotencyKey);
+  if (idempotencyKey) {
+    body.idempotency_key = idempotencyKey;
   }
 
   const notificationSharedSecret = getNotificationSharedSecret(env);
@@ -2524,23 +2752,43 @@ const sendEmail = async (
     headers: {
       "Content-Type": "application/json",
       [NOTIFICATION_AUTH_HEADER]: notificationSharedSecret,
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
   });
 
-  options.onProviderRequestStarted?.();
-  const res = await env.NOTIFICATION.fetch(request);
-
-  if (!res.ok) {
-    throw new Error(`Notification service returned status ${res.status}`);
+  let res: Response;
+  try {
+    res = await env.NOTIFICATION.fetch(request);
+  } catch (error: unknown) {
+    throw new NotificationServiceError(
+      errorMessage(error, `Notification service request failed for ${email}`),
+      null,
+      false,
+      true,
+    );
   }
 
-  const { message, messageId } = (await res.json()) as {
-    message?: string;
-    messageId?: string;
-  };
+  if (!res.ok) {
+    throw new NotificationServiceError(
+      `Notification service returned status ${res.status}`,
+      res.status,
+      isRetryableNotificationStatus(res.status),
+      true,
+    );
+  }
+
+  const responseBody = await res.json<unknown>().catch(() => null);
+  const { message, messageId } = responseBody && typeof responseBody === "object"
+    ? responseBody as { message?: string; messageId?: string }
+    : {};
 
   if (message !== "success") {
-    throw new Error(`Failed to send email to ${email}`);
+    throw new NotificationServiceError(
+      `Failed to send email to ${email}`,
+      null,
+      false,
+      true,
+    );
   }
 
   return messageId;
@@ -2843,17 +3091,55 @@ const streamToArrayBuffer = async function (
   return result;
 };
 
-async function getSubscribers(
+async function countSubscribedSubscribers(
   newsletterId: string,
   db: D1Database,
+  snapshotAt: string,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS subscriberCount
+       FROM Subscriber
+       WHERE newsletter_id = ?
+         AND COALESCE(subscribed_at, upsertedAt, '1970-01-01T00:00:00.000Z') <= ?
+         AND (unsubscribed_at IS NULL OR unsubscribed_at > ?)
+         AND (deleted_at IS NULL OR deleted_at > ?)`,
+    )
+    .bind(newsletterId, snapshotAt, snapshotAt, snapshotAt)
+    .first<Record<string, unknown>>();
+  return asNumber(row?.subscriberCount);
+}
+
+async function getSubscribedSubscriberPage(
+  newsletterId: string,
+  db: D1Database,
+  cursorEmail: string | null,
+  limit: number,
+  snapshotAt: string,
 ): Promise<{ email: string }[]> {
+  const params: unknown[] = [newsletterId, snapshotAt, snapshotAt, snapshotAt];
+  let cursorPredicate = "";
+  if (cursorEmail) {
+    cursorPredicate = "AND email COLLATE NOCASE > ?";
+    params.push(cursorEmail);
+  }
+  params.push(limit);
+
   const { results } = await db
     .prepare(
-      `SELECT email FROM Subscriber WHERE newsletter_id = ? AND isSubscribed = 1`,
+      `SELECT email
+       FROM Subscriber
+       WHERE newsletter_id = ?
+         AND COALESCE(subscribed_at, upsertedAt, '1970-01-01T00:00:00.000Z') <= ?
+         AND (unsubscribed_at IS NULL OR unsubscribed_at > ?)
+         AND (deleted_at IS NULL OR deleted_at > ?)
+       ${cursorPredicate}
+       ORDER BY email COLLATE NOCASE
+       LIMIT ?`,
     )
-    .bind(newsletterId)
-    .all();
-  return results as { email: string }[];
+    .bind(...params)
+    .all<Record<string, unknown>>();
+  return results.map((row) => ({ email: String(row.email ?? "") }));
 }
 
 async function markSubscriberUnsubscribed(
@@ -2861,11 +3147,16 @@ async function markSubscriberUnsubscribed(
   email: string,
   newsletterId: string,
 ): Promise<void> {
+  const now = new Date().toISOString();
   await db
     .prepare(
-      `UPDATE Subscriber SET isSubscribed = 0 WHERE email = ? AND newsletter_id = ?`,
+      `UPDATE Subscriber
+       SET isSubscribed = 0,
+           upsertedAt = ?,
+           unsubscribed_at = COALESCE(unsubscribed_at, ?)
+       WHERE email = ? AND newsletter_id = ?`,
     )
-    .bind(email, newsletterId)
+    .bind(now, now, email, newsletterId)
     .run();
 }
 
@@ -2950,6 +3241,99 @@ function asNumber(value: unknown): number {
   return 0;
 }
 
+function compareEmailCursor(lhs: string | null, rhs: string | null): number {
+  if (!lhs && !rhs) return 0;
+  if (!lhs) return -1;
+  if (!rhs) return 1;
+  return lhs.localeCompare(rhs, undefined, { sensitivity: "base" });
+}
+
+function newestEmailCursor(
+  first: string | null,
+  second: string | null,
+): string | null {
+  return compareEmailCursor(first, second) >= 0 ? first : second;
+}
+
+function boundedInt(
+  value: unknown,
+  defaultValue: number,
+  minValue: number,
+  maxValue: number,
+): number {
+  const parsed =
+    typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : typeof value === "number"
+        ? value
+        : NaN;
+  if (!Number.isFinite(parsed)) return defaultValue;
+  return Math.min(maxValue, Math.max(minValue, Math.floor(parsed)));
+}
+
+function isNewsletterSendRecipientStatus(
+  value: string | null | undefined,
+): value is NewsletterSendRecipientStatus {
+  return (
+    value === "queued" ||
+    value === "sending" ||
+    value === "providerAccepted" ||
+    value === "deliveryDelayed" ||
+    value === "delivered" ||
+    value === "bounced" ||
+    value === "complained" ||
+    value === "retrying" ||
+    value === "failed" ||
+    value === "deadLettered" ||
+    value === "needsReview"
+  );
+}
+
+function likePattern(value: string): string {
+  return `%${value.replace(/[\\%_]/g, (match) => `\\${match}`)}%`;
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+class NotificationServiceError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null,
+    readonly retryable: boolean,
+    readonly providerContacted: boolean,
+  ) {
+    super(message);
+  }
+}
+
+function isRetryableNotificationStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function shouldRetryRecipientError(error: unknown): boolean {
+  if (error instanceof NotificationServiceError) {
+    if (
+      error.providerContacted &&
+      error.status !== 408 &&
+      error.status !== 409 &&
+      error.status !== 425 &&
+      error.status !== 429
+    ) {
+      return false;
+    }
+    return error.retryable;
+  }
+  return true;
+}
+
+function isFanoutQueueMessage(
+  message: NewsletterQueueMessage,
+): message is NewsletterFanoutQueueMessage {
+  return "kind" in message && message.kind === "fanout";
+}
+
 function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendSummary {
   return {
     id: String(row.id ?? ""),
@@ -2959,6 +3343,9 @@ function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendS
     status: String(row.status ?? "queued") as NewsletterSendStatus,
     recipientCount: asNumber(row.recipientCount ?? row.recipient_count),
     queuedCount: asNumber(row.queuedCount ?? row.queued_count),
+    fanoutQueuedCount: asNumber(row.fanoutQueuedCount ?? row.fanout_queued_count),
+    sendingCount: asNumber(row.sendingCount ?? row.sending_count),
+    retryingCount: asNumber(row.retryingCount ?? row.retrying_count),
     queueFailedCount: asNumber(row.queueFailedCount ?? row.queue_failed_count),
     providerAcceptedCount: asNumber(row.providerAcceptedCount ?? row.provider_accepted_count),
     deliveredCount: asNumber(row.deliveredCount ?? row.delivered_count),
@@ -2969,6 +3356,12 @@ function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendS
     deadLetteredCount: asNumber(row.deadLetteredCount ?? row.dead_lettered_count),
     needsReviewCount: asNumber(row.needsReviewCount ?? row.needs_review_count),
     lastError: asNullableString(row.lastError ?? row.last_error),
+    contentFileName: asNullableString(row.contentFileName ?? row.content_file_name),
+    textFileName: asNullableString(row.textFileName ?? row.text_file_name),
+    fromName: asNullableString(row.fromName ?? row.from_name),
+    fanoutSnapshotAt: asNullableString(row.fanoutSnapshotAt ?? row.fanout_snapshot_at),
+    fanoutCursorEmail: asNullableString(row.fanoutCursorEmail ?? row.fanout_cursor_email),
+    fanoutCompletedAt: asNullableString(row.fanoutCompletedAt ?? row.fanout_completed_at),
     createdAt: String(row.createdAt ?? ""),
     updatedAt: String(row.updatedAt ?? ""),
     completedAt: asNullableString(row.completedAt ?? row.completed_at),
@@ -2984,6 +3377,7 @@ function mapNewsletterSendRecipient(row: Record<string, unknown>): NewsletterSen
     recipientHash: String(row.recipientHash ?? row.recipient_hash ?? ""),
     status: String(row.status ?? "queued") as NewsletterSendRecipientStatus,
     attempts: asNumber(row.attempts),
+    failureType: asNullableString(row.failureType ?? row.failure_type),
     providerMessageId: asNullableString(row.providerMessageId ?? row.provider_message_id),
     lastError: asNullableString(row.lastError ?? row.last_error),
     queuedAt: asNullableString(row.queuedAt ?? row.queued_at),
@@ -3034,6 +3428,9 @@ async function getNewsletterSendSummary(
               status,
               recipient_count AS recipientCount,
               queued_count AS queuedCount,
+              fanout_queued_count AS fanoutQueuedCount,
+              sending_count AS sendingCount,
+              retrying_count AS retryingCount,
               queue_failed_count AS queueFailedCount,
               provider_accepted_count AS providerAcceptedCount,
               delivered_count AS deliveredCount,
@@ -3044,6 +3441,12 @@ async function getNewsletterSendSummary(
               dead_lettered_count AS deadLetteredCount,
               needs_review_count AS needsReviewCount,
               last_error AS lastError,
+              content_file_name AS contentFileName,
+              text_file_name AS textFileName,
+              from_name AS fromName,
+              fanout_snapshot_at AS fanoutSnapshotAt,
+              fanout_cursor_email AS fanoutCursorEmail,
+              fanout_completed_at AS fanoutCompletedAt,
               createdAt,
               updatedAt,
               completedAt
@@ -3069,6 +3472,9 @@ async function getNewsletterSendSummaryBySourceMessage(
               status,
               recipient_count AS recipientCount,
               queued_count AS queuedCount,
+              fanout_queued_count AS fanoutQueuedCount,
+              sending_count AS sendingCount,
+              retrying_count AS retryingCount,
               queue_failed_count AS queueFailedCount,
               provider_accepted_count AS providerAcceptedCount,
               delivered_count AS deliveredCount,
@@ -3079,6 +3485,12 @@ async function getNewsletterSendSummaryBySourceMessage(
               dead_lettered_count AS deadLetteredCount,
               needs_review_count AS needsReviewCount,
               last_error AS lastError,
+              content_file_name AS contentFileName,
+              text_file_name AS textFileName,
+              from_name AS fromName,
+              fanout_snapshot_at AS fanoutSnapshotAt,
+              fanout_cursor_email AS fanoutCursorEmail,
+              fanout_completed_at AS fanoutCompletedAt,
               createdAt,
               updatedAt,
               completedAt
@@ -3106,6 +3518,7 @@ async function getNewsletterSendRecipientByHash(
               recipient_hash AS recipientHash,
               status,
               attempts,
+              failure_type AS failureType,
               provider_message_id AS providerMessageId,
               last_error AS lastError,
               queuedAt,
@@ -3127,10 +3540,47 @@ async function getNewsletterSendRecipientByHash(
   return row ? mapNewsletterSendRecipient(row) : null;
 }
 
-async function getNewsletterSendRecipients(
+async function getNewsletterSendRecipientsPage(
   db: D1Database,
   sendId: string,
-): Promise<NewsletterSendRecipient[]> {
+  options: {
+    cursorEmail?: string | null;
+    limit?: number;
+    status?: NewsletterSendRecipientStatus | null;
+    query?: string | null;
+  } = {},
+): Promise<{
+  recipients: NewsletterSendRecipient[];
+  pagination: {
+    limit: number;
+    nextCursor: string | null;
+    hasMore: boolean;
+  };
+}> {
+  const limit = boundedInt(
+    options.limit,
+    NEWSLETTER_SEND_RECIPIENT_PAGE_SIZE,
+    1,
+    NEWSLETTER_SEND_MAX_RECIPIENT_PAGE_SIZE,
+  );
+  const params: unknown[] = [sendId];
+  const predicates = ["send_id = ?"];
+  const cursorEmail = normalizeNonEmptyString(options.cursorEmail);
+  if (cursorEmail) {
+    predicates.push("email COLLATE NOCASE > ?");
+    params.push(cursorEmail);
+  }
+  if (options.status && isNewsletterSendRecipientStatus(options.status)) {
+    predicates.push("status = ?");
+    params.push(options.status);
+  }
+  const query = normalizeNonEmptyString(options.query);
+  if (query) {
+    predicates.push("email LIKE ? ESCAPE '\\'");
+    params.push(likePattern(query));
+  }
+  params.push(limit + 1);
+
   const { results } = await db
     .prepare(
       `SELECT id,
@@ -3140,6 +3590,7 @@ async function getNewsletterSendRecipients(
               recipient_hash AS recipientHash,
               status,
               attempts,
+              failure_type AS failureType,
               provider_message_id AS providerMessageId,
               last_error AS lastError,
               queuedAt,
@@ -3154,53 +3605,98 @@ async function getNewsletterSendRecipients(
               needsReviewAt,
               updatedAt
        FROM NewsletterSendRecipient
-       WHERE send_id = ?
-       ORDER BY email COLLATE NOCASE`,
+       WHERE ${predicates.join(" AND ")}
+       ORDER BY email COLLATE NOCASE
+       LIMIT ?`,
     )
-    .bind(sendId)
+    .bind(...params)
     .all<Record<string, unknown>>();
-  return results.map(mapNewsletterSendRecipient);
+  const page = results.slice(0, limit).map(mapNewsletterSendRecipient);
+  const hasMore = results.length > limit;
+  return {
+    recipients: page,
+    pagination: {
+      limit,
+      nextCursor: hasMore && page.length > 0 ? page[page.length - 1].email : null,
+      hasMore,
+    },
+  };
 }
 
 async function getNewsletterSendEvents(
   db: D1Database,
   sendId: string,
   afterEventId = 0,
+  limit = NEWSLETTER_SEND_EVENT_PAGE_SIZE,
 ): Promise<NewsletterSendEvent[]> {
-  const events: NewsletterSendEvent[] = [];
-  let cursor = afterEventId;
+  const boundedLimit = boundedInt(limit, NEWSLETTER_SEND_EVENT_PAGE_SIZE, 1, NEWSLETTER_SEND_EVENT_PAGE_SIZE);
+  const { results } = await db
+    .prepare(
+      `SELECT id,
+              send_id AS sendId,
+              newsletter_id AS newsletterId,
+              recipient_id AS recipientId,
+              recipient_hash AS recipientHash,
+              email,
+              event_type AS eventType,
+              recipient_status AS recipientStatus,
+              send_status AS sendStatus,
+              message,
+              provider_message_id AS providerMessageId,
+              createdAt
+       FROM NewsletterSendEvent
+       WHERE send_id = ? AND id > ?
+       ORDER BY id ASC
+       LIMIT ?`,
+    )
+    .bind(sendId, afterEventId, boundedLimit)
+    .all<Record<string, unknown>>();
+  return results.map(mapNewsletterSendEvent);
+}
 
-  while (true) {
-    const { results } = await db
-      .prepare(
-        `SELECT id,
-                send_id AS sendId,
-                newsletter_id AS newsletterId,
-                recipient_id AS recipientId,
-                recipient_hash AS recipientHash,
-                email,
-                event_type AS eventType,
-                recipient_status AS recipientStatus,
-                send_status AS sendStatus,
-                message,
-                provider_message_id AS providerMessageId,
-                createdAt
-         FROM NewsletterSendEvent
-         WHERE send_id = ? AND id > ?
-         ORDER BY id ASC
-         LIMIT ?`,
-      )
-      .bind(sendId, cursor, NEWSLETTER_SEND_EVENT_PAGE_SIZE)
-      .all<Record<string, unknown>>();
-    const page = results.map(mapNewsletterSendEvent);
-    events.push(...page);
-    if (page.length < NEWSLETTER_SEND_EVENT_PAGE_SIZE) {
-      break;
-    }
-    cursor = page[page.length - 1].id;
-  }
+async function getLatestNewsletterSendEvents(
+  db: D1Database,
+  sendId: string,
+  limit: number,
+): Promise<NewsletterSendEvent[]> {
+  const boundedLimit = boundedInt(limit, 100, 1, NEWSLETTER_SEND_EVENT_PAGE_SIZE);
+  const { results } = await db
+    .prepare(
+      `SELECT id,
+              send_id AS sendId,
+              newsletter_id AS newsletterId,
+              recipient_id AS recipientId,
+              recipient_hash AS recipientHash,
+              email,
+              event_type AS eventType,
+              recipient_status AS recipientStatus,
+              send_status AS sendStatus,
+              message,
+              provider_message_id AS providerMessageId,
+              createdAt
+       FROM NewsletterSendEvent
+       WHERE send_id = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .bind(sendId, boundedLimit)
+    .all<Record<string, unknown>>();
+  return results.map(mapNewsletterSendEvent).sort((lhs, rhs) => lhs.id - rhs.id);
+}
 
-  return events;
+async function getNewsletterSendLastEventId(
+  db: D1Database,
+  sendId: string,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COALESCE(MAX(id), 0) AS lastEventId
+       FROM NewsletterSendEvent
+       WHERE send_id = ?`,
+    )
+    .bind(sendId)
+    .first<Record<string, unknown>>();
+  return asNumber(row?.lastEventId);
 }
 
 async function listNewsletterSendSummaries(
@@ -3216,6 +3712,9 @@ async function listNewsletterSendSummaries(
               status,
               recipient_count AS recipientCount,
               queued_count AS queuedCount,
+              fanout_queued_count AS fanoutQueuedCount,
+              sending_count AS sendingCount,
+              retrying_count AS retryingCount,
               queue_failed_count AS queueFailedCount,
               provider_accepted_count AS providerAcceptedCount,
               delivered_count AS deliveredCount,
@@ -3226,6 +3725,12 @@ async function listNewsletterSendSummaries(
               dead_lettered_count AS deadLetteredCount,
               needs_review_count AS needsReviewCount,
               last_error AS lastError,
+              content_file_name AS contentFileName,
+              text_file_name AS textFileName,
+              from_name AS fromName,
+              fanout_snapshot_at AS fanoutSnapshotAt,
+              fanout_cursor_email AS fanoutCursorEmail,
+              fanout_completed_at AS fanoutCompletedAt,
               createdAt,
               updatedAt,
               completedAt
@@ -3247,6 +3752,10 @@ async function createNewsletterSend(
     subject: string;
     sourceMessageId: string | null;
     recipientCount: number;
+    contentFileName: string;
+    textFileName: string | null;
+    fromName: string | null;
+    fanoutSnapshotAt: string;
     now: string;
   },
 ): Promise<NewsletterSendSummary> {
@@ -3254,11 +3763,14 @@ async function createNewsletterSend(
     .prepare(
       `INSERT INTO NewsletterSend (
          id, newsletter_id, subject, source_message_id, status,
-         recipient_count, queued_count, queue_failed_count, provider_accepted_count,
+         recipient_count, queued_count, fanout_queued_count, sending_count, retrying_count,
+         queue_failed_count, provider_accepted_count,
          delivered_count, delivery_delayed_count, bounced_count, complained_count,
-         failed_count, dead_lettered_count, needs_review_count, createdAt, updatedAt
+         failed_count, dead_lettered_count, needs_review_count,
+         content_file_name, text_file_name, from_name, fanout_snapshot_at,
+         fanout_cursor_email, fanout_completed_at, createdAt, updatedAt
        )
-       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
     )
     .bind(
       input.sendId,
@@ -3267,6 +3779,10 @@ async function createNewsletterSend(
       input.sourceMessageId,
       "queued",
       input.recipientCount,
+      input.contentFileName,
+      input.textFileName,
+      input.fromName,
+      input.fanoutSnapshotAt,
       input.now,
       input.now,
     )
@@ -3276,47 +3792,6 @@ async function createNewsletterSend(
     throw new Error("Failed to create newsletter send record");
   }
   return send;
-}
-
-async function insertNewsletterSendRecipient(
-  db: D1Database,
-  input: {
-    sendId: string;
-    newsletterId: string;
-    email: string;
-    recipientHash: string;
-    now: string;
-  },
-): Promise<NewsletterSendRecipient> {
-  const recipientId = crypto.randomUUID();
-  await db
-    .prepare(
-      `INSERT INTO NewsletterSendRecipient (
-         id, send_id, newsletter_id, email, recipient_hash, status, attempts,
-         queuedAt, updatedAt
-       )
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
-    )
-    .bind(
-      recipientId,
-      input.sendId,
-      input.newsletterId,
-      input.email,
-      input.recipientHash,
-      "queued",
-      input.now,
-      input.now,
-    )
-    .run();
-  const recipient = await getNewsletterSendRecipientByHash(
-    db,
-    input.sendId,
-    input.recipientHash,
-  );
-  if (!recipient) {
-    throw new Error("Failed to create newsletter send recipient record");
-  }
-  return recipient;
 }
 
 async function recordNewsletterSendEvent(
@@ -3394,94 +3869,163 @@ function completedAtValue(
   return null;
 }
 
-async function refreshNewsletterSendSummary(
+type NewsletterSendCounterName =
+  | "queuedCount"
+  | "sendingCount"
+  | "retryingCount"
+  | "queueFailedCount"
+  | "providerAcceptedCount"
+  | "deliveredCount"
+  | "deliveryDelayedCount"
+  | "bouncedCount"
+  | "complainedCount"
+  | "failedCount"
+  | "deadLetteredCount"
+  | "needsReviewCount";
+
+type NewsletterSendCounterDelta = Partial<Record<NewsletterSendCounterName, number>>;
+
+function counterNameForRecipientStatus(
+  status: NewsletterSendRecipientStatus,
+  failureType: string | null = null,
+): NewsletterSendCounterName | null {
+  switch (status) {
+    case "queued":
+      return "queuedCount";
+    case "sending":
+      return "sendingCount";
+    case "retrying":
+      return "retryingCount";
+    case "providerAccepted":
+      return "providerAcceptedCount";
+    case "deliveryDelayed":
+      return "deliveryDelayedCount";
+    case "delivered":
+      return "deliveredCount";
+    case "bounced":
+      return "bouncedCount";
+    case "complained":
+      return "complainedCount";
+    case "failed":
+      return failureType === "queue" ? "queueFailedCount" : "failedCount";
+    case "deadLettered":
+      return "deadLetteredCount";
+    case "needsReview":
+      return "needsReviewCount";
+  }
+}
+
+function buildRecipientStatusDelta(
+  previousStatus: NewsletterSendRecipientStatus,
+  nextStatus: NewsletterSendRecipientStatus,
+  previousFailureType: string | null,
+  nextFailureType: string | null,
+): NewsletterSendCounterDelta {
+  const delta: NewsletterSendCounterDelta = {};
+  const previousCounter = counterNameForRecipientStatus(previousStatus, previousFailureType);
+  const nextCounter = counterNameForRecipientStatus(nextStatus, nextFailureType);
+  if (previousCounter) {
+    delta[previousCounter] = (delta[previousCounter] ?? 0) - 1;
+  }
+  if (nextCounter) {
+    delta[nextCounter] = (delta[nextCounter] ?? 0) + 1;
+  }
+  return delta;
+}
+
+function activeNewsletterSendCount(send: NewsletterSendSummary): number {
+  return send.queuedCount + send.sendingCount + send.retryingCount
+    + send.providerAcceptedCount + send.deliveryDelayedCount;
+}
+
+function deriveNewsletterSendStatus(send: NewsletterSendSummary): NewsletterSendStatus {
+  if (!send.fanoutCompletedAt) {
+    return activeNewsletterSendCount(send) > 0 ? "sending" : "queued";
+  }
+  if (activeNewsletterSendCount(send) > 0) {
+    return "sending";
+  }
+  return newsletterSendFailureCount(send) > 0 ? "completedWithFailures" : "completed";
+}
+
+function newsletterSendFailureCount(send: NewsletterSendSummary): number {
+  return send.queueFailedCount + send.bouncedCount + send.complainedCount
+    + send.failedCount + send.deadLetteredCount + send.needsReviewCount;
+}
+
+async function updateNewsletterSendStatusFromCounters(
   db: D1Database,
   sendId: string,
   now: string,
-  lastError: string | null = null,
 ): Promise<NewsletterSendSummary> {
-  const counts = await db
-    .prepare(
-      `SELECT COUNT(*) AS recipientCount,
-              SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queuedCount,
-              SUM(CASE WHEN status = 'failed' AND failure_type = 'queue' THEN 1 ELSE 0 END) AS queueFailedCount,
-              SUM(CASE WHEN status = 'providerAccepted' THEN 1 ELSE 0 END) AS providerAcceptedCount,
-              SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS deliveredCount,
-              SUM(CASE WHEN status = 'deliveryDelayed' THEN 1 ELSE 0 END) AS deliveryDelayedCount,
-              SUM(CASE WHEN status = 'bounced' THEN 1 ELSE 0 END) AS bouncedCount,
-              SUM(CASE WHEN status = 'complained' THEN 1 ELSE 0 END) AS complainedCount,
-              SUM(CASE WHEN status = 'failed' AND (failure_type IS NULL OR failure_type != 'queue') THEN 1 ELSE 0 END) AS failedCount,
-              SUM(CASE WHEN status = 'deadLettered' THEN 1 ELSE 0 END) AS deadLetteredCount,
-              SUM(CASE WHEN status = 'needsReview' THEN 1 ELSE 0 END) AS needsReviewCount,
-              SUM(CASE WHEN status IN ('queued', 'sending', 'providerAccepted', 'deliveryDelayed', 'retrying') THEN 1 ELSE 0 END) AS activeCount
-       FROM NewsletterSendRecipient
-       WHERE send_id = ?`,
-    )
-    .bind(sendId)
-    .first<Record<string, unknown>>();
-  const existing = await getNewsletterSendSummary(db, sendId);
-  if (!counts || !existing) {
+  const current = await getNewsletterSendSummary(db, sendId);
+  if (!current) {
     throw new Error("Newsletter send not found");
   }
-
-  const activeCount = asNumber(counts.activeCount);
-  const queueFailedCount = asNumber(counts.queueFailedCount);
-  const failedCount = asNumber(counts.failedCount);
-  const deadLetteredCount = asNumber(counts.deadLetteredCount);
-  const needsReviewCount = asNumber(counts.needsReviewCount);
-  const status: NewsletterSendStatus =
-    activeCount > 0
-      ? "sending"
-      : queueFailedCount + failedCount + deadLetteredCount + needsReviewCount > 0
-        ? "completedWithFailures"
-        : "completed";
-  const completedAt = completedAtValue(status, existing.completedAt, now);
-
+  const status = deriveNewsletterSendStatus(current);
+  const completedAt = completedAtValue(status, current.completedAt, now);
   await db
     .prepare(
       `UPDATE NewsletterSend
        SET status = ?,
-           recipient_count = ?,
-           queued_count = ?,
-           queue_failed_count = ?,
-           provider_accepted_count = ?,
-           delivered_count = ?,
-           delivery_delayed_count = ?,
-           bounced_count = ?,
-           complained_count = ?,
-           failed_count = ?,
-           dead_lettered_count = ?,
-           needs_review_count = ?,
+           completedAt = ?,
+           updatedAt = ?
+       WHERE id = ?`,
+    )
+    .bind(status, completedAt, now, sendId)
+    .run();
+  const updated = await getNewsletterSendSummary(db, sendId);
+  if (!updated) {
+    throw new Error("Newsletter send not found after status update");
+  }
+  return updated;
+}
+
+async function applyNewsletterSendCounterDelta(
+  db: D1Database,
+  sendId: string,
+  now: string,
+  delta: NewsletterSendCounterDelta,
+  lastError: string | null = null,
+): Promise<NewsletterSendSummary> {
+  await db
+    .prepare(
+      `UPDATE NewsletterSend
+       SET queued_count = MAX(queued_count + ?, 0),
+           sending_count = MAX(sending_count + ?, 0),
+           retrying_count = MAX(retrying_count + ?, 0),
+           queue_failed_count = MAX(queue_failed_count + ?, 0),
+           provider_accepted_count = MAX(provider_accepted_count + ?, 0),
+           delivered_count = MAX(delivered_count + ?, 0),
+           delivery_delayed_count = MAX(delivery_delayed_count + ?, 0),
+           bounced_count = MAX(bounced_count + ?, 0),
+           complained_count = MAX(complained_count + ?, 0),
+           failed_count = MAX(failed_count + ?, 0),
+           dead_lettered_count = MAX(dead_lettered_count + ?, 0),
+           needs_review_count = MAX(needs_review_count + ?, 0),
            last_error = COALESCE(?, last_error),
-           updatedAt = ?,
-           completedAt = ?
+           updatedAt = ?
        WHERE id = ?`,
     )
     .bind(
-      status,
-      asNumber(counts.recipientCount),
-      asNumber(counts.queuedCount),
-      queueFailedCount,
-      asNumber(counts.providerAcceptedCount),
-      asNumber(counts.deliveredCount),
-      asNumber(counts.deliveryDelayedCount),
-      asNumber(counts.bouncedCount),
-      asNumber(counts.complainedCount),
-      failedCount,
-      deadLetteredCount,
-      needsReviewCount,
+      delta.queuedCount ?? 0,
+      delta.sendingCount ?? 0,
+      delta.retryingCount ?? 0,
+      delta.queueFailedCount ?? 0,
+      delta.providerAcceptedCount ?? 0,
+      delta.deliveredCount ?? 0,
+      delta.deliveryDelayedCount ?? 0,
+      delta.bouncedCount ?? 0,
+      delta.complainedCount ?? 0,
+      delta.failedCount ?? 0,
+      delta.deadLetteredCount ?? 0,
+      delta.needsReviewCount ?? 0,
       lastError,
       now,
-      completedAt,
       sendId,
     )
     .run();
-
-  const send = await getNewsletterSendSummary(db, sendId);
-  if (!send) {
-    throw new Error("Newsletter send not found after refresh");
-  }
-  return send;
+  return updateNewsletterSendStatusFromCounters(db, sendId, now);
 }
 
 function timestampColumnForStatus(
@@ -3611,6 +4155,7 @@ async function updateNewsletterSendRecipientStatus(
   const timestampValues = timestampColumn ? [now] : [];
   const attempts =
     input.status === "sending" ? existing.attempts + 1 : existing.attempts;
+  const nextFailureType = input.failureType ?? null;
   const lastError =
     input.status === "retrying" ||
     input.status === "failed" ||
@@ -3635,7 +4180,7 @@ async function updateNewsletterSendRecipientStatus(
       attempts,
       input.providerMessageId ?? existing.providerMessageId,
       lastError,
-      input.failureType ?? null,
+      nextFailureType,
       ...timestampValues,
       now,
       input.sendId,
@@ -3651,10 +4196,16 @@ async function updateNewsletterSendRecipientStatus(
   if (!recipient) {
     return null;
   }
-  const send = await refreshNewsletterSendSummary(
+  const send = await applyNewsletterSendCounterDelta(
     env.DB,
     input.sendId,
     now,
+    buildRecipientStatusDelta(
+      existing.status,
+      input.status,
+      existing.failureType,
+      nextFailureType,
+    ),
     lastError,
   );
   const event = await recordNewsletterSendEvent(env.DB, {
@@ -3691,6 +4242,19 @@ async function beginNewsletterSendRecipientAttempt(
   event: NewsletterSendEvent;
 } | null> {
   const now = new Date().toISOString();
+  const existing = await getNewsletterSendRecipientByHash(
+    env.DB,
+    input.sendId,
+    input.recipientHash,
+  );
+  if (
+    !existing ||
+    existing.newsletterId !== input.newsletterId ||
+    !["queued", "retrying"].includes(existing.status)
+  ) {
+    return null;
+  }
+
   const result = await env.DB.prepare(
     `UPDATE NewsletterSendRecipient
      SET status = ?,
@@ -3702,7 +4266,7 @@ async function beginNewsletterSendRecipientAttempt(
      WHERE send_id = ?
        AND recipient_hash = ?
        AND newsletter_id = ?
-       AND status IN ('queued', 'retrying')`,
+       AND status = ?`,
   )
     .bind(
       "sending",
@@ -3711,6 +4275,7 @@ async function beginNewsletterSendRecipientAttempt(
       input.sendId,
       input.recipientHash,
       input.newsletterId,
+      existing.status,
     )
     .run();
 
@@ -3727,7 +4292,12 @@ async function beginNewsletterSendRecipientAttempt(
     return null;
   }
 
-  const send = await refreshNewsletterSendSummary(env.DB, input.sendId, now);
+  const send = await applyNewsletterSendCounterDelta(
+    env.DB,
+    input.sendId,
+    now,
+    buildRecipientStatusDelta(existing.status, "sending", existing.failureType, null),
+  );
   const event = await recordNewsletterSendEvent(env.DB, {
     sendId: input.sendId,
     newsletterId: input.newsletterId,
@@ -3774,6 +4344,296 @@ async function broadcastNewsletterSendMessage(
   }
 }
 
+function buildFanoutQueueMessage(
+  input: {
+    newsletterId: string;
+    subject: string;
+    fileName: string;
+    textFileName?: string;
+    fromName?: string | null;
+    sendId: string;
+    sourceMessageId: string;
+    cursorEmail?: string | null;
+    chunkIndex: number;
+  },
+): NewsletterFanoutQueueMessage {
+  return {
+    kind: "fanout",
+    newsletterId: input.newsletterId,
+    subject: input.subject,
+    fileName: input.fileName,
+    textFileName: input.textFileName,
+    fromName: input.fromName ?? null,
+    sendId: input.sendId,
+    sourceMessageId: input.sourceMessageId,
+    cursorEmail: input.cursorEmail ?? null,
+    chunkIndex: input.chunkIndex,
+  };
+}
+
+async function enqueueNewsletterFanoutForSend(
+  env: Bindings,
+  send: NewsletterSendSummary,
+): Promise<boolean> {
+  if (send.fanoutCompletedAt || !send.contentFileName || !send.sourceMessageId) {
+    return false;
+  }
+  await env.QUEUE.send(buildFanoutQueueMessage({
+    newsletterId: send.newsletterId,
+    subject: send.subject,
+    fileName: send.contentFileName,
+    textFileName: send.textFileName ?? undefined,
+    fromName: send.fromName,
+    sendId: send.id,
+    sourceMessageId: send.sourceMessageId,
+    cursorEmail: send.fanoutCursorEmail,
+    chunkIndex: Math.floor(send.fanoutQueuedCount / NEWSLETTER_FANOUT_CHUNK_SIZE),
+  }));
+  return true;
+}
+
+async function advanceNewsletterSendFanout(
+  db: D1Database,
+  input: {
+    sendId: string;
+    expectedCursorEmail: string | null;
+    nextCursorEmail: string | null;
+    queuedCount: number;
+    completed: boolean;
+    now: string;
+  },
+): Promise<{ send: NewsletterSendSummary; advanced: boolean }> {
+  const completionValue = input.completed ? input.now : null;
+  const statement = input.expectedCursorEmail
+    ? db.prepare(
+        `UPDATE NewsletterSend
+         SET queued_count = queued_count + ?,
+             fanout_queued_count = fanout_queued_count + ?,
+             fanout_cursor_email = ?,
+             fanout_completed_at = COALESCE(?, fanout_completed_at),
+             updatedAt = ?
+         WHERE id = ? AND fanout_completed_at IS NULL AND fanout_cursor_email = ?`,
+      ).bind(
+        input.queuedCount,
+        input.queuedCount,
+        input.nextCursorEmail,
+        completionValue,
+        input.now,
+        input.sendId,
+        input.expectedCursorEmail,
+      )
+    : db.prepare(
+        `UPDATE NewsletterSend
+         SET queued_count = queued_count + ?,
+             fanout_queued_count = fanout_queued_count + ?,
+             fanout_cursor_email = ?,
+             fanout_completed_at = COALESCE(?, fanout_completed_at),
+             updatedAt = ?
+         WHERE id = ? AND fanout_completed_at IS NULL AND fanout_cursor_email IS NULL`,
+      ).bind(
+        input.queuedCount,
+        input.queuedCount,
+        input.nextCursorEmail,
+        completionValue,
+        input.now,
+        input.sendId,
+      );
+
+  const result = await statement.run();
+  const send = await updateNewsletterSendStatusFromCounters(
+    db,
+    input.sendId,
+    input.now,
+  );
+  return { send, advanced: Number(result.meta.changes ?? 0) > 0 };
+}
+
+async function processNewsletterFanoutMessage(
+  env: Bindings,
+  message: NewsletterFanoutQueueMessage,
+): Promise<void> {
+  const send = await getNewsletterSendSummary(env.DB, message.sendId);
+  if (!send || send.newsletterId !== message.newsletterId) {
+    return;
+  }
+  if (send.fanoutCompletedAt) {
+    return;
+  }
+  if (!send.fanoutSnapshotAt) {
+    throw new Error(`Newsletter send ${send.id} is missing fanout snapshot metadata`);
+  }
+
+  const cursorEmail = newestEmailCursor(
+    send.fanoutCursorEmail,
+    normalizeNonEmptyString(message.cursorEmail),
+  );
+  const subscribers = await getSubscribedSubscriberPage(
+    message.newsletterId,
+    env.DB,
+    cursorEmail,
+    NEWSLETTER_FANOUT_CHUNK_SIZE,
+    send.fanoutSnapshotAt,
+  );
+  const now = new Date().toISOString();
+  if (subscribers.length === 0) {
+    const { send: updatedSend, advanced } = await advanceNewsletterSendFanout(
+      env.DB,
+      {
+        sendId: message.sendId,
+        expectedCursorEmail: send.fanoutCursorEmail,
+        nextCursorEmail: send.fanoutCursorEmail,
+        queuedCount: 0,
+        completed: true,
+        now,
+      },
+    );
+    if (advanced) {
+      const event = await recordNewsletterSendEvent(env.DB, {
+        sendId: message.sendId,
+        newsletterId: message.newsletterId,
+        eventType: "fanoutCompleted",
+        sendStatus: updatedSend.status,
+        message: "Subscriber fanout completed.",
+        now,
+      });
+      await broadcastNewsletterSendMessage(env, message.sendId, {
+        type: "sendEvent",
+        event,
+        send: updatedSend,
+      });
+    }
+    return;
+  }
+
+  const recipients = await Promise.all(subscribers.map(async (subscriber) => ({
+    id: crypto.randomUUID(),
+    email: subscriber.email,
+    recipientHash: await sha256Hex(`${message.sendId}:${subscriber.email}`),
+  })));
+
+  await env.DB.batch(recipients.map((recipient) => (
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO NewsletterSendRecipient (
+         id, send_id, newsletter_id, email, recipient_hash, status, attempts,
+         queuedAt, updatedAt
+       )
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+    ).bind(
+      recipient.id,
+      message.sendId,
+      message.newsletterId,
+      recipient.email,
+      recipient.recipientHash,
+      "queued",
+      now,
+      now,
+    )
+  )));
+
+  await env.QUEUE.sendBatch(recipients.map((recipient) => ({
+    body: {
+      kind: "recipient",
+      email: recipient.email,
+      newsletterId: message.newsletterId,
+      subject: message.subject,
+      fileName: message.fileName,
+      textFileName: message.textFileName,
+      fromName: message.fromName,
+      sendId: message.sendId,
+      recipientHash: recipient.recipientHash,
+    } satisfies NewsletterRecipientQueueMessage,
+  })));
+
+  const nextCursorEmail = subscribers[subscribers.length - 1].email;
+  const completed = subscribers.length < NEWSLETTER_FANOUT_CHUNK_SIZE;
+  const { send: updatedSend, advanced } = await advanceNewsletterSendFanout(
+    env.DB,
+    {
+      sendId: message.sendId,
+      expectedCursorEmail: send.fanoutCursorEmail,
+      nextCursorEmail,
+      queuedCount: subscribers.length,
+      completed,
+      now,
+    },
+  );
+  if (!advanced) {
+    return;
+  }
+
+  const event = await recordNewsletterSendEvent(env.DB, {
+    sendId: message.sendId,
+    newsletterId: message.newsletterId,
+    eventType: completed ? "fanoutCompleted" : "fanoutChunkQueued",
+    sendStatus: updatedSend.status,
+    message: completed
+      ? `Queued final fanout chunk with ${subscribers.length} recipient(s).`
+      : `Queued fanout chunk with ${subscribers.length} recipient(s).`,
+    now,
+  });
+  await broadcastNewsletterSendMessage(env, message.sendId, {
+    type: "sendEvent",
+    event,
+    send: updatedSend,
+  });
+
+  if (!completed) {
+    await env.QUEUE.send(buildFanoutQueueMessage({
+      newsletterId: message.newsletterId,
+      subject: message.subject,
+      fileName: message.fileName,
+      textFileName: message.textFileName,
+      fromName: message.fromName,
+      sendId: message.sendId,
+      sourceMessageId: message.sourceMessageId,
+      cursorEmail: nextCursorEmail,
+      chunkIndex: message.chunkIndex + 1,
+    }));
+  }
+}
+
+async function markFanoutDeadLettered(
+  env: Bindings,
+  message: NewsletterFanoutQueueMessage,
+): Promise<void> {
+  const send = await getNewsletterSendSummary(env.DB, message.sendId);
+  if (!send || send.newsletterId !== message.newsletterId || send.fanoutCompletedAt) {
+    return;
+  }
+  const now = new Date().toISOString();
+  const remaining = Math.max(0, send.recipientCount - send.fanoutQueuedCount);
+  await env.DB.prepare(
+    `UPDATE NewsletterSend
+     SET queue_failed_count = queue_failed_count + ?,
+         fanout_completed_at = ?,
+         last_error = ?,
+         updatedAt = ?
+     WHERE id = ?`,
+  )
+    .bind(
+      remaining,
+      now,
+      "Cloudflare Queue moved subscriber fanout to the dead-letter queue.",
+      now,
+      message.sendId,
+    )
+    .run();
+  const updatedSend = await updateNewsletterSendStatusFromCounters(env.DB, message.sendId, now);
+  const event = await recordNewsletterSendEvent(env.DB, {
+    sendId: message.sendId,
+    newsletterId: message.newsletterId,
+    eventType: "fanoutDeadLettered",
+    sendStatus: updatedSend.status,
+    message: "Cloudflare Queue moved subscriber fanout to the dead-letter queue.",
+    now,
+  });
+  await broadcastNewsletterSendMessage(env, message.sendId, {
+    type: "sendEvent",
+    event,
+    send: updatedSend,
+  });
+}
+
 async function publishNewsletter(
   env: Bindings,
   input: PublishNewsletterInput,
@@ -3789,12 +4649,14 @@ async function publishNewsletter(
     sourceMessageId,
   );
   if (existingSend) {
+    await enqueueNewsletterFanoutForSend(env, existingSend);
     return {
       ok: true,
       newsletterId: input.newsletterId,
       subject: existingSend.subject,
       sendId: existingSend.id,
       send: existingSend,
+      recipientCount: existingSend.recipientCount,
       queuedCount: 0,
       queueFailedCount: 0,
       duplicate: true,
@@ -3831,7 +4693,7 @@ async function publishNewsletter(
   await env.R2.put(fileName, html);
   await env.R2.put(textFileName, text);
 
-  const subscribers = await getSubscribers(input.newsletterId, env.DB);
+  const recipientCount = await countSubscribedSubscribers(input.newsletterId, env.DB, now);
   const publishConfig = await getPublishConfig(env);
   let send: NewsletterSendSummary;
   try {
@@ -3840,7 +4702,11 @@ async function publishNewsletter(
       newsletterId: input.newsletterId,
       subject,
       sourceMessageId,
-      recipientCount: subscribers.length,
+      recipientCount,
+      contentFileName: fileName,
+      textFileName,
+      fromName: publishConfig.fromName,
+      fanoutSnapshotAt: now,
       now,
     });
   } catch (error: unknown) {
@@ -3850,12 +4716,14 @@ async function publishNewsletter(
       sourceMessageId,
     );
     if (duplicateSend) {
+      await enqueueNewsletterFanoutForSend(env, duplicateSend);
       return {
         ok: true,
         newsletterId: input.newsletterId,
         subject: duplicateSend.subject,
         sendId: duplicateSend.id,
         send: duplicateSend,
+        recipientCount: duplicateSend.recipientCount,
         queuedCount: 0,
         queueFailedCount: 0,
         duplicate: true,
@@ -3868,61 +4736,10 @@ async function publishNewsletter(
     newsletterId: input.newsletterId,
     eventType: "sendCreated",
     sendStatus: send.status,
-    message: `Created send for ${subscribers.length} subscriber(s).`,
+    message: `Created send for ${recipientCount} subscriber(s).`,
     now,
   });
-
-  let queuedCount = 0;
-  let queueFailedCount = 0;
-  for (const subscriber of subscribers) {
-    const recipientHash = await sha256Hex(`${sendId}:${subscriber.email}`);
-    const recipient = await insertNewsletterSendRecipient(env.DB, {
-      sendId,
-      newsletterId: input.newsletterId,
-      email: subscriber.email,
-      recipientHash,
-      now,
-    });
-    await recordNewsletterSendEvent(env.DB, {
-      sendId,
-      newsletterId: input.newsletterId,
-      recipient,
-      eventType: "recipientQueued",
-      recipientStatus: "queued",
-      sendStatus: send.status,
-      message: "Recipient queued for delivery.",
-      now,
-    });
-
-    try {
-      const queueMessage: NewsletterQueueMessage = {
-        email: subscriber.email,
-        newsletterId: input.newsletterId,
-        subject,
-        fileName,
-        textFileName,
-        sendId,
-        recipientHash,
-      };
-      if (publishConfig.fromName) {
-        queueMessage.fromName = publishConfig.fromName;
-      }
-      await env.QUEUE.send(queueMessage);
-      queuedCount += 1;
-    } catch (error: unknown) {
-      queueFailedCount += 1;
-      await updateNewsletterSendRecipientStatus(env, {
-        sendId,
-        newsletterId: input.newsletterId,
-        recipientHash,
-        status: "failed",
-        eventType: "queueFailed",
-        message: errorMessage(error, "Failed to enqueue recipient."),
-        failureType: "queue",
-      });
-    }
-  }
-  send = await refreshNewsletterSendSummary(env.DB, sendId, new Date().toISOString());
+  await enqueueNewsletterFanoutForSend(env, send);
 
   return {
     ok: true,
@@ -3932,8 +4749,9 @@ async function publishNewsletter(
     textFileName,
     sendId,
     send,
-    queuedCount,
-    queueFailedCount,
+    recipientCount,
+    queuedCount: 0,
+    queueFailedCount: 0,
     duplicate: false,
   };
 }
@@ -4096,6 +4914,20 @@ export default {
   ): Promise<void> {
     const isDeadLetterBatch = batch.queue.endsWith("-dlq");
     for (const message of batch.messages) {
+      if (isFanoutQueueMessage(message.body)) {
+        if (isDeadLetterBatch) {
+          await markFanoutDeadLettered(env, message.body);
+          continue;
+        }
+        try {
+          await processNewsletterFanoutMessage(env, message.body);
+        } catch (error: unknown) {
+          logError("newsletter-fanout", error);
+          message.retry({ delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS });
+        }
+        continue;
+      }
+
       const { email, subject, newsletterId, fileName, textFileName, fromName, sendId } =
         message.body;
       const trackedRecipientHash = message.body.recipientHash;
@@ -4117,7 +4949,6 @@ export default {
 
       console.log(`Sending email to ${email} for newsletter ${newsletterId}`);
 
-      let providerAttempted = false;
       try {
         if (sendId && trackedRecipientHash) {
           const started = await beginNewsletterSendRecipientAttempt(env, {
@@ -4173,9 +5004,9 @@ export default {
               sendId,
             ),
             tags: buildNewsletterEmailTags(newsletterId, recipientHash, sendId),
-            onProviderRequestStarted: () => {
-              providerAttempted = true;
-            },
+            idempotencyKey: sendId
+              ? `newsletter:${sendId}:${recipientHash}`
+              : null,
           },
         );
         if (sendId && trackedRecipientHash) {
@@ -4214,23 +5045,24 @@ export default {
         );
       } catch (error: unknown) {
         console.error(`Failed to send email to ${email}:`, error);
+        const shouldRetry = shouldRetryRecipientError(error);
         if (sendId && trackedRecipientHash) {
           try {
             await updateNewsletterSendRecipientStatus(env, {
               sendId,
               newsletterId,
               recipientHash: trackedRecipientHash,
-              status: providerAttempted ? "needsReview" : "retrying",
-              eventType: providerAttempted ? "needsReview" : "retrying",
+              status: shouldRetry ? "retrying" : "needsReview",
+              eventType: shouldRetry ? "retrying" : "needsReview",
               message: errorMessage(error, "Recipient send failed."),
-              failureType: providerAttempted ? "needsReview" : null,
+              failureType: shouldRetry ? null : "needsReview",
             });
           } catch (trackingError: unknown) {
-            logError(providerAttempted ? "track-needs-review" : "track-retrying", trackingError);
+            logError(shouldRetry ? "track-retrying" : "track-needs-review", trackingError);
           }
         }
-        if (!providerAttempted) {
-          message.retry();
+        if (shouldRetry) {
+          message.retry({ delaySeconds: NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS });
         }
       }
     }

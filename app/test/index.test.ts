@@ -23,12 +23,18 @@ type SubscriberRecord = {
   firstName: string | null
   lastName: string | null
   isSubscribed: number
+  upsertedAt?: string
+  subscribedAt?: string | null
+  unsubscribedAt?: string | null
+  deletedAt?: string | null
 }
 
 type FakeDatabaseOptions = {
   denyBuckets?: string[]
   missingAbuseEventTable?: boolean
   failRecipientStatusUpdates?: string[]
+  failFanoutAdvanceOnce?: boolean
+  failQueueSendOnce?: boolean
 }
 
 type AbuseEvent = {
@@ -54,6 +60,9 @@ type NewsletterSendRecord = {
   status: string
   recipientCount: number
   queuedCount: number
+  fanoutQueuedCount: number
+  sendingCount: number
+  retryingCount: number
   queueFailedCount: number
   providerAcceptedCount: number
   deliveredCount: number
@@ -64,6 +73,12 @@ type NewsletterSendRecord = {
   deadLetteredCount: number
   needsReviewCount: number
   lastError: string | null
+  contentFileName: string | null
+  textFileName: string | null
+  fromName: string | null
+  fanoutSnapshotAt: string | null
+  fanoutCursorEmail: string | null
+  fanoutCompletedAt: string | null
   createdAt: string
   updatedAt: string
   completedAt: string | null
@@ -160,10 +175,12 @@ class FakeD1Database {
   readonly newsletterSendRecipients = new Map<string, NewsletterSendRecipientRecord>()
   readonly newsletterSendEvents: NewsletterSendEventRecord[] = []
   readonly attemptedRateLimitBuckets: string[] = []
+  operationCount = 0
 
   private readonly denyBuckets: Set<string>
   private readonly missingAbuseEventTable: boolean
   private readonly failRecipientStatusUpdates: Set<string>
+  private failFanoutAdvanceOnce: boolean
   private sourceMessageLookupMisses = 0
   private nextNewsletterSendEventId = 1
 
@@ -171,6 +188,7 @@ class FakeD1Database {
     this.denyBuckets = new Set(options.denyBuckets ?? [])
     this.missingAbuseEventTable = options.missingAbuseEventTable ?? false
     this.failRecipientStatusUpdates = new Set(options.failRecipientStatusUpdates ?? [])
+    this.failFanoutAdvanceOnce = options.failFanoutAdvanceOnce ?? false
   }
 
   prepare(sql: string): FakeD1PreparedStatement {
@@ -181,11 +199,16 @@ class FakeD1Database {
     this.sourceMessageLookupMisses += 1
   }
 
+  resetOperationCount() {
+    this.operationCount = 0
+  }
+
   async batch(statements: Array<FakeD1PreparedStatement>) {
     return Promise.all(statements.map((statement) => statement.run()))
   }
 
   async first<T>(sql: string, params: unknown[]): Promise<T | null> {
+    this.operationCount += 1
     const normalized = normalizeSql(sql)
     if (normalized.includes('select id, subscribable from newsletter where id = ?')) {
       const newsletterId = String(params[0] ?? '')
@@ -198,6 +221,25 @@ class FakeD1Database {
       return (newsletter ? { id: newsletter.id } : null) as T | null
     }
 
+    if (normalized.includes('select count(*) as subscribercount from subscriber')) {
+      const newsletterId = String(params[0] ?? '')
+      const snapshotAt = String(params[1] ?? '9999-12-31T23:59:59.999Z')
+      const subscriberCount = Array.from(this.subscribers.values())
+        .filter((subscriber) => (
+          subscriber.newsletterId === newsletterId &&
+          subscriberEligibleAt(subscriber, snapshotAt)
+        )).length
+      return ({ subscriberCount } as T)
+    }
+
+    if (normalized.includes('select coalesce(max(id), 0) as lasteventid from newslettersendevent')) {
+      const sendId = String(params[0] ?? '')
+      const lastEventId = this.newsletterSendEvents
+        .filter((event) => event.sendId === sendId)
+        .reduce((maxId, event) => Math.max(maxId, event.id), 0)
+      return ({ lastEventId } as T)
+    }
+
     if (normalized.includes('from newslettersendrecipient') && normalized.includes('count(*) as recipientcount')) {
       const sendId = String(params[0] ?? '')
       const recipients = Array.from(this.newsletterSendRecipients.values())
@@ -206,6 +248,8 @@ class FakeD1Database {
       return ({
         recipientCount: recipients.length,
         queuedCount: countStatus('queued'),
+        sendingCount: countStatus('sending'),
+        retryingCount: countStatus('retrying'),
         queueFailedCount: recipients.filter((recipient) => recipient.status === 'failed' && recipient.failureType === 'queue').length,
         providerAcceptedCount: countStatus('providerAccepted'),
         deliveredCount: countStatus('delivered'),
@@ -258,25 +302,60 @@ class FakeD1Database {
   }
 
   async all<T>(sql: string, params: unknown[]): Promise<{ results: T[] }> {
+    this.operationCount += 1
     const normalized = normalizeSql(sql)
 
-    if (normalized.includes('select email from subscriber where newsletter_id = ? and issubscribed = 1')) {
+    if (normalized.includes('select email from subscriber where newsletter_id = ?')) {
       const newsletterId = String(params[0] ?? '')
+      const snapshotAt = String(params[1] ?? '9999-12-31T23:59:59.999Z')
+      const hasCursor = normalized.includes('email collate nocase > ?')
+      const cursor = hasCursor ? String(params[4] ?? '') : null
+      const limitParam = hasCursor ? params[5] : params[4]
+      const limit = Number(limitParam ?? Number.MAX_SAFE_INTEGER)
       const subscribers = Array.from(this.subscribers.values())
         .filter((subscriber) => (
           subscriber.newsletterId === newsletterId &&
-          subscriber.isSubscribed === 1
+          subscriberEligibleAt(subscriber, snapshotAt) &&
+          (!cursor || subscriber.email.localeCompare(cursor, undefined, { sensitivity: 'base' }) > 0)
         ))
+        .sort((a, b) => a.email.localeCompare(b.email))
+        .slice(0, limit)
         .map((subscriber) => ({ email: subscriber.email }))
       return { results: subscribers as T[] }
     }
 
     if (normalized.includes('from newslettersendrecipient') && normalized.includes('where send_id = ?')) {
       const sendId = String(params[0] ?? '')
+      let index = 1
+      const hasCursor = normalized.includes('email collate nocase > ?')
+      const cursor = hasCursor ? String(params[index++] ?? '') : null
+      const hasStatus = normalized.includes('status = ?')
+      const status = hasStatus ? String(params[index++] ?? '') : null
+      const hasQuery = normalized.includes("email like ? escape '\\'")
+      const query = hasQuery ? String(params[index++] ?? '').replace(/^%|%$/g, '').toLowerCase() : null
+      const limit = normalized.includes('limit ?')
+        ? Number(params[index] ?? Number.MAX_SAFE_INTEGER)
+        : Number.MAX_SAFE_INTEGER
       const recipients = Array.from(this.newsletterSendRecipients.values())
-        .filter((recipient) => recipient.sendId === sendId)
+        .filter((recipient) => (
+          recipient.sendId === sendId &&
+          (!cursor || recipient.email.localeCompare(cursor, undefined, { sensitivity: 'base' }) > 0) &&
+          (!status || recipient.status === status) &&
+          (!query || recipient.email.toLowerCase().includes(query))
+        ))
         .sort((a, b) => a.email.localeCompare(b.email))
+        .slice(0, limit)
       return { results: recipients as T[] }
+    }
+
+    if (normalized.includes('from newslettersendevent') && normalized.includes('where send_id = ? order by id desc')) {
+      const sendId = String(params[0] ?? '')
+      const limit = Number(params[1] ?? Number.MAX_SAFE_INTEGER)
+      const events = this.newsletterSendEvents
+        .filter((event) => event.sendId === sendId)
+        .sort((a, b) => b.id - a.id)
+        .slice(0, limit)
+      return { results: events as T[] }
     }
 
     if (normalized.includes('from newslettersendevent') && normalized.includes('where send_id = ? and id > ?')) {
@@ -302,6 +381,7 @@ class FakeD1Database {
   }
 
   async run(sql: string, params: unknown[]): Promise<{ meta: { changes: number } }> {
+    this.operationCount += 1
     const normalized = normalizeSql(sql)
 
     if (normalized.includes('insert into subscriber')) {
@@ -309,6 +389,8 @@ class FakeD1Database {
       const firstName = normalizeNameParam(params[1])
       const lastName = normalizeNameParam(params[2])
       const newsletterId = String(params[3] ?? '')
+      const upsertedAt = String(params[4] ?? new Date().toISOString())
+      const subscribedAt = String(params[5] ?? upsertedAt)
       const key = `${newsletterId}:${email}`
       const existing = this.subscribers.get(key)
       this.subscribers.set(key, {
@@ -317,13 +399,23 @@ class FakeD1Database {
         firstName: firstName ?? existing?.firstName ?? null,
         lastName: lastName ?? existing?.lastName ?? null,
         isSubscribed: 1,
+        upsertedAt,
+        subscribedAt: existing?.isSubscribed === 1
+          ? existing.subscribedAt ?? subscribedAt
+          : subscribedAt,
+        unsubscribedAt: null,
+        deletedAt: null,
       })
       return { meta: { changes: 1 } }
     }
 
     if (normalized.includes('update subscriber set issubscribed = 0')) {
-      const email = String(params[0] ?? '')
-      const newsletterId = String(params[1] ?? '')
+      const hasTimestamp = normalized.includes('upsertedat = ?')
+      const now = hasTimestamp ? String(params[0] ?? '') : new Date().toISOString()
+      const hasDeletedAt = normalized.includes('deleted_at = ?')
+      const emailIndex = hasTimestamp ? (hasDeletedAt ? 3 : 2) : 0
+      const email = String(params[emailIndex] ?? '')
+      const newsletterId = String(params[emailIndex + 1] ?? '')
       const key = `${newsletterId}:${email}`
       const existing = this.subscribers.get(key) ?? {
         email,
@@ -333,6 +425,11 @@ class FakeD1Database {
         isSubscribed: 0,
       }
       existing.isSubscribed = 0
+      existing.upsertedAt = now
+      existing.unsubscribedAt = existing.unsubscribedAt ?? now
+      if (hasDeletedAt) {
+        existing.deletedAt = String(params[2] ?? now)
+      }
       this.subscribers.set(key, existing)
       return { meta: { changes: 1 } }
     }
@@ -380,7 +477,7 @@ class FakeD1Database {
       return { meta: { changes: 1 } }
     }
 
-    if (normalized.includes('insert into newslettersendrecipient')) {
+    if (normalized.includes('into newslettersendrecipient')) {
       const recipient: NewsletterSendRecipientRecord = {
         id: String(params[0] ?? ''),
         sendId: String(params[1] ?? ''),
@@ -403,6 +500,9 @@ class FakeD1Database {
         deadLetteredAt: null,
         needsReviewAt: null,
         updatedAt: String(params[7] ?? ''),
+      }
+      if (this.newsletterSendRecipients.has(`${recipient.sendId}:${recipient.recipientHash}`)) {
+        return { meta: { changes: 0 } }
       }
       this.newsletterSendRecipients.set(`${recipient.sendId}:${recipient.recipientHash}`, recipient)
       return { meta: { changes: 1 } }
@@ -452,6 +552,9 @@ class FakeD1Database {
         status: String(params[4] ?? ''),
         recipientCount: Number(params[5] ?? 0),
         queuedCount: 0,
+        fanoutQueuedCount: 0,
+        sendingCount: 0,
+        retryingCount: 0,
         queueFailedCount: 0,
         providerAcceptedCount: 0,
         deliveredCount: 0,
@@ -462,26 +565,33 @@ class FakeD1Database {
         deadLetteredCount: 0,
         needsReviewCount: 0,
         lastError: null,
-        createdAt: String(params[6] ?? ''),
-        updatedAt: String(params[7] ?? ''),
+        contentFileName: params[6] === null ? null : String(params[6] ?? ''),
+        textFileName: params[7] === null ? null : String(params[7] ?? ''),
+        fromName: params[8] === null ? null : String(params[8] ?? ''),
+        fanoutSnapshotAt: params[9] === null ? null : String(params[9] ?? ''),
+        fanoutCursorEmail: null,
+        fanoutCompletedAt: null,
+        createdAt: String(params[10] ?? ''),
+        updatedAt: String(params[11] ?? ''),
         completedAt: null,
       }
       this.newsletterSends.set(send.id, send)
       return { meta: { changes: 1 } }
     }
 
-    if (normalized.includes('update newslettersendrecipient') && normalized.includes("status in ('queued', 'retrying')")) {
+    if (normalized.includes('update newslettersendrecipient') && normalized.includes('and status = ?')) {
       const status = String(params[0] ?? '')
       const timestamp = String(params[1] ?? '')
       const updatedAt = String(params[2] ?? '')
       const sendId = String(params[3] ?? '')
       const recipientHash = String(params[4] ?? '')
       const newsletterId = String(params[5] ?? '')
+      const expectedStatus = String(params[6] ?? '')
       const recipient = this.newsletterSendRecipients.get(`${sendId}:${recipientHash}`)
       if (
         recipient &&
         recipient.newsletterId === newsletterId &&
-        ['queued', 'retrying'].includes(recipient.status)
+        recipient.status === expectedStatus
       ) {
         recipient.status = status
         recipient.attempts += 1
@@ -550,6 +660,81 @@ class FakeD1Database {
       return { meta: { changes: recipient ? 1 : 0 } }
     }
 
+    if (normalized.includes('update newslettersend') && normalized.includes('queued_count = max(queued_count + ?')) {
+      const sendId = String(params[14] ?? '')
+      const send = this.newsletterSends.get(sendId)
+      if (send) {
+        send.queuedCount = Math.max(send.queuedCount + Number(params[0] ?? 0), 0)
+        send.sendingCount = Math.max(send.sendingCount + Number(params[1] ?? 0), 0)
+        send.retryingCount = Math.max(send.retryingCount + Number(params[2] ?? 0), 0)
+        send.queueFailedCount = Math.max(send.queueFailedCount + Number(params[3] ?? 0), 0)
+        send.providerAcceptedCount = Math.max(send.providerAcceptedCount + Number(params[4] ?? 0), 0)
+        send.deliveredCount = Math.max(send.deliveredCount + Number(params[5] ?? 0), 0)
+        send.deliveryDelayedCount = Math.max(send.deliveryDelayedCount + Number(params[6] ?? 0), 0)
+        send.bouncedCount = Math.max(send.bouncedCount + Number(params[7] ?? 0), 0)
+        send.complainedCount = Math.max(send.complainedCount + Number(params[8] ?? 0), 0)
+        send.failedCount = Math.max(send.failedCount + Number(params[9] ?? 0), 0)
+        send.deadLetteredCount = Math.max(send.deadLetteredCount + Number(params[10] ?? 0), 0)
+        send.needsReviewCount = Math.max(send.needsReviewCount + Number(params[11] ?? 0), 0)
+        if (params[12] !== null) {
+          send.lastError = String(params[12] ?? '')
+        }
+        send.updatedAt = String(params[13] ?? '')
+      }
+      return { meta: { changes: send ? 1 : 0 } }
+    }
+
+    if (normalized.includes('update newslettersend') && normalized.includes('fanout_cursor_email = ?')) {
+      const hasExpectedCursor = normalized.includes('fanout_cursor_email = ?')
+        && !normalized.includes('fanout_cursor_email is null')
+      const sendId = String(params[5] ?? '')
+      const send = this.newsletterSends.get(sendId)
+      const expectedCursor = hasExpectedCursor ? String(params[6] ?? '') : null
+      const cursorMatches = send && (
+        hasExpectedCursor
+          ? send.fanoutCursorEmail === expectedCursor
+          : send.fanoutCursorEmail === null
+      )
+      if (send && send.fanoutCompletedAt === null && cursorMatches) {
+        if (this.failFanoutAdvanceOnce) {
+          this.failFanoutAdvanceOnce = false
+          throw new Error('Simulated fanout advance failure')
+        }
+        send.queuedCount += Number(params[0] ?? 0)
+        send.fanoutQueuedCount += Number(params[1] ?? 0)
+        send.fanoutCursorEmail = params[2] === null ? null : String(params[2] ?? '')
+        if (params[3] !== null) {
+          send.fanoutCompletedAt = String(params[3] ?? '')
+        }
+        send.updatedAt = String(params[4] ?? '')
+        return { meta: { changes: 1 } }
+      }
+      return { meta: { changes: 0 } }
+    }
+
+    if (normalized.includes('update newslettersend') && normalized.includes('queue_failed_count = queue_failed_count + ?')) {
+      const sendId = String(params[4] ?? '')
+      const send = this.newsletterSends.get(sendId)
+      if (send) {
+        send.queueFailedCount += Number(params[0] ?? 0)
+        send.fanoutCompletedAt = String(params[1] ?? '')
+        send.lastError = String(params[2] ?? '')
+        send.updatedAt = String(params[3] ?? '')
+      }
+      return { meta: { changes: send ? 1 : 0 } }
+    }
+
+    if (normalized.includes('update newslettersend') && normalized.includes('set status = ?')) {
+      const sendId = String(params[3] ?? '')
+      const send = this.newsletterSends.get(sendId)
+      if (send) {
+        send.status = String(params[0] ?? '')
+        send.completedAt = params[1] === null ? null : String(params[1] ?? '')
+        send.updatedAt = String(params[2] ?? '')
+      }
+      return { meta: { changes: send ? 1 : 0 } }
+    }
+
     if (normalized.includes('update newslettersend')) {
       const sendId = String(params[15] ?? '')
       const send = this.newsletterSends.get(sendId)
@@ -557,20 +742,22 @@ class FakeD1Database {
         send.status = String(params[0] ?? '')
         send.recipientCount = Number(params[1] ?? 0)
         send.queuedCount = Number(params[2] ?? 0)
-        send.queueFailedCount = Number(params[3] ?? 0)
-        send.providerAcceptedCount = Number(params[4] ?? 0)
-        send.deliveredCount = Number(params[5] ?? 0)
-        send.deliveryDelayedCount = Number(params[6] ?? 0)
-        send.bouncedCount = Number(params[7] ?? 0)
-        send.complainedCount = Number(params[8] ?? 0)
-        send.failedCount = Number(params[9] ?? 0)
-        send.deadLetteredCount = Number(params[10] ?? 0)
-        send.needsReviewCount = Number(params[11] ?? 0)
-        if (params[12] !== null) {
-          send.lastError = String(params[12] ?? '')
+        send.sendingCount = Number(params[3] ?? 0)
+        send.retryingCount = Number(params[4] ?? 0)
+        send.queueFailedCount = Number(params[5] ?? 0)
+        send.providerAcceptedCount = Number(params[6] ?? 0)
+        send.deliveredCount = Number(params[7] ?? 0)
+        send.deliveryDelayedCount = Number(params[8] ?? 0)
+        send.bouncedCount = Number(params[9] ?? 0)
+        send.complainedCount = Number(params[10] ?? 0)
+        send.failedCount = Number(params[11] ?? 0)
+        send.deadLetteredCount = Number(params[12] ?? 0)
+        send.needsReviewCount = Number(params[13] ?? 0)
+        if (params[14] !== null) {
+          send.lastError = String(params[14] ?? '')
         }
-        send.updatedAt = String(params[13] ?? '')
-        send.completedAt = params[14] === null ? null : String(params[14] ?? '')
+        send.updatedAt = String(params[15] ?? '')
+        send.completedAt = params[16] === null ? null : String(params[16] ?? '')
       }
       return { meta: { changes: send ? 1 : 0 } }
     }
@@ -599,6 +786,21 @@ function normalizeNameParam(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
+function subscriberSubscribedAt(subscriber: SubscriberRecord) {
+  return subscriber.subscribedAt ?? subscriber.upsertedAt ?? '1970-01-01T00:00:00.000Z'
+}
+
+function subscriberEligibleAt(subscriber: SubscriberRecord, snapshotAt: string) {
+  const subscribedAt = subscriberSubscribedAt(subscriber)
+  if (subscriber.isSubscribed !== 1 && !subscriber.unsubscribedAt) {
+    return false
+  }
+  return subscriber.newsletterId.length > 0 &&
+    subscribedAt <= snapshotAt &&
+    (subscriber.unsubscribedAt === undefined || subscriber.unsubscribedAt === null || subscriber.unsubscribedAt > snapshotAt) &&
+    (subscriber.deletedAt === undefined || subscriber.deletedAt === null || subscriber.deletedAt > snapshotAt)
+}
+
 function createEnv(options: FakeDatabaseOptions = {}) {
   const db = new FakeD1Database(options)
   db.newsletters.set(NEWSLETTER_ID, { id: NEWSLETTER_ID, subscribable: 1 })
@@ -623,7 +825,14 @@ function createEnv(options: FakeDatabaseOptions = {}) {
       text: async () => value,
     }
   })
-  const queueSend = vi.fn()
+  let shouldFailQueueSend = options.failQueueSendOnce ?? false
+  const queueSend = vi.fn(async () => {
+    if (shouldFailQueueSend) {
+      shouldFailQueueSend = false
+      throw new Error('Simulated queue send failure')
+    }
+  })
+  const queueSendBatch = vi.fn()
   const sendStatusBrokerFetch = vi.fn(async () => (
     new Response(JSON.stringify({ message: 'Broadcast sent' }), {
       status: 200,
@@ -644,7 +853,10 @@ function createEnv(options: FakeDatabaseOptions = {}) {
       list: vi.fn(async () => ({ objects: [], truncated: false })),
       delete: vi.fn(),
     } as unknown as R2Bucket,
-    QUEUE: { send: queueSend } as unknown as Queue,
+    QUEUE: {
+      send: queueSend,
+      sendBatch: queueSendBatch,
+    } as unknown as Queue,
     SEND_STATUS_BROKER: {
       getByName: sendStatusBrokerGetByName,
     } as unknown as DurableObjectNamespace,
@@ -669,6 +881,7 @@ function createEnv(options: FakeDatabaseOptions = {}) {
     r2Put,
     r2Get,
     queueSend,
+    queueSendBatch,
     sendStatusBrokerFetch,
     sendStatusBrokerGetByName,
   }
@@ -784,6 +997,21 @@ function createQueueBatch(body: Record<string, unknown>, queue = 'letterdrop-tes
     } as unknown as MessageBatch<Record<string, unknown>>,
     message,
   }
+}
+
+async function drainFirstFanoutJob(
+  env: ReturnType<typeof createEnv>['env'],
+  queueSend: ReturnType<typeof vi.fn>,
+  queueSendBatch: ReturnType<typeof vi.fn>
+) {
+  const fanoutBody = queueSend.mock.calls.at(-1)?.[0] as Record<string, unknown>
+  const fanout = createQueueBatch(fanoutBody)
+  await worker.queue(fanout.batch, env)
+  expect(fanout.message.retry).not.toHaveBeenCalled()
+  const batchMessages = queueSendBatch.mock.calls.at(-1)?.[0] as Array<{
+    body: Record<string, unknown>
+  }>
+  return batchMessages.map((entry) => entry.body)
 }
 
 async function getNotificationRequestBody(notificationFetch: ReturnType<typeof vi.fn>) {
@@ -1200,8 +1428,8 @@ describe('direct newsletter publish endpoint', () => {
     expect(queueSend).not.toHaveBeenCalled()
   })
 
-  it('stores newsletter HTML and queues subscribed recipients', async () => {
-    const { env, db, r2Put, queueSend } = createEnv()
+  it('stores newsletter HTML and queues subscriber fanout', async () => {
+    const { env, db, r2Put, queueSend, queueSendBatch } = createEnv()
     env.ALLOWED_EMAILS = 'someone-else@example.com'
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -1232,7 +1460,8 @@ describe('direct newsletter publish endpoint', () => {
       subject: 'Direct title: spaces & symbols',
       sendId: expect.any(String),
       queueFailedCount: 0,
-      queuedCount: 1,
+      queuedCount: 0,
+      recipientCount: 1,
       duplicate: false,
       fileName: expect.stringMatching(
         new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.html$`)
@@ -1245,12 +1474,21 @@ describe('direct newsletter publish endpoint', () => {
     expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
     expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
-      email: 'first@example.com',
+      kind: 'fanout',
       newsletterId: NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
       fileName: result.fileName,
       textFileName: result.textFileName,
       sendId: result.sendId,
+      cursorEmail: null,
+    }))
+    expect(db.newsletterSends.get(result.sendId)?.queuedCount).toBe(0)
+    expect(db.newsletterSendRecipients.size).toBe(0)
+    const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+    expect(recipientMessages).toHaveLength(1)
+    expect(recipientMessages[0]).toEqual(expect.objectContaining({
+      kind: 'recipient',
+      email: 'first@example.com',
       recipientHash: expect.any(String),
     }))
     expect(db.newsletterSends.get(result.sendId)?.queuedCount).toBe(1)
@@ -1258,7 +1496,7 @@ describe('direct newsletter publish endpoint', () => {
   })
 
   it('snapshots the configured sender display name onto queued recipients', async () => {
-    const { env, db, queueSend } = createEnv()
+    const { env, db, queueSend, queueSendBatch } = createEnv()
     await env.KV.put('publish-config', JSON.stringify({ fromName: 'Haben Girma' }))
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -1277,12 +1515,119 @@ describe('direct newsletter publish endpoint', () => {
 
     expect(response.status).toBe(200)
     expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
-      email: 'first@example.com',
+      kind: 'fanout',
       fromName: 'Haben Girma',
     }))
   })
 
-  it('does not requeue a direct publish source message that was already processed', async () => {
+  it('dry-runs large publishes without storing content or queueing work', async () => {
+    const { env, db, r2Put, queueSend, queueSendBatch, notificationFetch } = createEnv()
+    for (let index = 0; index < 5000; index += 1) {
+      const email = `subscriber-${String(index).padStart(4, '0')}@example.com`
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish/dry-run`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(result).toEqual(expect.objectContaining({
+      newsletterId: NEWSLETTER_ID,
+      recipientCount: 5000,
+      estimatedFanoutChunks: 334,
+      estimatedRecipientQueueBatches: 334,
+      fanoutChunkSize: 15,
+      wouldSendEmail: false,
+      freePlanSafe: true,
+      duplicate: false,
+    }))
+    expect(r2Put).not.toHaveBeenCalled()
+    expect(queueSend).not.toHaveBeenCalled()
+    expect(queueSendBatch).not.toHaveBeenCalled()
+    expect(notificationFetch).not.toHaveBeenCalled()
+  })
+
+  it('fans out five thousand subscribers in bounded queue chunks', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv()
+    for (let index = 0; index < 5000; index += 1) {
+      const email = `subscriber-${String(index).padStart(4, '0')}@example.com`
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    expect(response.status).toBe(200)
+    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(db.newsletterSendRecipients.size).toBe(0)
+
+    const operationCounts: number[] = []
+    let fanoutIndex = 0
+    while (fanoutIndex < queueSend.mock.calls.length) {
+      const fanoutBody = queueSend.mock.calls[fanoutIndex][0] as Record<string, unknown>
+      expect(fanoutBody).toEqual(expect.objectContaining({ kind: 'fanout' }))
+      db.resetOperationCount()
+      const { batch, message } = createQueueBatch(fanoutBody)
+      await worker.queue(batch, env)
+      expect(message.retry).not.toHaveBeenCalled()
+      operationCounts.push(db.operationCount)
+      fanoutIndex += 1
+    }
+
+    const recipientMessageCount = queueSendBatch.mock.calls.reduce((sum, call) => (
+      sum + (call[0] as Array<unknown>).length
+    ), 0)
+    const maxFanoutBatchSize = Math.max(...queueSendBatch.mock.calls.map((call) => (
+      (call[0] as Array<unknown>).length
+    )))
+    expect(queueSendBatch).toHaveBeenCalledTimes(334)
+    expect(recipientMessageCount).toBe(5000)
+    expect(maxFanoutBatchSize).toBeLessThanOrEqual(15)
+    expect(Math.max(...operationCounts)).toBeLessThanOrEqual(50)
+    expect(db.newsletterSendRecipients.size).toBe(5000)
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      recipientCount: 5000,
+      queuedCount: 5000,
+      fanoutCompletedAt: expect.any(String),
+    }))
+
+    const recipientsResponse = await app.request(
+      `https://example.com/api/newsletter/${NEWSLETTER_ID}/sends/${result.sendId}/recipients?limit=100`,
+      { headers: { Authorization: 'Bearer admin-token' } },
+      env
+    )
+    const recipientPage = await recipientsResponse.json() as {
+      recipients: Array<Record<string, unknown>>
+      pagination: { hasMore: boolean; nextCursor: string | null }
+    }
+    expect(recipientsResponse.status).toBe(200)
+    expect(recipientPage.recipients).toHaveLength(100)
+    expect(recipientPage.pagination.hasMore).toBe(true)
+    expect(recipientPage.pagination.nextCursor).toBe('subscriber-0099@example.com')
+  })
+
+  it('requeues duplicate direct publishes while fanout is incomplete', async () => {
     const { env, db, r2Put, queueSend } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -1315,10 +1660,10 @@ describe('direct newsletter publish endpoint', () => {
       duplicate: true,
     }))
     expect(r2Put).toHaveBeenCalledTimes(2)
-    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend).toHaveBeenCalledTimes(2)
   })
 
-  it('returns duplicate direct sends before validating mutable body fields', async () => {
+  it('returns duplicate direct sends before validating mutable body fields and requeues incomplete fanout', async () => {
     const { env, db, r2Put, queueSend } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -1356,11 +1701,11 @@ describe('direct newsletter publish endpoint', () => {
       duplicate: true,
     }))
     expect(r2Put).toHaveBeenCalledTimes(2)
-    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend).toHaveBeenCalledTimes(2)
   })
 
   it('returns existing sends when the D1 source-message unique index wins a race', async () => {
-    const { env, db, queueSend } = createEnv()
+    const { env, db, queueSend, queueSendBatch } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
@@ -1394,11 +1739,161 @@ describe('direct newsletter publish endpoint', () => {
       queueFailedCount: 0,
       duplicate: true,
     }))
-    expect(queueSend).not.toHaveBeenCalled()
+    expect(queueSend).toHaveBeenCalledTimes(1)
   })
 
-  it('returns send history and recipient snapshots for tracked publishes', async () => {
-    const { env, db } = createEnv()
+  it('recovers a send when the initial fanout enqueue fails', async () => {
+    const { env, db, queueSend } = createEnv({ failQueueSendOnce: true })
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+
+    const failedResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const retryResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const retryResult = await retryResponse.json() as { duplicate: boolean; sendId: string }
+
+    expect(failedResponse.status).toBe(500)
+    expect(retryResponse.status).toBe(200)
+    expect(retryResult.duplicate).toBe(true)
+    expect(db.newsletterSends.get(retryResult.sendId)).toEqual(expect.objectContaining({
+      contentFileName: expect.stringMatching(/\.html$/),
+      fanoutSnapshotAt: expect.any(String),
+    }))
+    expect(queueSend).toHaveBeenCalledTimes(2)
+    expect(queueSend.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
+      kind: 'fanout',
+      sendId: retryResult.sendId,
+      cursorEmail: null,
+    }))
+  })
+
+  it('keeps fanout counters idempotent when D1 advance fails after sendBatch', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv({ failFanoutAdvanceOnce: true })
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    const fanoutBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const firstFanout = createQueueBatch(fanoutBody)
+
+    await worker.queue(firstFanout.batch, env)
+
+    expect(firstFanout.message.retry).toHaveBeenCalledTimes(1)
+    expect(queueSendBatch).toHaveBeenCalledTimes(1)
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      queuedCount: 0,
+      fanoutQueuedCount: 0,
+    }))
+
+    const secondFanout = createQueueBatch(fanoutBody)
+    await worker.queue(secondFanout.batch, env)
+
+    expect(secondFanout.message.retry).not.toHaveBeenCalled()
+    expect(queueSendBatch).toHaveBeenCalledTimes(2)
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      queuedCount: 1,
+      fanoutQueuedCount: 1,
+      fanoutCompletedAt: expect.any(String),
+    }))
+  })
+
+  it('uses publish-time subscriber eligibility while fanout drains later', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { recipientCount: number }
+    db.subscribers.set(`${NEWSLETTER_ID}:late@example.com`, {
+      email: 'late@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+      subscribedAt: '9999-01-01T00:00:00.000Z',
+    })
+
+    const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+
+    expect(result.recipientCount).toBe(1)
+    expect(recipientMessages.map((message) => message.email)).toEqual(['first@example.com'])
+  })
+
+  it('counts only unfanned subscribers when a later fanout job dead-letters', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv()
+    for (let index = 0; index < 20; index += 1) {
+      const email = `subscriber-${String(index).padStart(2, '0')}@example.com`
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+      })
+    }
+
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const result = await response.json() as { sendId: string }
+    const firstFanoutBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const firstFanout = createQueueBatch(firstFanoutBody)
+    await worker.queue(firstFanout.batch, env)
+    const recipientBatch = queueSendBatch.mock.calls[0][0] as Array<{ body: Record<string, unknown> }>
+    for (const entry of recipientBatch.slice(0, 3)) {
+      await worker.queue(createQueueBatch(entry.body).batch, env)
+    }
+
+    const nextFanoutBody = queueSend.mock.calls.at(-1)?.[0] as Record<string, unknown>
+    const deadLetteredFanout = createQueueBatch(nextFanoutBody, 'letterdrop-test-dlq')
+    await worker.queue(deadLetteredFanout.batch, env)
+
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      recipientCount: 20,
+      queuedCount: 12,
+      fanoutQueuedCount: 15,
+      queueFailedCount: 5,
+    }))
+  })
+
+  it('returns send history and paged recipient snapshots for tracked publishes', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
@@ -1413,6 +1908,7 @@ describe('direct newsletter publish endpoint', () => {
       { Authorization: 'Bearer admin-token' }
     )
     const publishResult = await publishResponse.json() as Record<string, unknown>
+    await drainFirstFanoutJob(env, queueSend, queueSendBatch)
 
     const sendsResponse = await app.request(
       `https://example.com/api/newsletter/${NEWSLETTER_ID}/sends`,
@@ -1441,11 +1937,41 @@ describe('direct newsletter publish endpoint', () => {
     expect(snapshot.recipients).toHaveLength(1)
     expect(snapshot.events.map((event) => event.eventType)).toEqual([
       'sendCreated',
-      'recipientQueued',
+      'fanoutCompleted',
     ])
   })
 
-  it('returns complete send event history beyond one D1 page', async () => {
+  it('rejects unbounded recipient search input before querying recipients', async () => {
+    const { env, db } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const publishResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      publishPayload,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const publishResult = await publishResponse.json() as Record<string, unknown>
+    db.resetOperationCount()
+
+    const response = await app.request(
+      `https://example.com/api/newsletter/${NEWSLETTER_ID}/sends/${publishResult.sendId}/recipients?q=${'x'.repeat(257)}`,
+      { headers: { Authorization: 'Bearer admin-token' } },
+      env
+    )
+    const body = await response.json() as { error: string }
+
+    expect(response.status).toBe(400)
+    expect(body.error).toBe('Recipient search must be 256 bytes or fewer')
+    expect(db.operationCount).toBe(1)
+  })
+
+  it('returns bounded snapshots and paged send event history', async () => {
     const { env, db } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -1489,10 +2015,25 @@ describe('direct newsletter publish endpoint', () => {
       events: Array<Record<string, unknown>>
       lastEventId: number
     }
+    const eventsResponse = await app.request(
+      `https://example.com/api/newsletter/${NEWSLETTER_ID}/sends/${publishResult.sendId}/events?afterEventId=0&limit=500`,
+      { headers: { Authorization: 'Bearer admin-token' } },
+      env
+    )
+    const eventPage = await eventsResponse.json() as {
+      events: Array<Record<string, unknown>>
+      lastEventId: number
+      pagination: { hasMore: boolean; nextAfterEventId: number }
+    }
 
     expect(snapshotResponse.status).toBe(200)
-    expect(snapshot.events).toHaveLength(505)
+    expect(snapshot.events).toHaveLength(100)
     expect(snapshot.lastEventId).toBe(505)
+    expect(eventsResponse.status).toBe(200)
+    expect(eventPage.events).toHaveLength(500)
+    expect(eventPage.lastEventId).toBe(505)
+    expect(eventPage.pagination.hasMore).toBe(true)
+    expect(eventPage.pagination.nextAfterEventId).toBe(500)
   })
 
   it('scopes duplicate source messages by newsletter', async () => {
@@ -1538,19 +2079,19 @@ describe('direct newsletter publish endpoint', () => {
     expect(secondResponse.status).toBe(200)
     expect(secondResult).toEqual(expect.objectContaining({
       newsletterId: SECOND_NEWSLETTER_ID,
-      queuedCount: 1,
+      queuedCount: 0,
+      recipientCount: 1,
       duplicate: false,
     }))
     expect(r2Put).toHaveBeenCalledTimes(4)
     expect(queueSend).toHaveBeenCalledTimes(2)
     expect(queueSend).toHaveBeenLastCalledWith(expect.objectContaining({
-      email: 'second@example.com',
+      kind: 'fanout',
       newsletterId: SECOND_NEWSLETTER_ID,
       subject: 'Direct title: spaces & symbols',
       fileName: secondResult.fileName,
       textFileName: secondResult.textFileName,
       sendId: secondResult.sendId,
-      recipientHash: expect.any(String),
     }))
   })
 
@@ -1663,7 +2204,7 @@ describe('Google Workspace publish bridge', () => {
     })
   })
 
-  it('stores the newsletter HTML and queues subscribers', async () => {
+  it('stores the newsletter HTML and queues subscriber fanout', async () => {
     const { env, db, r2Put, queueSend } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -1694,7 +2235,8 @@ describe('Google Workspace publish bridge', () => {
       subject: 'Bridge title: spaces & symbols',
       sendId: expect.any(String),
       queueFailedCount: 0,
-      queuedCount: 1,
+      queuedCount: 0,
+      recipientCount: 1,
       duplicate: false,
       fileName: expect.stringMatching(
         new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.html$`)
@@ -1707,17 +2249,16 @@ describe('Google Workspace publish bridge', () => {
     expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
     expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
-      email: 'first@example.com',
+      kind: 'fanout',
       newsletterId: NEWSLETTER_ID,
       subject: 'Bridge title: spaces & symbols',
       fileName: result.fileName,
       textFileName: result.textFileName,
       sendId: result.sendId,
-      recipientHash: expect.any(String),
     }))
   })
 
-  it('does not requeue a Gmail message that was already processed', async () => {
+  it('requeues duplicate Gmail bridge messages while fanout is incomplete', async () => {
     const { env, db, queueSend } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -1749,7 +2290,7 @@ describe('Google Workspace publish bridge', () => {
       queueFailedCount: 0,
       duplicate: true,
     }))
-    expect(queueSend).toHaveBeenCalledTimes(1)
+    expect(queueSend).toHaveBeenCalledTimes(2)
   })
 
   it('rejects messages without a newsletter ID in the subject', async () => {
@@ -1860,13 +2401,12 @@ describe('Cloudflare Email Worker publish path', () => {
     )
     expect(String(text).trim()).toBe('Hello subscribers')
     expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
-      email: 'first@example.com',
+      kind: 'fanout',
       newsletterId: NEWSLETTER_ID,
       subject: 'Email worker title',
       fileName,
       textFileName,
       sendId: expect.any(String),
-      recipientHash: expect.any(String),
     }))
   })
 
@@ -1905,7 +2445,7 @@ describe('newsletter queue delivery', () => {
   })
 
   async function publishTrackedNewsletter() {
-    const { env, db, notificationFetch, queueSend, sendStatusBrokerFetch } = createEnv()
+    const { env, db, notificationFetch, queueSend, queueSendBatch, sendStatusBrokerFetch } = createEnv()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
       newsletterId: NEWSLETTER_ID,
@@ -1921,12 +2461,13 @@ describe('newsletter queue delivery', () => {
     )
     const result = await response.json() as Record<string, unknown>
     expect(response.status).toBe(200)
+    const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
     return {
       env,
       db,
       notificationFetch,
       sendStatusBrokerFetch,
-      queueBody: queueSend.mock.calls[0][0] as Record<string, unknown>,
+      queueBody: recipientMessages[0],
       sendId: String(result.sendId),
     }
   }
@@ -1999,7 +2540,11 @@ describe('newsletter queue delivery', () => {
     await worker.queue(batch, env)
 
     expect(message.retry).not.toHaveBeenCalled()
+    const request = notificationFetch.mock.calls[0][0] as Request
+    const expectedIdempotencyKey = `newsletter:${sendId}:${queueBody.recipientHash}`
+    expect(request.headers.get('Idempotency-Key')).toBe(expectedIdempotencyKey)
     const body = await getNotificationRequestBody(notificationFetch)
+    expect(body.idempotency_key).toBe(expectedIdempotencyKey)
     expect(body.headers).toEqual(expect.arrayContaining([
       { name: 'X-LetterDrop-Send-ID', value: sendId },
     ]))
@@ -2024,7 +2569,7 @@ describe('newsletter queue delivery', () => {
   })
 
   it('does not retry after SES accepts when provider-accepted tracking fails', async () => {
-    const { env, db, notificationFetch, queueSend } = createEnv({
+    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv({
       failRecipientStatusUpdates: ['providerAccepted'],
     })
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
@@ -2041,7 +2586,7 @@ describe('newsletter queue delivery', () => {
       { Authorization: 'Bearer admin-token' }
     )
     expect(response.status).toBe(200)
-    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
     const { batch, message } = createQueueBatch(queueBody)
 
     await worker.queue(batch, env)
@@ -2060,7 +2605,29 @@ describe('newsletter queue delivery', () => {
     }))
   })
 
-  it('marks tracked recipients needsReview when the sender fails ambiguously', async () => {
+  it('retries tracked recipients when the notification service throttles before provider acceptance', async () => {
+    const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
+    notificationFetch.mockResolvedValueOnce(new Response('sender throttled', { status: 429 }))
+    const { batch, message } = createQueueBatch(queueBody)
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).toHaveBeenCalledTimes(1)
+    const recipient = Array.from(db.newsletterSendRecipients.values())[0]
+    expect(recipient).toEqual(expect.objectContaining({
+      status: 'retrying',
+      attempts: 1,
+      lastError: 'Notification service returned status 429',
+    }))
+    expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
+      status: 'sending',
+      queuedCount: 0,
+      retryingCount: 1,
+      needsReviewCount: 0,
+    }))
+  })
+
+  it('does not retry ambiguous notification failures after provider contact', async () => {
     const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
     notificationFetch.mockResolvedValueOnce(new Response('sender unavailable', { status: 500 }))
     const { batch, message } = createQueueBatch(queueBody)
@@ -2076,12 +2643,11 @@ describe('newsletter queue delivery', () => {
     }))
     expect(db.newsletterSends.get(sendId)).toEqual(expect.objectContaining({
       status: 'completedWithFailures',
-      queuedCount: 0,
       needsReviewCount: 1,
     }))
   })
 
-  it('allows later SES delivery evidence to resolve needsReview recipients', async () => {
+  it('allows later SES delivery evidence to resolve needs-review recipients', async () => {
     const { env, db, notificationFetch, queueBody, sendId } = await publishTrackedNewsletter()
     const { signEnvelope } = await createSnsSigner()
     notificationFetch.mockResolvedValueOnce(new Response('sender unavailable', { status: 500 }))
@@ -2326,7 +2892,7 @@ describe('SES SNS suppression webhook', () => {
   })
 
   it('updates tracked recipients from SES delivery events', async () => {
-    const { env, db, queueSend } = createEnv()
+    const { env, db, queueSend, queueSendBatch } = createEnv()
     const { signEnvelope } = await createSnsSigner()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -2342,7 +2908,7 @@ describe('SES SNS suppression webhook', () => {
       { Authorization: 'Bearer admin-token' }
     )
     const publishResult = await publishResponse.json() as Record<string, unknown>
-    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
 
     const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
       Type: 'Notification',
@@ -2379,7 +2945,7 @@ describe('SES SNS suppression webhook', () => {
   })
 
   it('does not reopen terminal recipients when active SES events arrive late', async () => {
-    const { env, db, queueSend } = createEnv()
+    const { env, db, queueSend, queueSendBatch } = createEnv()
     const { signEnvelope } = await createSnsSigner()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -2395,7 +2961,7 @@ describe('SES SNS suppression webhook', () => {
       { Authorization: 'Bearer admin-token' }
     )
     const publishResult = await publishResponse.json() as Record<string, unknown>
-    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
     const tags = {
       newsletterId: [NEWSLETTER_ID],
       sendId: [publishResult.sendId],
@@ -2468,7 +3034,7 @@ describe('SES SNS suppression webhook', () => {
   })
 
   it('keeps sends active for SES delivery delay events', async () => {
-    const { env, db, queueSend } = createEnv()
+    const { env, db, queueSend, queueSendBatch } = createEnv()
     const { signEnvelope } = await createSnsSigner()
     db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
       email: 'first@example.com',
@@ -2484,7 +3050,7 @@ describe('SES SNS suppression webhook', () => {
       { Authorization: 'Bearer admin-token' }
     )
     const publishResult = await publishResponse.json() as Record<string, unknown>
-    const queueBody = queueSend.mock.calls[0][0] as Record<string, unknown>
+    const [queueBody] = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
 
     const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
       Type: 'Notification',

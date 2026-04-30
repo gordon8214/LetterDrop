@@ -21,14 +21,14 @@ queue = "replace-with-queue"
 
 [[queues.consumers]]
 queue = "replace-with-queue"
-max_batch_size = 10
+max_batch_size = 1
 max_batch_timeout = 30
 max_retries = 10
 dead_letter_queue = "replace-with-dead-letter-queue"
 
 [[queues.consumers]]
 queue = "replace-with-dead-letter-queue"
-max_batch_size = 10
+max_batch_size = 1
 max_batch_timeout = 30
 max_retries = 0
 
