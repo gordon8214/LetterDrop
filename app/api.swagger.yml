@@ -402,6 +402,34 @@ paths:
         '500':
           description: Server error
 
+  /api/newsletter/{newsletterId}/subscribers/import:
+    post:
+      summary: Import subscribers
+      description: Import subscribers while skipping existing unsubscribed records unless explicitly overridden
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: newsletterId
+          in: path
+          required: true
+          type: string
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/ImportSubscribersRequest'
+      responses:
+        '201':
+          description: Subscriber import processed successfully
+          schema:
+            $ref: '#/definitions/ImportSubscribersResponse'
+        '400':
+          description: Invalid subscriber import payload
+        '404':
+          description: Newsletter not found
+        '500':
+          description: Server error
+
   /api/newsletter/{newsletterId}/subscribers/{email}:
     delete:
       summary: Remove a subscriber
@@ -714,6 +742,34 @@ definitions:
         type: array
         items:
           $ref: '#/definitions/SubscriberInput'
+
+  ImportSubscribersRequest:
+    type: object
+    required:
+      - subscribers
+    properties:
+      subscribers:
+        type: array
+        items:
+          $ref: '#/definitions/SubscriberInput'
+      resubscribeUnsubscribed:
+        type: boolean
+        default: false
+        description: When true, existing unsubscribed records are resubscribed. When false or omitted, they are skipped.
+
+  ImportSubscribersResponse:
+    type: object
+    required:
+      - message
+      - importedCount
+      - skippedUnsubscribedCount
+    properties:
+      message:
+        type: string
+      importedCount:
+        type: integer
+      skippedUnsubscribedCount:
+        type: integer
 
   SubscriberInput:
     type: object

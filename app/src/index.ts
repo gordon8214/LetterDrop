@@ -2266,15 +2266,35 @@ app.get("/api/newsletter/:newsletterId/subscribers", async (c) => {
   }
 });
 
-// Add subscriber(s) to a newsletter
-app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
+// Add subscriber(s), preserving the existing behavior of reactivating matches.
+app.post("/api/newsletter/:newsletterId/subscribers", (c) =>
+  upsertAdminSubscribers(c, "add"),
+);
+
+// Import subscriber(s) with explicit control over reactivating unsubscribed matches.
+app.post("/api/newsletter/:newsletterId/subscribers/import", (c) =>
+  upsertAdminSubscribers(c, "import"),
+);
+
+async function upsertAdminSubscribers(
+  c: Context<{ Bindings: Bindings }>,
+  mode: "add" | "import",
+) {
   const { newsletterId } = c.req.param();
-  const { subscribers } = await c.req.json<{
+  const request = await c.req.json<{
     subscribers: SubscriberInput[];
+    resubscribeUnsubscribed?: boolean;
   }>();
+  const { subscribers } = request;
+  const resubscribeUnsubscribed = mode === "add"
+    ? true
+    : request.resubscribeUnsubscribed ?? false;
 
   if (!subscribers || !Array.isArray(subscribers) || subscribers.length === 0) {
     return c.json({ error: "subscribers array is required" }, 400);
+  }
+  if (mode === "import" && typeof resubscribeUnsubscribed !== "boolean") {
+    return c.json({ error: "resubscribeUnsubscribed must be a boolean" }, 400);
   }
 
   const normalizedSubscribers: Array<{
@@ -2325,6 +2345,7 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
     }
 
     const now = new Date().toISOString();
+    let importedCount = 0;
     // Chunk into batches to respect D1's 100-statement batch limit
     for (let i = 0; i < normalizedSubscribers.length; i += D1_BATCH_LIMIT) {
       const chunk = normalizedSubscribers.slice(i, i + D1_BATCH_LIMIT);
@@ -2350,7 +2371,8 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
                ELSE excluded.subscribed_at
              END,
              unsubscribed_at = NULL,
-             deleted_at = NULL`,
+             deleted_at = NULL
+           WHERE Subscriber.isSubscribed = 1 OR ? = 1`,
         ).bind(
           email,
           firstName,
@@ -2360,19 +2382,36 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
           now,
           now,
           hasNotes ? 1 : 0,
+          resubscribeUnsubscribed ? 1 : 0,
         ),
       );
-      await c.env.DB.batch(statements);
+      const results = await c.env.DB.batch(statements);
+      importedCount += results.reduce(
+        (count, result) => count + (result.meta.changes ?? 0),
+        0,
+      );
     }
 
+    if (mode === "add") {
+      return c.json(
+        { message: `${normalizedSubscribers.length} subscriber(s) added` },
+        201,
+      );
+    }
+
+    const skippedUnsubscribedCount = normalizedSubscribers.length - importedCount;
     return c.json(
-      { message: `${normalizedSubscribers.length} subscriber(s) added` },
+      {
+        message: `${importedCount} subscriber(s) imported; ${skippedUnsubscribedCount} unsubscribed subscriber(s) skipped`,
+        importedCount,
+        skippedUnsubscribedCount,
+      },
       201,
     );
   } catch (error: unknown) {
-    return internalServerError(c, "add-subscribers", error);
+    return internalServerError(c, `${mode}-subscribers`, error);
   }
-});
+}
 
 // Update a subscriber managed by the authenticated admin app
 app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {

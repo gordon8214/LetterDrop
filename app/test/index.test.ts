@@ -492,6 +492,13 @@ class FakeD1Database {
       const shouldUpdateNotes = hasNotesColumn && Number(params[subscribedAtIndex + 1] ?? 0) === 1
       const key = `${newsletterId}:${email}`
       const existing = this.subscribers.get(key)
+      const guardsUnsubscribed = normalized.includes(
+        'where subscriber.issubscribed = 1 or ? = 1'
+      )
+      const resubscribeUnsubscribed = Number(params[subscribedAtIndex + 2] ?? 0) === 1
+      if (guardsUnsubscribed && existing?.isSubscribed === 0 && !resubscribeUnsubscribed) {
+        return { meta: { changes: 0 } }
+      }
       this.subscribers.set(key, {
         email,
         newsletterId,
@@ -1429,6 +1436,7 @@ describe('admin auth middleware', () => {
       '/api/newsletter/ses-diagnostics',
       `/api/newsletter/${NEWSLETTER_ID}/publish`,
       `/api/newsletter/${NEWSLETTER_ID}/subscribers`,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/import`,
       `/api/newsletter/${NEWSLETTER_ID}/offline`,
     ]
 
@@ -1719,6 +1727,113 @@ describe('admin subscriber notes', () => {
     expect(db.subscribers.get(`${NEWSLETTER_ID}:${email}`)?.notes).toBe(
       'Encoded path works'
     )
+  })
+})
+
+describe('admin subscriber imports', () => {
+  const adminHeaders = { Authorization: 'Bearer admin-token' }
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('skips existing unsubscribed subscribers by default', async () => {
+    const { env, db } = createEnv()
+    const subscriberKey = `${NEWSLETTER_ID}:unsubscribed@example.com`
+    const unsubscribedAt = '2026-02-01T00:00:00.000Z'
+    db.subscribers.set(subscriberKey, {
+      email: 'unsubscribed@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Original',
+      lastName: 'Subscriber',
+      isSubscribed: 0,
+      unsubscribedAt,
+    })
+
+    const response = await postJson(env, `/api/newsletter/${NEWSLETTER_ID}/subscribers/import`, {
+      subscribers: [
+        { email: 'new@example.com', firstName: 'New' },
+        { email: 'unsubscribed@example.com', firstName: 'Replacement' },
+      ],
+    }, adminHeaders)
+
+    expect(response.status).toBe(201)
+    await expect(response.json()).resolves.toMatchObject({
+      importedCount: 1,
+      skippedUnsubscribedCount: 1,
+    })
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:new@example.com`)?.isSubscribed).toBe(1)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      firstName: 'Original',
+      isSubscribed: 0,
+      unsubscribedAt,
+    })
+  })
+
+  it('resubscribes existing unsubscribed subscribers only with an explicit override', async () => {
+    const { env, db } = createEnv()
+    const subscriberKey = `${NEWSLETTER_ID}:unsubscribed@example.com`
+    db.subscribers.set(subscriberKey, {
+      email: 'unsubscribed@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Original',
+      lastName: null,
+      isSubscribed: 0,
+      unsubscribedAt: '2026-02-01T00:00:00.000Z',
+    })
+
+    const response = await postJson(env, `/api/newsletter/${NEWSLETTER_ID}/subscribers/import`, {
+      subscribers: [{ email: 'unsubscribed@example.com', firstName: 'Updated' }],
+      resubscribeUnsubscribed: true,
+    }, adminHeaders)
+
+    expect(response.status).toBe(201)
+    await expect(response.json()).resolves.toMatchObject({
+      importedCount: 1,
+      skippedUnsubscribedCount: 0,
+    })
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      firstName: 'Updated',
+      isSubscribed: 1,
+      unsubscribedAt: null,
+    })
+  })
+
+  it('rejects a non-boolean resubscribe override', async () => {
+    const { env } = createEnv()
+    const response = await postJson(env, `/api/newsletter/${NEWSLETTER_ID}/subscribers/import`, {
+      subscribers: [{ email: 'person@example.com' }],
+      resubscribeUnsubscribed: 'yes',
+    }, adminHeaders)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({
+      error: 'resubscribeUnsubscribed must be a boolean',
+    })
+  })
+
+  it('preserves the existing add endpoint resubscription behavior', async () => {
+    const { env, db } = createEnv()
+    const subscriberKey = `${NEWSLETTER_ID}:unsubscribed@example.com`
+    db.subscribers.set(subscriberKey, {
+      email: 'unsubscribed@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Original',
+      lastName: null,
+      isSubscribed: 0,
+      unsubscribedAt: '2026-02-01T00:00:00.000Z',
+    })
+
+    const response = await postJson(env, `/api/newsletter/${NEWSLETTER_ID}/subscribers`, {
+      subscribers: [{ email: 'unsubscribed@example.com', firstName: 'Updated' }],
+    }, adminHeaders)
+
+    expect(response.status).toBe(201)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      firstName: 'Updated',
+      isSubscribed: 1,
+      unsubscribedAt: null,
+    })
   })
 })
 
