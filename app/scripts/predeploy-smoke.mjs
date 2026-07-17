@@ -132,6 +132,7 @@ async function checkMigrations(databaseName, envName) {
   const missingColumns = [
     'first_name',
     'last_name',
+    'notes',
     'subscribed_at',
     'unsubscribed_at',
     'deleted_at',
