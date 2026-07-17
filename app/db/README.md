@@ -41,3 +41,9 @@ wrangler d1 execute <d1_database_name> --remote --file db/20260429_add_scalable_
 ```bash
 wrangler d1 execute <d1_database_name> --remote --file db/20260430_add_newsletter_drafts.sql
 ```
+
+## Run subscriber notes migration on existing database
+
+```bash
+wrangler d1 execute <d1_database_name> --remote --file db/20260716_add_subscriber_notes.sql
+```

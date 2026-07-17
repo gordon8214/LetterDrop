@@ -22,6 +22,7 @@ type SubscriberRecord = {
   newsletterId: string
   firstName: string | null
   lastName: string | null
+  notes?: string | null
   isSubscribed: number
   upsertedAt?: string
   subscribedAt?: string | null
@@ -247,6 +248,29 @@ class FakeD1Database {
       return ({ subscriberCount } as T)
     }
 
+    if (normalized.includes('select count(*) as total from subscriber')) {
+      const newsletterId = String(params[0] ?? '')
+      const total = Array.from(this.subscribers.values())
+        .filter((subscriber) => (
+          subscriber.newsletterId === newsletterId &&
+          (subscriber.deletedAt === undefined || subscriber.deletedAt === null)
+        )).length
+      return ({ total } as T)
+    }
+
+    if (normalized.includes('select email from subscriber where email = ? and newsletter_id = ?')) {
+      const email = String(params[0] ?? '')
+      const newsletterId = String(params[1] ?? '')
+      const subscriber = this.subscribers.get(`${newsletterId}:${email}`)
+      if (!subscriber) {
+        return null
+      }
+      if (normalized.includes('deleted_at is null') && subscriber.deletedAt) {
+        return null
+      }
+      return ({ email: subscriber.email } as T)
+    }
+
     if (normalized.includes('select coalesce(max(id), 0) as lasteventid from newslettersendevent')) {
       const sendId = String(params[0] ?? '')
       const lastEventId = this.newsletterSendEvents
@@ -334,6 +358,34 @@ class FakeD1Database {
   async all<T>(sql: string, params: unknown[]): Promise<{ results: T[] }> {
     this.operationCount += 1
     const normalized = normalizeSql(sql)
+
+    if (normalized.includes('select * from subscriber')) {
+      const newsletterId = String(params[0] ?? '')
+      const limit = Number(params[1] ?? Number.MAX_SAFE_INTEGER)
+      const offset = Number(params[2] ?? 0)
+      const subscribers = Array.from(this.subscribers.values())
+        .filter((subscriber) => (
+          subscriber.newsletterId === newsletterId &&
+          (subscriber.deletedAt === undefined || subscriber.deletedAt === null)
+        ))
+        .sort((first, second) => (
+          (second.upsertedAt ?? '').localeCompare(first.upsertedAt ?? '')
+        ))
+        .slice(offset, offset + limit)
+        .map((subscriber) => ({
+          email: subscriber.email,
+          first_name: subscriber.firstName,
+          last_name: subscriber.lastName,
+          notes: subscriber.notes ?? null,
+          newsletter_id: subscriber.newsletterId,
+          isSubscribed: subscriber.isSubscribed,
+          upsertedAt: subscriber.upsertedAt ?? null,
+          subscribed_at: subscriber.subscribedAt ?? null,
+          unsubscribed_at: subscriber.unsubscribedAt ?? null,
+          deleted_at: subscriber.deletedAt ?? null,
+        }))
+      return { results: subscribers as T[] }
+    }
 
     if (normalized.includes('select email from subscriber where newsletter_id = ?')) {
       const newsletterId = String(params[0] ?? '')
@@ -424,12 +476,20 @@ class FakeD1Database {
     const normalized = normalizeSql(sql)
 
     if (normalized.includes('insert into subscriber')) {
+      const hasNotesColumn = normalized.includes(
+        'email, first_name, last_name, notes, newsletter_id'
+      )
       const email = String(params[0] ?? '')
       const firstName = normalizeNameParam(params[1])
       const lastName = normalizeNameParam(params[2])
-      const newsletterId = String(params[3] ?? '')
-      const upsertedAt = String(params[4] ?? new Date().toISOString())
-      const subscribedAt = String(params[5] ?? upsertedAt)
+      const notes = hasNotesColumn ? normalizeNameParam(params[3]) : null
+      const newsletterIndex = hasNotesColumn ? 4 : 3
+      const upsertedAtIndex = newsletterIndex + 1
+      const subscribedAtIndex = upsertedAtIndex + 1
+      const newsletterId = String(params[newsletterIndex] ?? '')
+      const upsertedAt = String(params[upsertedAtIndex] ?? new Date().toISOString())
+      const subscribedAt = String(params[subscribedAtIndex] ?? upsertedAt)
+      const shouldUpdateNotes = hasNotesColumn && Number(params[subscribedAtIndex + 1] ?? 0) === 1
       const key = `${newsletterId}:${email}`
       const existing = this.subscribers.get(key)
       this.subscribers.set(key, {
@@ -437,6 +497,9 @@ class FakeD1Database {
         newsletterId,
         firstName: firstName ?? existing?.firstName ?? null,
         lastName: lastName ?? existing?.lastName ?? null,
+        notes: existing
+          ? (shouldUpdateNotes ? notes : existing.notes ?? null)
+          : notes,
         isSubscribed: 1,
         upsertedAt,
         subscribedAt: existing?.isSubscribed === 1
@@ -444,6 +507,36 @@ class FakeD1Database {
           : subscribedAt,
         unsubscribedAt: null,
         deletedAt: null,
+      })
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('update subscriber set email = ?')) {
+      const email = String(params[0] ?? '')
+      const firstName = normalizeNameParam(params[1])
+      const lastName = normalizeNameParam(params[2])
+      const notes = normalizeNameParam(params[3])
+      const upsertedAt = String(params[4] ?? new Date().toISOString())
+      const originalEmail = String(params[5] ?? '')
+      const newsletterId = String(params[6] ?? '')
+      const originalKey = `${newsletterId}:${originalEmail}`
+      const updatedKey = `${newsletterId}:${email}`
+      const existing = this.subscribers.get(originalKey)
+      if (!existing || existing.deletedAt) {
+        return { meta: { changes: 0 } }
+      }
+      if (updatedKey !== originalKey && this.subscribers.has(updatedKey)) {
+        throw new Error('UNIQUE constraint failed: Subscriber.email, Subscriber.newsletter_id')
+      }
+
+      this.subscribers.delete(originalKey)
+      this.subscribers.set(updatedKey, {
+        ...existing,
+        email,
+        firstName,
+        lastName,
+        notes,
+        upsertedAt,
       })
       return { meta: { changes: 1 } }
     }
@@ -1074,6 +1167,22 @@ async function putJson(
   }, env)
 }
 
+async function patchJson(
+  env: Record<string, unknown>,
+  path: string,
+  body: unknown,
+  headers: Record<string, string> = {}
+) {
+  return app.request(`https://example.com${path}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  }, env)
+}
+
 async function getJson(
   env: Record<string, unknown>,
   path: string,
@@ -1347,6 +1456,269 @@ describe('admin auth middleware', () => {
     const response = await app.request('https://example.com/api/newsletter', {}, env)
     expect(response.status).toBe(503)
     await expect(response.json()).resolves.toEqual({ error: 'Admin API unavailable' })
+  })
+})
+
+describe('admin subscriber notes', () => {
+  const adminHeaders = { Authorization: 'Bearer admin-token' }
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('creates and lists normalized notes while preserving them when omitted', async () => {
+    const { env, db } = createEnv()
+    const createResponse = await postJson(env, `/api/newsletter/${NEWSLETTER_ID}/subscribers`, {
+      subscribers: [{
+        email: ' Person@Example.com ',
+        firstName: ' Ada ',
+        lastName: ' Lovelace ',
+        notes: '  Met at the conference.\nFollow up in August.  ',
+      }],
+    }, adminHeaders)
+
+    expect(createResponse.status).toBe(201)
+    const subscriberKey = `${NEWSLETTER_ID}:person@example.com`
+    expect(db.subscribers.get(subscriberKey)?.notes).toBe(
+      'Met at the conference.\nFollow up in August.'
+    )
+
+    const malformedResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers`,
+      { subscribers: [{ email: 'person@example.com', notes: false }] },
+      adminHeaders
+    )
+    expect(malformedResponse.status).toBe(400)
+    await expect(malformedResponse.json()).resolves.toEqual({
+      error: 'notes must be a string or null',
+    })
+    expect(db.subscribers.get(subscriberKey)?.notes).toBe(
+      'Met at the conference.\nFollow up in August.'
+    )
+
+    const listResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers`,
+      adminHeaders
+    )
+    expect(listResponse.status).toBe(200)
+    await expect(listResponse.json()).resolves.toMatchObject({
+      subscribers: [{
+        email: 'person@example.com',
+        notes: 'Met at the conference.\nFollow up in August.',
+      }],
+      pagination: { total: 1 },
+    })
+
+    const upsertResponse = await postJson(env, `/api/newsletter/${NEWSLETTER_ID}/subscribers`, {
+      subscribers: [{ email: 'person@example.com', firstName: 'Augusta' }],
+    }, adminHeaders)
+    expect(upsertResponse.status).toBe(201)
+    expect(db.subscribers.get(subscriberKey)?.notes).toBe(
+      'Met at the conference.\nFollow up in August.'
+    )
+  })
+
+  it('updates and clears notes through the single-subscriber endpoint', async () => {
+    const { env, db } = createEnv()
+    const subscriberKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
+    db.subscribers.set(subscriberKey, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      notes: 'Old note',
+      isSubscribed: 1,
+    })
+
+    const updateResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: SUBSCRIBER_EMAIL,
+        firstName: ' Grace ',
+        lastName: ' Hopper ',
+        notes: '  New note\nwith context.  ',
+      },
+      adminHeaders
+    )
+    expect(updateResponse.status).toBe(200)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      firstName: 'Grace',
+      lastName: 'Hopper',
+      notes: 'New note\nwith context.',
+    })
+
+    const clearResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: SUBSCRIBER_EMAIL,
+        firstName: 'Grace',
+        lastName: 'Hopper',
+        notes: '  \n  ',
+      },
+      adminHeaders
+    )
+    expect(clearResponse.status).toBe(200)
+    expect(db.subscribers.get(subscriberKey)?.notes).toBeNull()
+  })
+
+  it('renames a subscriber without changing subscription lifecycle state', async () => {
+    const { env, db } = createEnv()
+    const originalKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
+    const subscribedAt = '2026-01-01T00:00:00.000Z'
+    const unsubscribedAt = '2026-02-01T00:00:00.000Z'
+    db.subscribers.set(originalKey, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      notes: 'Manager note',
+      isSubscribed: 0,
+      subscribedAt,
+      unsubscribedAt,
+      deletedAt: null,
+    })
+
+    const response = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: 'renamed@example.com',
+        firstName: 'Ada',
+        lastName: 'Lovelace',
+        notes: 'Manager note',
+      },
+      adminHeaders
+    )
+
+    expect(response.status).toBe(200)
+    expect(db.subscribers.has(originalKey)).toBe(false)
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:renamed@example.com`)).toMatchObject({
+      isSubscribed: 0,
+      subscribedAt,
+      unsubscribedAt,
+      notes: 'Manager note',
+    })
+  })
+
+  it('rejects conflicting email changes and updates to unknown subscribers', async () => {
+    const { env, db } = createEnv()
+    for (const email of [SUBSCRIBER_EMAIL, 'existing@example.com']) {
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        notes: null,
+        isSubscribed: 1,
+      })
+    }
+
+    const conflictResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: 'existing@example.com',
+        firstName: null,
+        lastName: null,
+        notes: null,
+      },
+      adminHeaders
+    )
+    expect(conflictResponse.status).toBe(409)
+    await expect(conflictResponse.json()).resolves.toEqual({
+      error: 'A subscriber with that email already exists',
+    })
+
+    const missingResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/missing@example.com`,
+      {
+        email: 'missing@example.com',
+        firstName: null,
+        lastName: null,
+        notes: null,
+      },
+      adminHeaders
+    )
+    expect(missingResponse.status).toBe(404)
+    await expect(missingResponse.json()).resolves.toEqual({ error: 'Subscriber not found' })
+  })
+
+  it('rejects partial and malformed updates without changing stored fields', async () => {
+    const { env, db } = createEnv()
+    const subscriberKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
+    db.subscribers.set(subscriberKey, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      notes: 'Private context',
+      isSubscribed: 1,
+    })
+
+    const partialResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      { email: SUBSCRIBER_EMAIL },
+      adminHeaders
+    )
+    expect(partialResponse.status).toBe(400)
+    await expect(partialResponse.json()).resolves.toEqual({ error: 'firstName is required' })
+
+    const malformedResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: SUBSCRIBER_EMAIL,
+        firstName: 42,
+        lastName: 'Lovelace',
+        notes: 'Replacement context',
+      },
+      adminHeaders
+    )
+    expect(malformedResponse.status).toBe(400)
+    await expect(malformedResponse.json()).resolves.toEqual({
+      error: 'firstName must be a string or null',
+    })
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      notes: 'Private context',
+    })
+  })
+
+  it('updates an email containing an encoded path separator', async () => {
+    const { env, db } = createEnv()
+    const email = 'a/b@example.com'
+    db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+      email,
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      notes: null,
+      isSubscribed: 1,
+    })
+
+    const response = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/a%2Fb%40example.com`,
+      {
+        email,
+        firstName: null,
+        lastName: null,
+        notes: 'Encoded path works',
+      },
+      adminHeaders
+    )
+
+    expect(response.status).toBe(200)
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${email}`)?.notes).toBe(
+      'Encoded path works'
+    )
   })
 })
 
@@ -4210,6 +4582,44 @@ describe('single-use subscription tokens', () => {
     const replayResponse = await app.request(`https://example.com/api/subscribe/confirm/${token}`, {}, env)
     expect(replayResponse.status).toBe(400)
     await expect(replayResponse.json()).resolves.toEqual({ error: 'Invalid or expired token' })
+  })
+
+  it('preserves manager notes when a subscriber confirms again', async () => {
+    const { env, db, kv } = createEnv()
+    const subscriberKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
+    db.subscribers.set(subscriberKey, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      notes: 'Private manager context',
+      isSubscribed: 0,
+      subscribedAt: '2026-01-01T00:00:00.000Z',
+      unsubscribedAt: '2026-02-01T00:00:00.000Z',
+      deletedAt: null,
+    })
+
+    const token = 'confirm-token-with-untrusted-notes'
+    await kv.put(token, JSON.stringify({
+      action: 'confirm',
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Updated',
+      notes: 'Attempted public note',
+    }))
+
+    const response = await app.request(
+      `https://example.com/api/subscribe/confirm/${token}`,
+      {},
+      env
+    )
+
+    expect(response.status).toBe(302)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      isSubscribed: 1,
+      firstName: 'Updated',
+      notes: 'Private manager context',
+    })
   })
 
   it('enforces single-use cancel tokens and preserves locale rendering', async () => {

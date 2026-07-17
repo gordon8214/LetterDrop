@@ -14,6 +14,7 @@ CREATE TABLE Subscriber (
     email TEXT,
     first_name TEXT,
     last_name TEXT,
+    notes TEXT,
     newsletter_id TEXT,
     isSubscribed BOOLEAN,
     upsertedAt DATETIME DEFAULT CURRENT_TIMESTAMP,

@@ -1,0 +1,1 @@
+ALTER TABLE Subscriber ADD COLUMN notes TEXT;

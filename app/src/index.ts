@@ -26,6 +26,7 @@ type SubscriberInput = {
   email: string;
   firstName?: string | null;
   lastName?: string | null;
+  notes?: string | null;
 };
 
 type SubscriptionAction = "confirm" | "cancel";
@@ -2280,6 +2281,8 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
     email: string;
     firstName: string | null;
     lastName: string | null;
+    notes: string | null;
+    hasNotes: boolean;
   }> = [];
 
   for (const subscriber of subscribers) {
@@ -2293,10 +2296,20 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
     if (!normalizedEmail) {
       return c.json({ error: `Invalid email: ${subscriber.email}` }, 400);
     }
+    const hasNotes = Object.hasOwn(subscriber, "notes");
+    if (
+      hasNotes &&
+      subscriber.notes !== null &&
+      typeof subscriber.notes !== "string"
+    ) {
+      return c.json({ error: "notes must be a string or null" }, 400);
+    }
     normalizedSubscribers.push({
       email: normalizedEmail,
       firstName: normalizeOptionalName(subscriber.firstName),
       lastName: normalizeOptionalName(subscriber.lastName),
+      notes: normalizeNonEmptyString(subscriber.notes),
+      hasNotes,
     });
   }
 
@@ -2315,17 +2328,21 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
     // Chunk into batches to respect D1's 100-statement batch limit
     for (let i = 0; i < normalizedSubscribers.length; i += D1_BATCH_LIMIT) {
       const chunk = normalizedSubscribers.slice(i, i + D1_BATCH_LIMIT);
-      const statements = chunk.map(({ email, firstName, lastName }) =>
+      const statements = chunk.map(({ email, firstName, lastName, notes, hasNotes }) =>
         c.env.DB.prepare(
           `INSERT INTO Subscriber (
-             email, first_name, last_name, newsletter_id, isSubscribed,
+             email, first_name, last_name, notes, newsletter_id, isSubscribed,
              upsertedAt, subscribed_at, unsubscribed_at, deleted_at
            )
-           VALUES (?, ?, ?, ?, 1, ?, ?, NULL, NULL)
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
            ON CONFLICT(email, newsletter_id) DO UPDATE SET
              isSubscribed = 1,
              first_name = COALESCE(excluded.first_name, Subscriber.first_name),
              last_name = COALESCE(excluded.last_name, Subscriber.last_name),
+             notes = CASE
+               WHEN ? = 1 THEN excluded.notes
+               ELSE Subscriber.notes
+             END,
              upsertedAt = excluded.upsertedAt,
              subscribed_at = CASE
                WHEN Subscriber.isSubscribed = 1
@@ -2334,7 +2351,16 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
              END,
              unsubscribed_at = NULL,
              deleted_at = NULL`,
-        ).bind(email, firstName, lastName, newsletterId, now, now),
+        ).bind(
+          email,
+          firstName,
+          lastName,
+          notes,
+          newsletterId,
+          now,
+          now,
+          hasNotes ? 1 : 0,
+        ),
       );
       await c.env.DB.batch(statements);
     }
@@ -2345,6 +2371,95 @@ app.post("/api/newsletter/:newsletterId/subscribers", async (c) => {
     );
   } catch (error: unknown) {
     return internalServerError(c, "add-subscribers", error);
+  }
+});
+
+// Update a subscriber managed by the authenticated admin app
+app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
+  const { newsletterId } = c.req.param();
+  const originalEmail = normalizeEmail(c.req.param("email"));
+  if (!originalEmail) {
+    return c.json({ error: "Invalid subscriber email" }, 400);
+  }
+
+  try {
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+
+    const requiredFields = ["email", "firstName", "lastName", "notes"] as const;
+    const missingField = requiredFields.find(
+      (field) => !Object.hasOwn(parsedBody.body, field),
+    );
+    if (missingField) {
+      return c.json({ error: `${missingField} is required` }, 400);
+    }
+
+    const updatedEmail = normalizeEmail(parsedBody.body.email);
+    if (!updatedEmail) {
+      return c.json({ error: "Invalid email" }, 400);
+    }
+    for (const field of ["firstName", "lastName", "notes"] as const) {
+      const value = parsedBody.body[field];
+      if (value !== null && typeof value !== "string") {
+        return c.json({ error: `${field} must be a string or null` }, 400);
+      }
+    }
+
+    const existing = await c.env.DB.prepare(
+      `SELECT email FROM Subscriber
+       WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
+    )
+      .bind(originalEmail, newsletterId)
+      .first<{ email: string }>();
+    if (!existing) {
+      return c.json({ error: "Subscriber not found" }, 404);
+    }
+
+    if (updatedEmail !== originalEmail) {
+      const conflict = await c.env.DB.prepare(
+        `SELECT email FROM Subscriber WHERE email = ? AND newsletter_id = ?`,
+      )
+        .bind(updatedEmail, newsletterId)
+        .first<{ email: string }>();
+      if (conflict) {
+        return c.json({ error: "A subscriber with that email already exists" }, 409);
+      }
+    }
+
+    const now = new Date().toISOString();
+    try {
+      await c.env.DB.prepare(
+        `UPDATE Subscriber
+         SET email = ?,
+             first_name = ?,
+             last_name = ?,
+             notes = ?,
+             upsertedAt = ?
+         WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
+      )
+        .bind(
+          updatedEmail,
+          normalizeOptionalName(parsedBody.body.firstName),
+          normalizeOptionalName(parsedBody.body.lastName),
+          normalizeNonEmptyString(parsedBody.body.notes),
+          now,
+          originalEmail,
+          newsletterId,
+        )
+        .run();
+    } catch (error: unknown) {
+      const message = errorMessage(error, "").toLowerCase();
+      if (message.includes("unique constraint") || message.includes("constraint failed")) {
+        return c.json({ error: "A subscriber with that email already exists" }, 409);
+      }
+      throw error;
+    }
+
+    return c.json({ message: "Subscriber updated" });
+  } catch (error: unknown) {
+    return internalServerError(c, "update-subscriber", error);
   }
 });
 
