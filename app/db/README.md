@@ -47,3 +47,9 @@ wrangler d1 execute <d1_database_name> --remote --file db/20260430_add_newslette
 ```bash
 wrangler d1 execute <d1_database_name> --remote --file db/20260716_add_subscriber_notes.sql
 ```
+
+## Run unsubscribe footer snapshot migration on existing database
+
+```bash
+wrangler d1 execute <d1_database_name> --remote --file db/20260717_add_unsubscribe_footer_snapshots.sql
+```

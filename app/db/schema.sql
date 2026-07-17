@@ -70,6 +70,8 @@ CREATE TABLE NewsletterSend (
     content_file_name TEXT,
     text_file_name TEXT,
     from_name TEXT,
+    footer_html TEXT,
+    footer_text TEXT,
     fanout_snapshot_at DATETIME,
     fanout_cursor_email TEXT,
     fanout_completed_at DATETIME,

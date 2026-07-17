@@ -66,6 +66,11 @@ type StoredPublishConfig = {
   fromName: string | null;
 };
 
+type StoredUnsubscribeFooterConfig = {
+  html: string;
+  text: string;
+};
+
 type PublishNewsletterInput = {
   newsletterId: string;
   subject: unknown;
@@ -147,6 +152,8 @@ type NewsletterRecipientQueueMessage = {
   fileName: string;
   textFileName?: string;
   fromName?: string | null;
+  footerHtml?: string;
+  footerText?: string;
   sendId?: string;
   recipientHash?: string;
 };
@@ -163,6 +170,8 @@ type NewsletterRecipientBatchQueueMessage = {
   fileName: string;
   textFileName?: string;
   fromName?: string | null;
+  footerHtml?: string;
+  footerText?: string;
   sendId: string;
   recipients: NewsletterRecipientQueueEntry[];
 };
@@ -174,6 +183,8 @@ type NewsletterFanoutQueueMessage = {
   fileName: string;
   textFileName?: string;
   fromName?: string | null;
+  footerHtml?: string;
+  footerText?: string;
   sendId: string;
   sourceMessageId: string;
   cursorEmail?: string | null;
@@ -329,6 +340,18 @@ type SesNotification = {
 const NOTIFICATION_BASE_URL = "http://haben-notification";
 const NOTIFICATION_AUTH_HEADER = "X-LetterDrop-Notification-Token";
 const PUBLISH_CONFIG_KV_KEY = "publish-config";
+const UNSUBSCRIBE_FOOTER_CONFIG_KV_KEY = "unsubscribe-footer-config";
+const UNSUBSCRIBE_PLACEHOLDER_URL = "https://unsubscribe.letterdrop.invalid/";
+const DEFAULT_UNSUBSCRIBE_FOOTER_HTML = [
+  '<p style="font-size: 12px; color: #555;">',
+  "You are receiving this email because you subscribed to this newsletter. ",
+  `<a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Unsubscribe</a>`,
+  "</p>",
+].join("");
+const DEFAULT_UNSUBSCRIBE_FOOTER_TEXT = [
+  "You are receiving this email because you subscribed to this newsletter.",
+  `Unsubscribe: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+].join("\n");
 const DEFAULT_PUBLIC_ORIGIN = "https://newsletter.habengirma.com";
 const D1_BATCH_LIMIT = 100;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -346,6 +369,7 @@ const POST_TURNSTILE_WINDOW_SECONDS = 60 * 60;
 const MISSING_ABUSE_EVENT_TABLE_FRAGMENT = "no such table: AbuseEvent";
 const MAX_PUBLISH_REQUEST_BYTES = 5 * 1024 * 1024;
 const MAX_FROM_NAME_LENGTH = 120;
+const MAX_UNSUBSCRIBE_FOOTER_TEMPLATE_BYTES = 64 * 1024;
 const MAX_SUPPRESSION_PAYLOAD_LENGTH = 20_000;
 const NEWSLETTER_SEND_EVENT_PAGE_SIZE = 500;
 const NEWSLETTER_SEND_RECIPIENT_PAGE_SIZE = 100;
@@ -466,6 +490,113 @@ async function storePublishConfig(
     return;
   }
   await env.KV.put(PUBLISH_CONFIG_KV_KEY, JSON.stringify(config));
+}
+
+type UnsubscribeFooterConfigValidation =
+  | { ok: true; config: StoredUnsubscribeFooterConfig }
+  | { ok: false; error: string };
+
+function countOccurrences(value: string, search: string): number {
+  if (!search) {
+    return 0;
+  }
+  return value.split(search).length - 1;
+}
+
+function validateUnsubscribeFooterConfig(
+  htmlValue: unknown,
+  textValue: unknown,
+): UnsubscribeFooterConfigValidation {
+  if (typeof htmlValue !== "string" || typeof textValue !== "string") {
+    return { ok: false, error: "html and text must be strings" };
+  }
+  if (
+    new TextEncoder().encode(htmlValue).byteLength > MAX_UNSUBSCRIBE_FOOTER_TEMPLATE_BYTES ||
+    new TextEncoder().encode(textValue).byteLength > MAX_UNSUBSCRIBE_FOOTER_TEMPLATE_BYTES
+  ) {
+    return { ok: false, error: "Footer html and text must each be 64 KiB or smaller" };
+  }
+  if (countOccurrences(htmlValue, UNSUBSCRIBE_PLACEHOLDER_URL) !== 1) {
+    return { ok: false, error: "Footer html must contain exactly one unsubscribe link" };
+  }
+  const placeholderHref = `href="${UNSUBSCRIBE_PLACEHOLDER_URL}"`;
+  if (!htmlValue.includes(placeholderHref)) {
+    return { ok: false, error: "Footer html unsubscribe link is invalid" };
+  }
+  if (countOccurrences(textValue, UNSUBSCRIBE_PLACEHOLDER_URL) !== 1) {
+    return { ok: false, error: "Footer text must contain exactly one unsubscribe link" };
+  }
+  return { ok: true, config: { html: htmlValue, text: textValue } };
+}
+
+function defaultUnsubscribeFooterConfig(): StoredUnsubscribeFooterConfig {
+  return {
+    html: DEFAULT_UNSUBSCRIBE_FOOTER_HTML,
+    text: DEFAULT_UNSUBSCRIBE_FOOTER_TEXT,
+  };
+}
+
+function parseStoredUnsubscribeFooterConfig(
+  value: string | null,
+): StoredUnsubscribeFooterConfig {
+  if (!value) {
+    return defaultUnsubscribeFooterConfig();
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return defaultUnsubscribeFooterConfig();
+    }
+    const record = parsed as Record<string, unknown>;
+    const validated = validateUnsubscribeFooterConfig(record.html, record.text);
+    return validated.ok ? validated.config : defaultUnsubscribeFooterConfig();
+  } catch {
+    return defaultUnsubscribeFooterConfig();
+  }
+}
+
+function unsubscribeFooterConfigOrDefault(
+  html: unknown,
+  text: unknown,
+): StoredUnsubscribeFooterConfig {
+  const validated = validateUnsubscribeFooterConfig(html, text);
+  return validated.ok ? validated.config : defaultUnsubscribeFooterConfig();
+}
+
+async function resolveQueuedUnsubscribeFooter(
+  env: Bindings,
+  message: {
+    sendId?: string;
+    footerHtml?: string;
+    footerText?: string;
+  },
+): Promise<StoredUnsubscribeFooterConfig> {
+  const embedded = validateUnsubscribeFooterConfig(
+    message.footerHtml,
+    message.footerText,
+  );
+  if (embedded.ok) {
+    return embedded.config;
+  }
+  if (message.sendId) {
+    return getNewsletterSendFooterSnapshot(env.DB, message.sendId);
+  }
+  return defaultUnsubscribeFooterConfig();
+}
+
+async function getUnsubscribeFooterConfig(
+  env: Bindings,
+): Promise<StoredUnsubscribeFooterConfig> {
+  return parseStoredUnsubscribeFooterConfig(
+    await env.KV.get(UNSUBSCRIBE_FOOTER_CONFIG_KV_KEY),
+  );
+}
+
+async function storeUnsubscribeFooterConfig(
+  env: Bindings,
+  config: StoredUnsubscribeFooterConfig,
+): Promise<void> {
+  await env.KV.put(UNSUBSCRIBE_FOOTER_CONFIG_KV_KEY, JSON.stringify(config));
 }
 
 function getPublicOrigin(env: Bindings): string {
@@ -1448,6 +1579,34 @@ app.put("/api/newsletter/publish-config", async (c) => {
     return c.json({ emailAddress, fromName: normalized.fromName });
   } catch (error: unknown) {
     return internalServerError(c, "update-publish-config", error);
+  }
+});
+
+app.get("/api/newsletter/footer-config", async (c) => {
+  try {
+    return c.json(await getUnsubscribeFooterConfig(c.env));
+  } catch (error: unknown) {
+    return internalServerError(c, "get-unsubscribe-footer-config", error);
+  }
+});
+
+app.put("/api/newsletter/footer-config", async (c) => {
+  try {
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const validated = validateUnsubscribeFooterConfig(
+      parsedBody.body.html,
+      parsedBody.body.text,
+    );
+    if (!validated.ok) {
+      return c.json({ error: validated.error }, 400);
+    }
+    await storeUnsubscribeFooterConfig(c.env, validated.config);
+    return c.json(validated.config);
+  } catch (error: unknown) {
+    return internalServerError(c, "update-unsubscribe-footer-config", error);
   }
 });
 
@@ -3661,15 +3820,14 @@ async function markSubscriberUnsubscribed(
 function appendUnsubscribeFooterToHtml(
   html: string,
   unsubscribeUrl: string,
+  footerHtml?: string,
 ): string {
   const safeUrl = escapeHtml(unsubscribeUrl);
-  const footer = [
-    "<hr>",
-    "<p style=\"font-size: 12px; color: #555;\">",
-    "You are receiving this email because you subscribed to this newsletter. ",
-    `<a href="${safeUrl}">Unsubscribe</a>`,
-    "</p>",
-  ].join("");
+  const template = unsubscribeFooterConfigOrDefault(
+    footerHtml,
+    DEFAULT_UNSUBSCRIBE_FOOTER_TEXT,
+  ).html;
+  const footer = `<hr>${template.replace(UNSUBSCRIBE_PLACEHOLDER_URL, safeUrl)}`;
 
   if (/<\/body>/i.test(html)) {
     return html.replace(/<\/body>/i, `${footer}</body>`);
@@ -3680,9 +3838,14 @@ function appendUnsubscribeFooterToHtml(
 function appendUnsubscribeFooterToText(
   text: string,
   unsubscribeUrl: string,
+  footerText?: string,
 ): string {
   const body = text.trimEnd();
-  const footer = `\n\n--\nYou are receiving this email because you subscribed to this newsletter.\nUnsubscribe: ${unsubscribeUrl}`;
+  const template = unsubscribeFooterConfigOrDefault(
+    DEFAULT_UNSUBSCRIBE_FOOTER_HTML,
+    footerText,
+  ).text;
+  const footer = `\n\n--\n${template.replace(UNSUBSCRIBE_PLACEHOLDER_URL, unsubscribeUrl)}`;
   return `${body}${footer}`;
 }
 
@@ -4277,6 +4440,25 @@ async function getNewsletterSendSummary(
   return row ? mapNewsletterSendSummary(row) : null;
 }
 
+async function getNewsletterSendFooterSnapshot(
+  db: D1Database,
+  sendId: string,
+): Promise<StoredUnsubscribeFooterConfig> {
+  const row = await db
+    .prepare(
+      `SELECT footer_html AS footerHtml,
+              footer_text AS footerText
+       FROM NewsletterSend
+       WHERE id = ?`,
+    )
+    .bind(sendId)
+    .first<Record<string, unknown>>();
+  return unsubscribeFooterConfigOrDefault(
+    row?.footerHtml ?? row?.footer_html,
+    row?.footerText ?? row?.footer_text,
+  );
+}
+
 async function getNewsletterSendSummaryBySourceMessage(
   db: D1Database,
   newsletterId: string,
@@ -4574,6 +4756,8 @@ async function createNewsletterSend(
     contentFileName: string;
     textFileName: string | null;
     fromName: string | null;
+    footerHtml: string;
+    footerText: string;
     fanoutSnapshotAt: string;
     now: string;
   },
@@ -4586,10 +4770,11 @@ async function createNewsletterSend(
          queue_failed_count, provider_accepted_count,
          delivered_count, delivery_delayed_count, bounced_count, complained_count,
          failed_count, dead_lettered_count, needs_review_count,
-         content_file_name, text_file_name, from_name, fanout_snapshot_at,
+         content_file_name, text_file_name, from_name, footer_html, footer_text,
+         fanout_snapshot_at,
          fanout_cursor_email, fanout_completed_at, createdAt, updatedAt
        )
-       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
     )
     .bind(
       input.sendId,
@@ -4601,6 +4786,8 @@ async function createNewsletterSend(
       input.contentFileName,
       input.textFileName,
       input.fromName,
+      input.footerHtml,
+      input.footerText,
       input.fanoutSnapshotAt,
       input.now,
       input.now,
@@ -5514,8 +5701,11 @@ async function publishNewsletter(
   await env.R2.put(fileName, html);
   await env.R2.put(textFileName, text);
 
-  const recipientCount = await countSubscribedSubscribers(input.newsletterId, env.DB, now);
-  const publishConfig = await getPublishConfig(env);
+  const [recipientCount, publishConfig, footerConfig] = await Promise.all([
+    countSubscribedSubscribers(input.newsletterId, env.DB, now),
+    getPublishConfig(env),
+    getUnsubscribeFooterConfig(env),
+  ]);
   let send: NewsletterSendSummary;
   try {
     send = await createNewsletterSend(env.DB, {
@@ -5527,6 +5717,8 @@ async function publishNewsletter(
       contentFileName: fileName,
       textFileName,
       fromName: publishConfig.fromName,
+      footerHtml: footerConfig.html,
+      footerText: footerConfig.text,
       fanoutSnapshotAt: now,
       now,
     });
@@ -5618,6 +5810,8 @@ type NewsletterRecipientDeliveryInput = {
   fileName: string;
   textFileName?: string;
   fromName?: string | null;
+  footerHtml?: string;
+  footerText?: string;
   sendId?: string;
   recipientHash?: string;
   content?: NewsletterDeliveryContent;
@@ -5629,6 +5823,8 @@ type NewsletterRecipientBatchMetadata = {
   fileName: string;
   textFileName?: string;
   fromName?: string | null;
+  footerHtml?: string;
+  footerText?: string;
   sendId: string;
 };
 
@@ -5806,6 +6002,8 @@ async function processNewsletterRecipientDelivery(
     fileName,
     textFileName,
     fromName,
+    footerHtml,
+    footerText,
     sendId,
     recipientHash: trackedRecipientHash,
     content,
@@ -5843,10 +6041,12 @@ async function processNewsletterRecipientDelivery(
     const deliverableHtml = appendUnsubscribeFooterToHtml(
       deliveryContent.html,
       visibleUnsubscribeUrl,
+      footerHtml,
     );
     const deliverableText = appendUnsubscribeFooterToText(
       deliveryContent.text,
       visibleUnsubscribeUrl,
+      footerText,
     );
 
     const messageId = await sendEmail(
@@ -6073,6 +6273,8 @@ export default {
           fileName,
           textFileName,
           fromName,
+          footerHtml,
+          footerText,
           sendId,
           recipients,
         } = message.body;
@@ -6090,6 +6292,17 @@ export default {
           continue;
         }
 
+        const footer = await resolveQueuedUnsubscribeFooter(env, {
+          sendId,
+          footerHtml,
+          footerText,
+        });
+        const deliveryMetadata: NewsletterRecipientBatchMetadata = {
+          ...metadata,
+          footerHtml: footer.html,
+          footerText: footer.text,
+        };
+
         let content: NewsletterDeliveryContent | undefined;
         try {
           content = await readNewsletterDeliveryContent(env, fileName, textFileName);
@@ -6100,7 +6313,7 @@ export default {
         for (const [index, recipient] of recipients.entries()) {
           const result = await processNewsletterRecipientDelivery(env, {
             email: recipient.email,
-            ...metadata,
+            ...deliveryMetadata,
             recipientHash: recipient.recipientHash,
             ...(content ? { content } : {}),
           });
@@ -6123,8 +6336,15 @@ export default {
         continue;
       }
 
-      const { email, subject, newsletterId, fileName, textFileName, fromName, sendId } =
-        message.body;
+      const {
+        email,
+        subject,
+        newsletterId,
+        fileName,
+        textFileName,
+        fromName,
+        sendId,
+      } = message.body;
       const trackedRecipientHash = message.body.recipientHash;
 
       if (isDeadLetterBatch) {
@@ -6136,6 +6356,8 @@ export default {
         continue;
       }
 
+      const footer = await resolveQueuedUnsubscribeFooter(env, message.body);
+
       const result = await processNewsletterRecipientDelivery(env, {
         email,
         newsletterId,
@@ -6143,6 +6365,8 @@ export default {
         fileName,
         textFileName,
         fromName,
+        footerHtml: footer.html,
+        footerText: footer.text,
         sendId,
         recipientHash: trackedRecipientHash,
       });

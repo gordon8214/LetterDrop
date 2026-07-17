@@ -5,6 +5,7 @@ const NEWSLETTER_ID = '11111111-1111-4111-8111-111111111111'
 const MISSING_NEWSLETTER_ID = '22222222-2222-4222-8222-222222222222'
 const SECOND_NEWSLETTER_ID = '33333333-3333-4333-8333-333333333333'
 const SUBSCRIBER_EMAIL = 'user@example.com'
+const UNSUBSCRIBE_PLACEHOLDER_URL = 'https://unsubscribe.letterdrop.invalid/'
 const TRACKED_PUBLISH_PAYLOAD = {
   subject: 'Tracked title',
   html: '<p>Hello tracked subscribers</p>',
@@ -77,6 +78,8 @@ type NewsletterSendRecord = {
   contentFileName: string | null
   textFileName: string | null
   fromName: string | null
+  footerHtml: string | null
+  footerText: string | null
   fanoutSnapshotAt: string | null
   fanoutCursorEmail: string | null
   fanoutCompletedAt: string | null
@@ -803,11 +806,13 @@ class FakeD1Database {
         contentFileName: params[6] === null ? null : String(params[6] ?? ''),
         textFileName: params[7] === null ? null : String(params[7] ?? ''),
         fromName: params[8] === null ? null : String(params[8] ?? ''),
-        fanoutSnapshotAt: params[9] === null ? null : String(params[9] ?? ''),
+        footerHtml: params[9] === null ? null : String(params[9] ?? ''),
+        footerText: params[10] === null ? null : String(params[10] ?? ''),
+        fanoutSnapshotAt: params[11] === null ? null : String(params[11] ?? ''),
         fanoutCursorEmail: null,
         fanoutCompletedAt: null,
-        createdAt: String(params[10] ?? ''),
-        updatedAt: String(params[11] ?? ''),
+        createdAt: String(params[12] ?? ''),
+        updatedAt: String(params[13] ?? ''),
         completedAt: null,
       }
       this.newsletterSends.set(send.id, send)
@@ -2006,6 +2011,92 @@ describe('publish config', () => {
     expect(response.status).toBe(503)
     await expect(response.json()).resolves.toEqual({
       error: 'Publish email address unavailable',
+    })
+  })
+})
+
+describe('unsubscribe footer config', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('returns the legacy footer by default and persists a custom rich footer', async () => {
+    const { env } = createEnv()
+    const defaultResponse = await getJson(
+      env,
+      '/api/newsletter/footer-config',
+      { Authorization: 'Bearer admin-token' }
+    )
+    const custom = {
+      html: `<p><strong>Thanks for reading.</strong> <a href="https://example.com">Site</a> <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Leave this list</a></p>`,
+      text: `Thanks for reading. Site Leave this list: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+    }
+    const saveResponse = await putJson(
+      env,
+      '/api/newsletter/footer-config',
+      custom,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const getResponse = await getJson(
+      env,
+      '/api/newsletter/footer-config',
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(defaultResponse.status).toBe(200)
+    await expect(defaultResponse.json()).resolves.toEqual({
+      html: `<p style="font-size: 12px; color: #555;">You are receiving this email because you subscribed to this newsletter. <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Unsubscribe</a></p>`,
+      text: `You are receiving this email because you subscribed to this newsletter.\nUnsubscribe: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+    })
+    expect(saveResponse.status).toBe(200)
+    await expect(saveResponse.json()).resolves.toEqual(custom)
+    expect(getResponse.status).toBe(200)
+    await expect(getResponse.json()).resolves.toEqual(custom)
+  })
+
+  it('requires exactly one placeholder link in both representations', async () => {
+    const { env } = createEnv()
+    const missingResponse = await putJson(
+      env,
+      '/api/newsletter/footer-config',
+      { html: '<p>No unsubscribe link</p>', text: 'No unsubscribe link' },
+      { Authorization: 'Bearer admin-token' }
+    )
+    const duplicateResponse = await putJson(
+      env,
+      '/api/newsletter/footer-config',
+      {
+        html: `<a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">One</a><a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Two</a>`,
+        text: `${UNSUBSCRIBE_PLACEHOLDER_URL}\n${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+      },
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(missingResponse.status).toBe(400)
+    await expect(missingResponse.json()).resolves.toEqual({
+      error: 'Footer html must contain exactly one unsubscribe link',
+    })
+    expect(duplicateResponse.status).toBe(400)
+    await expect(duplicateResponse.json()).resolves.toEqual({
+      error: 'Footer html must contain exactly one unsubscribe link',
+    })
+  })
+
+  it('rejects footer templates larger than 64 KiB', async () => {
+    const { env } = createEnv()
+    const response = await putJson(
+      env,
+      '/api/newsletter/footer-config',
+      {
+        html: `<a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Unsubscribe</a>${'x'.repeat(65_536)}`,
+        text: `Unsubscribe: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+      },
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Footer html and text must each be 64 KiB or smaller',
     })
   })
 })
@@ -3284,6 +3375,8 @@ describe('newsletter draft admin endpoints', () => {
       contentFileName: 'newsletters/duplicate.html',
       textFileName: 'newsletters/duplicate.txt',
       fromName: null,
+      footerHtml: null,
+      footerText: null,
       fanoutSnapshotAt: '2026-04-30T01:00:00Z',
       fanoutCursorEmail: null,
       fanoutCompletedAt: '2026-04-30T01:00:00Z',
@@ -3782,6 +3875,111 @@ describe('newsletter queue delivery', () => {
       { name: 'newsletterId', value: NEWSLETTER_ID },
       expect.objectContaining({ name: 'recipientHash' }),
     ]))
+  })
+
+  it('renders the snapshotted rich footer with the recipient unsubscribe URL', async () => {
+    const { env, notificationFetch } = createEnv()
+    const fileName = `newsletters/${NEWSLETTER_ID}/custom-footer.html`
+    const textFileName = `newsletters/${NEWSLETTER_ID}/custom-footer.txt`
+    await env.R2.put(fileName, '<html><body><h1>Hello</h1></body></html>')
+    await env.R2.put(textFileName, 'Plain text body')
+    const footerHtml = `<p><strong>Thanks.</strong> <a href="https://example.com/privacy">Privacy</a> <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Leave this list</a></p>`
+    const footerText = `Thanks. Privacy Leave this list: ${UNSUBSCRIBE_PLACEHOLDER_URL}`
+    const { batch, message } = createQueueBatch({
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      subject: 'Custom footer test',
+      fileName,
+      textFileName,
+      footerHtml,
+      footerText,
+    })
+
+    await worker.queue(batch, env)
+
+    expect(message.retry).not.toHaveBeenCalled()
+    const body = await getNotificationRequestBody(notificationFetch)
+    expect(String(body.html)).toContain('<strong>Thanks.</strong>')
+    expect(String(body.html)).toContain('href="https://example.com/privacy"')
+    expect(String(body.html)).toContain('>Leave this list</a>')
+    expect(String(body.txt)).toContain('Leave this list: https://newsletter.example.com/api/subscribe/unsubscribe/')
+    expect(String(body.html)).not.toContain(UNSUBSCRIBE_PLACEHOLDER_URL)
+    expect(String(body.txt)).not.toContain(UNSUBSCRIBE_PLACEHOLDER_URL)
+  })
+
+  it('snapshots footer configuration for each send without copying it into queue messages', async () => {
+    const { env, db, notificationFetch, queueSend, queueSendBatch } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const firstFooter = {
+      html: `<p>First <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Leave</a></p>`,
+      text: `First Leave: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+    }
+    const secondFooter = {
+      html: `<p>Second <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Stop</a></p>`,
+      text: `Second Stop: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+    }
+    await putJson(
+      env,
+      '/api/newsletter/footer-config',
+      firstFooter,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const firstResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      { ...TRACKED_PUBLISH_PAYLOAD, sourceMessageId: 'first-footer-send' },
+      { Authorization: 'Bearer admin-token' }
+    )
+    expect(firstResponse.status).toBe(200)
+    const firstFanout = queueSend.mock.calls.at(-1)?.[0] as Record<string, unknown>
+
+    await putJson(
+      env,
+      '/api/newsletter/footer-config',
+      secondFooter,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const firstFanoutBatch = createQueueBatch(firstFanout)
+    await worker.queue(firstFanoutBatch.batch, env)
+    const firstRecipientBatch = (
+      queueSendBatch.mock.calls.at(-1)?.[0] as Array<{ body: Record<string, unknown> }>
+    )[0].body
+    await worker.queue(createQueueBatch(firstRecipientBatch).batch, env)
+    const firstDelivery = await getNotificationRequestBody(notificationFetch)
+
+    const secondResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      { ...TRACKED_PUBLISH_PAYLOAD, sourceMessageId: 'second-footer-send' },
+      { Authorization: 'Bearer admin-token' }
+    )
+    expect(secondResponse.status).toBe(200)
+    const secondFanout = queueSend.mock.calls.at(-1)?.[0] as Record<string, unknown>
+    await worker.queue(createQueueBatch(secondFanout).batch, env)
+    const secondRecipientBatch = (
+      queueSendBatch.mock.calls.at(-1)?.[0] as Array<{ body: Record<string, unknown> }>
+    )[0].body
+    await worker.queue(createQueueBatch(secondRecipientBatch).batch, env)
+    const secondDelivery = await getNotificationRequestBody(notificationFetch)
+
+    expect(firstFanout).not.toHaveProperty('footerHtml')
+    expect(firstFanout).not.toHaveProperty('footerText')
+    expect(firstRecipientBatch).not.toHaveProperty('footerHtml')
+    expect(firstRecipientBatch).not.toHaveProperty('footerText')
+    expect(String(firstDelivery.html)).toContain('First')
+    expect(String(firstDelivery.html)).toContain('>Leave</a>')
+    expect(secondFanout).not.toHaveProperty('footerHtml')
+    expect(secondFanout).not.toHaveProperty('footerText')
+    expect(secondRecipientBatch).not.toHaveProperty('footerHtml')
+    expect(secondRecipientBatch).not.toHaveProperty('footerText')
+    expect(String(secondDelivery.html)).toContain('Second')
+    expect(String(secondDelivery.html)).toContain('>Stop</a>')
   })
 
   it('keeps old queued messages deliverable when no text object is present', async () => {
