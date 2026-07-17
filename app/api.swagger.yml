@@ -87,6 +87,36 @@ paths:
         '503':
           description: Publish email address is not configured
 
+  /api/newsletter/email-style-config:
+    get:
+      summary: Get global email styles
+      description: Get the versioned global defaults applied to every outbound HTML newsletter.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        '200':
+          description: Email style configuration retrieved successfully
+          schema:
+            $ref: '#/definitions/EmailStyleConfig'
+    put:
+      summary: Replace global email styles
+      description: Validate and replace the complete global email style configuration.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: '#/definitions/EmailStyleConfig'
+      responses:
+        '200':
+          description: Email style configuration updated successfully
+          schema:
+            $ref: '#/definitions/EmailStyleConfig'
+        '400':
+          description: Invalid email style configuration
+
   /api/newsletter/{newsletterId}/publish:
     post:
       summary: Publish a newsletter directly
@@ -832,6 +862,180 @@ definitions:
         maxLength: 120
         pattern: '^[^\r\n<>]*$'
         description: Sender display name. Blank or null clears the display name.
+
+  EmailStyleConfig:
+    type: object
+    required:
+      - version
+      - layout
+      - body
+      - headings
+      - lists
+      - links
+    properties:
+      version:
+        type: integer
+        enum: [1]
+      layout:
+        $ref: '#/definitions/EmailStyleLayout'
+      body:
+        $ref: '#/definitions/EmailBodyStyle'
+      headings:
+        $ref: '#/definitions/EmailHeadingStyles'
+      lists:
+        $ref: '#/definitions/EmailListStyle'
+      links:
+        $ref: '#/definitions/EmailLinkStyle'
+
+  EmailStyleLayout:
+    type: object
+    required:
+      - maxWidthPx
+      - outerPaddingHorizontalPx
+      - outerPaddingVerticalPx
+      - contentPaddingHorizontalPx
+      - contentPaddingVerticalPx
+    properties:
+      maxWidthPx:
+        type: number
+        x-nullable: true
+        minimum: 320
+        maximum: 1200
+      outerPaddingHorizontalPx:
+        type: number
+        minimum: 0
+        maximum: 160
+      outerPaddingVerticalPx:
+        type: number
+        minimum: 0
+        maximum: 160
+      contentPaddingHorizontalPx:
+        type: number
+        minimum: 0
+        maximum: 160
+      contentPaddingVerticalPx:
+        type: number
+        minimum: 0
+        maximum: 160
+
+  EmailTextStyle:
+    type: object
+    required:
+      - fontFamily
+      - fontSizePx
+      - fontWeight
+      - fontStyle
+      - lineHeight
+      - letterSpacingPx
+      - alignment
+    properties:
+      fontFamily:
+        type: string
+        enum: [system-ui, helvetica, arial, georgia, times-new-roman, verdana, trebuchet-ms, courier-new]
+      fontSizePx:
+        type: number
+        minimum: 8
+        maximum: 120
+      fontWeight:
+        type: integer
+        minimum: 100
+        maximum: 900
+        multipleOf: 100
+      fontStyle:
+        type: string
+        enum: [normal, italic]
+      lineHeight:
+        type: number
+        minimum: 1
+        maximum: 3
+      letterSpacingPx:
+        type: number
+        minimum: -2
+        maximum: 10
+      alignment:
+        type: string
+        enum: [left, center, right, justify]
+
+  EmailBodyStyle:
+    allOf:
+      - $ref: '#/definitions/EmailTextStyle'
+      - type: object
+        required:
+          - paragraphMarginTopPx
+          - paragraphMarginBottomPx
+        properties:
+          fontSizePx:
+            type: number
+            minimum: 8
+            maximum: 72
+          paragraphMarginTopPx:
+            type: number
+            minimum: 0
+            maximum: 160
+          paragraphMarginBottomPx:
+            type: number
+            minimum: 0
+            maximum: 160
+
+  EmailHeadingStyle:
+    allOf:
+      - $ref: '#/definitions/EmailTextStyle'
+      - type: object
+        required:
+          - marginTopPx
+          - marginBottomPx
+        properties:
+          marginTopPx:
+            type: number
+            minimum: 0
+            maximum: 160
+          marginBottomPx:
+            type: number
+            minimum: 0
+            maximum: 160
+
+  EmailHeadingStyles:
+    type: object
+    required: [h1, h2, h3, h4, h5]
+    properties:
+      h1:
+        $ref: '#/definitions/EmailHeadingStyle'
+      h2:
+        $ref: '#/definitions/EmailHeadingStyle'
+      h3:
+        $ref: '#/definitions/EmailHeadingStyle'
+      h4:
+        $ref: '#/definitions/EmailHeadingStyle'
+      h5:
+        $ref: '#/definitions/EmailHeadingStyle'
+
+  EmailListStyle:
+    type: object
+    required: [indentationPx, marginTopPx, marginBottomPx, itemSpacingPx]
+    properties:
+      indentationPx:
+        type: number
+        minimum: 0
+        maximum: 160
+      marginTopPx:
+        type: number
+        minimum: 0
+        maximum: 160
+      marginBottomPx:
+        type: number
+        minimum: 0
+        maximum: 160
+      itemSpacingPx:
+        type: number
+        minimum: 0
+        maximum: 160
+
+  EmailLinkStyle:
+    type: object
+    required: [underline]
+    properties:
+      underline:
+        type: boolean
 
   GoogleWorkspacePublishRequest:
     type: object

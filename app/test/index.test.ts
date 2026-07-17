@@ -13,6 +13,50 @@ const TRACKED_PUBLISH_PAYLOAD = {
   sourceMessageId: 'tracked-source-message',
 }
 
+function factoryEmailTextStyle(fontSizePx: number, fontWeight: number) {
+  return {
+    fontFamily: 'helvetica',
+    fontSizePx,
+    fontWeight,
+    fontStyle: 'normal',
+    lineHeight: 1.2,
+    letterSpacingPx: 0,
+    alignment: 'left',
+  }
+}
+
+function factoryEmailStyleConfig() {
+  return {
+    version: 1,
+    layout: {
+      maxWidthPx: null as number | null,
+      outerPaddingHorizontalPx: 8,
+      outerPaddingVerticalPx: 8,
+      contentPaddingHorizontalPx: 0,
+      contentPaddingVerticalPx: 0,
+    },
+    body: {
+      ...factoryEmailTextStyle(14, 400),
+      paragraphMarginTopPx: 14,
+      paragraphMarginBottomPx: 14,
+    },
+    headings: {
+      h1: { ...factoryEmailTextStyle(28, 700), marginTopPx: 18.76, marginBottomPx: 18.76 },
+      h2: { ...factoryEmailTextStyle(25, 700), marginTopPx: 20.75, marginBottomPx: 20.75 },
+      h3: { ...factoryEmailTextStyle(21, 700), marginTopPx: 21, marginBottomPx: 21 },
+      h4: { ...factoryEmailTextStyle(18, 700), marginTopPx: 23.94, marginBottomPx: 23.94 },
+      h5: { ...factoryEmailTextStyle(16, 700), marginTopPx: 26.72, marginBottomPx: 26.72 },
+    },
+    lists: {
+      indentationPx: 40,
+      marginTopPx: 14,
+      marginBottomPx: 14,
+      itemSpacingPx: 0,
+    },
+    links: { underline: true },
+  }
+}
+
 type NewsletterRecord = {
   id: string
   subscribable: number
@@ -1438,6 +1482,7 @@ describe('admin auth middleware', () => {
       '/api/newsletter',
       `/api/newsletter/${NEWSLETTER_ID}`,
       '/api/newsletter/publish-config',
+      '/api/newsletter/email-style-config',
       '/api/newsletter/ses-diagnostics',
       `/api/newsletter/${NEWSLETTER_ID}/publish`,
       `/api/newsletter/${NEWSLETTER_ID}/subscribers`,
@@ -2015,6 +2060,85 @@ describe('publish config', () => {
   })
 })
 
+describe('email style config', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('returns factory defaults when KV is absent or corrupt', async () => {
+    const { env } = createEnv()
+    const absentResponse = await getJson(
+      env,
+      '/api/newsletter/email-style-config',
+      { Authorization: 'Bearer admin-token' }
+    )
+    await env.KV.put('email-style-config-v1', '{corrupt')
+    const corruptResponse = await getJson(
+      env,
+      '/api/newsletter/email-style-config',
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(absentResponse.status).toBe(200)
+    await expect(absentResponse.json()).resolves.toEqual(factoryEmailStyleConfig())
+    expect(corruptResponse.status).toBe(200)
+    await expect(corruptResponse.json()).resolves.toEqual(factoryEmailStyleConfig())
+  })
+
+  it('stores and returns a full replacement configuration', async () => {
+    const { env } = createEnv()
+    const config = factoryEmailStyleConfig()
+    config.layout.maxWidthPx = 680
+    config.layout.contentPaddingHorizontalPx = 24
+    config.body.fontFamily = 'georgia'
+    config.headings.h2.fontSizePx = 31
+    config.links.underline = false
+
+    const saveResponse = await putJson(
+      env,
+      '/api/newsletter/email-style-config',
+      config,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const getResponse = await getJson(
+      env,
+      '/api/newsletter/email-style-config',
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(saveResponse.status).toBe(200)
+    await expect(saveResponse.json()).resolves.toEqual(config)
+    expect(getResponse.status).toBe(200)
+    await expect(getResponse.json()).resolves.toEqual(config)
+  })
+
+  it('rejects missing, unknown, and out-of-range values', async () => {
+    const { env } = createEnv()
+    const missing = structuredClone(factoryEmailStyleConfig()) as Partial<
+      ReturnType<typeof factoryEmailStyleConfig>
+    >
+    delete missing.links
+    const unknown = structuredClone(factoryEmailStyleConfig())
+    const unknownBody = unknown.body as typeof unknown.body & { color?: string }
+    unknownBody.color = '#fff'
+    const outOfRange = structuredClone(factoryEmailStyleConfig())
+    outOfRange.body.fontSizePx = 73
+    const unsupportedWeight = structuredClone(factoryEmailStyleConfig())
+    unsupportedWeight.body.fontWeight = 550
+
+    for (const config of [missing, unknown, outOfRange, unsupportedWeight]) {
+      const response = await putJson(
+        env,
+        '/api/newsletter/email-style-config',
+        config,
+        { Authorization: 'Bearer admin-token' }
+      )
+      expect(response.status).toBe(400)
+      await expect(response.json()).resolves.toEqual({ error: expect.any(String) })
+    }
+  })
+})
+
 describe('unsubscribe footer config', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
@@ -2045,7 +2169,7 @@ describe('unsubscribe footer config', () => {
 
     expect(defaultResponse.status).toBe(200)
     await expect(defaultResponse.json()).resolves.toEqual({
-      html: `<p style="font-size: 12px; color: #555;">You are receiving this email because you subscribed to this newsletter. <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Unsubscribe</a></p>`,
+      html: `<p style="font-size: 12px;">You are receiving this email because you subscribed to this newsletter. <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Unsubscribe</a></p>`,
       text: `You are receiving this email because you subscribed to this newsletter.\nUnsubscribe: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
     })
     expect(saveResponse.status).toBe(200)
@@ -2325,7 +2449,12 @@ describe('direct newsletter publish endpoint', () => {
         new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.txt$`)
       ),
     }))
-    expect(r2Put).toHaveBeenCalledWith(result.fileName, publishPayload.html)
+    const storedHtml = String(
+      r2Put.mock.calls.find(([key]) => key === result.fileName)?.[1]
+    )
+    expect(storedHtml).toContain('<style id="letterdrop-global-email-styles">')
+    expect(storedHtml).toContain('<!-- letterdrop-content-start --><h1>Hello direct subscribers</h1>')
+    expect(storedHtml).toContain('<meta name="color-scheme" content="light dark">')
     expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
     expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
@@ -2352,6 +2481,122 @@ describe('direct newsletter publish endpoint', () => {
     }))
     expect(db.newsletterSends.get(result.sendId)?.queuedCount).toBe(1)
     expect(db.newsletterSendRecipients.size).toBe(1)
+  })
+
+  it('snapshots configured styling, preserves inline overrides, and reprocesses idempotently', async () => {
+    const {
+      env,
+      db,
+      notificationFetch,
+      r2Put,
+      queueSend,
+      queueSendBatch,
+    } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:first@example.com`, {
+      email: 'first@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const config = factoryEmailStyleConfig()
+    config.layout.maxWidthPx = 640
+    config.layout.outerPaddingHorizontalPx = 24
+    config.layout.contentPaddingVerticalPx = 16
+    config.body.fontFamily = 'georgia'
+    config.body.fontSizePx = 18
+    config.links.underline = false
+    const saveResponse = await putJson(
+      env,
+      '/api/newsletter/email-style-config',
+      config,
+      { Authorization: 'Bearer admin-token' }
+    )
+    expect(saveResponse.status).toBe(200)
+    const sourceHtml = '<!doctype html><html><head><title>Source title</title></head><body><h1 style="font-size: 44px">Styled heading</h1><p><a href="https://example.com" style="text-decoration: underline">Link</a></p></body></html>'
+
+    const firstResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      {
+        subject: 'Styled send',
+        html: sourceHtml,
+        text: 'Styled heading\n\nLink',
+        sourceMessageId: 'styled-snapshot',
+      },
+      { Authorization: 'Bearer admin-token' }
+    )
+    const first = await firstResponse.json()
+    const firstObject = await env.R2.get(first.fileName)
+    const firstHtml = await firstObject?.text() ?? ''
+
+    expect(firstResponse.status).toBe(200)
+    expect(firstHtml).toContain('<title>Source title</title>')
+    expect(firstHtml).toContain('max-width: 640px')
+    expect(firstHtml).toContain('padding: 8px 24px')
+    expect(firstHtml).toContain('padding: 16px 0px')
+    expect(firstHtml).toContain('font-family: Georgia, "Times New Roman", serif')
+    expect(firstHtml).toContain('text-decoration: none')
+    expect(firstHtml).toContain('style="font-size: 44px"')
+    expect(firstHtml.match(/letterdrop-content-start/g)).toHaveLength(1)
+    expect(firstHtml.match(/letterdrop-global-email-styles/g)).toHaveLength(1)
+    expect(firstHtml).toContain('#FFFFFF')
+    expect(firstHtml).toContain('#1C1C1E')
+    expect(firstHtml).toContain('@media (prefers-color-scheme: dark)')
+
+    const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+    await worker.queue(createQueueBatch(recipientMessages[0]).batch, env)
+    const delivery = await getNotificationRequestBody(notificationFetch)
+    const deliveryHtml = String(delivery.html)
+    expect(deliveryHtml.indexOf('class="letterdrop-footer"')).toBeGreaterThan(
+      deliveryHtml.indexOf('<!-- letterdrop-content-end -->')
+    )
+    expect(deliveryHtml.indexOf('class="letterdrop-footer"')).toBeLessThan(
+      deliveryHtml.indexOf('</body>')
+    )
+
+    const reprocessedResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      {
+        subject: 'Reprocessed style shell',
+        html: firstHtml,
+        text: 'Styled heading\n\nLink',
+        sourceMessageId: 'styled-reprocessed',
+      },
+      { Authorization: 'Bearer admin-token' }
+    )
+    const reprocessed = await reprocessedResponse.json()
+    const reprocessedObject = await env.R2.get(reprocessed.fileName)
+    await expect(reprocessedObject?.text()).resolves.toBe(firstHtml)
+
+    const changedConfig = structuredClone(config)
+    changedConfig.body.fontFamily = 'arial'
+    await putJson(
+      env,
+      '/api/newsletter/email-style-config',
+      changedConfig,
+      { Authorization: 'Bearer admin-token' }
+    )
+    const duplicateResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/publish`,
+      {
+        subject: 'Changed duplicate',
+        html: '<p>Changed duplicate</p>',
+        text: 'Changed duplicate',
+        sourceMessageId: 'styled-snapshot',
+      },
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    await expect(duplicateResponse.json()).resolves.toEqual(expect.objectContaining({
+      sendId: first.sendId,
+      duplicate: true,
+    }))
+    const stableObject = await env.R2.get(first.fileName)
+    await expect(stableObject?.text()).resolves.toBe(firstHtml)
+    expect(r2Put).toHaveBeenCalledTimes(4)
   })
 
   it('snapshots the configured sender display name onto queued recipients', async () => {
@@ -3337,7 +3582,9 @@ describe('newsletter draft admin endpoints', () => {
     const sentText = await env.R2.get(sent.textFileName)
 
     expect(sendResponse.status).toBe(200)
-    await expect(sentHtml?.text()).resolves.toBe('<p>Clean body</p>')
+    await expect(sentHtml?.text()).resolves.toContain(
+      '<!-- letterdrop-content-start --><p>Clean body</p><!-- letterdrop-content-end -->'
+    )
     await expect(sentText?.text()).resolves.toBe('Clean body')
     expect(db.newsletterSends.get(sent.sendId)).toEqual(expect.objectContaining({
       subject: 'Clean send',
@@ -3431,11 +3678,13 @@ describe('newsletter draft admin endpoints', () => {
       `/api/newsletter/${NEWSLETTER_ID}/sends/${published.sendId}/content`,
       auth
     )
-    await expect(contentResponse.json()).resolves.toEqual(expect.objectContaining({
+    const content = await contentResponse.json()
+    expect(content).toEqual(expect.objectContaining({
       send: expect.objectContaining({ id: published.sendId }),
-      html: TRACKED_PUBLISH_PAYLOAD.html,
       text: TRACKED_PUBLISH_PAYLOAD.text,
     }))
+    expect(String(content.html)).toContain(TRACKED_PUBLISH_PAYLOAD.html)
+    expect(String(content.html)).toContain('letterdrop-global-email-styles')
 
     const templateResponse = await postJson(
       env,
@@ -3451,9 +3700,10 @@ describe('newsletter draft admin endpoints', () => {
         subject: TRACKED_PUBLISH_PAYLOAD.subject,
         sourceMessageId: expect.stringMatching(/^draft:/),
       }),
-      html: TRACKED_PUBLISH_PAYLOAD.html,
       text: TRACKED_PUBLISH_PAYLOAD.text,
     }))
+    expect(String(template.html)).toContain(TRACKED_PUBLISH_PAYLOAD.html)
+    expect(String(template.html)).toContain('letterdrop-global-email-styles')
     expect(template.draft.sourceMessageId).not.toBe(TRACKED_PUBLISH_PAYLOAD.sourceMessageId)
   })
 
@@ -3607,7 +3857,11 @@ describe('Google Workspace publish bridge', () => {
         new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.txt$`)
       ),
     }))
-    expect(r2Put).toHaveBeenCalledWith(result.fileName, publishPayload.html)
+    const storedHtml = String(
+      r2Put.mock.calls.find(([key]) => key === result.fileName)?.[1]
+    )
+    expect(storedHtml).toContain('letterdrop-global-email-styles')
+    expect(storedHtml).toContain('<!-- letterdrop-content-start --><h1>Hello subscribers</h1>')
     expect(r2Put).toHaveBeenCalledWith(result.textFileName, publishPayload.text)
     expect(queueSend).toHaveBeenCalledTimes(1)
     expect(queueSend).toHaveBeenCalledWith(expect.objectContaining({
@@ -3755,7 +4009,8 @@ describe('Cloudflare Email Worker publish path', () => {
     expect(fileName).toEqual(
       expect.stringMatching(new RegExp(`^newsletters/${NEWSLETTER_ID}/\\d+\\.html$`))
     )
-    expect(String(html).trim()).toBe('<h1>Hello subscribers</h1>')
+    expect(String(html)).toContain('letterdrop-global-email-styles')
+    expect(String(html)).toContain('<h1>Hello subscribers</h1>')
     const textFileName = r2Put.mock.calls[1][0]
     const text = r2Put.mock.calls[1][1]
     expect(textFileName).toEqual(

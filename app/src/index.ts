@@ -71,6 +71,67 @@ type StoredUnsubscribeFooterConfig = {
   text: string;
 };
 
+type EmailFontPreset =
+  | "system-ui"
+  | "helvetica"
+  | "arial"
+  | "georgia"
+  | "times-new-roman"
+  | "verdana"
+  | "trebuchet-ms"
+  | "courier-new";
+
+type EmailFontStyle = "normal" | "italic";
+type EmailTextAlignment = "left" | "center" | "right" | "justify";
+
+type EmailTextStyle = {
+  fontFamily: EmailFontPreset;
+  fontSizePx: number;
+  fontWeight: number;
+  fontStyle: EmailFontStyle;
+  lineHeight: number;
+  letterSpacingPx: number;
+  alignment: EmailTextAlignment;
+};
+
+type EmailBodyStyle = EmailTextStyle & {
+  paragraphMarginTopPx: number;
+  paragraphMarginBottomPx: number;
+};
+
+type EmailHeadingStyle = EmailTextStyle & {
+  marginTopPx: number;
+  marginBottomPx: number;
+};
+
+type EmailStyleConfig = {
+  version: 1;
+  layout: {
+    maxWidthPx: number | null;
+    outerPaddingHorizontalPx: number;
+    outerPaddingVerticalPx: number;
+    contentPaddingHorizontalPx: number;
+    contentPaddingVerticalPx: number;
+  };
+  body: EmailBodyStyle;
+  headings: {
+    h1: EmailHeadingStyle;
+    h2: EmailHeadingStyle;
+    h3: EmailHeadingStyle;
+    h4: EmailHeadingStyle;
+    h5: EmailHeadingStyle;
+  };
+  lists: {
+    indentationPx: number;
+    marginTopPx: number;
+    marginBottomPx: number;
+    itemSpacingPx: number;
+  };
+  links: {
+    underline: boolean;
+  };
+};
+
 type PublishNewsletterInput = {
   newsletterId: string;
   subject: unknown;
@@ -341,9 +402,10 @@ const NOTIFICATION_BASE_URL = "http://haben-notification";
 const NOTIFICATION_AUTH_HEADER = "X-LetterDrop-Notification-Token";
 const PUBLISH_CONFIG_KV_KEY = "publish-config";
 const UNSUBSCRIBE_FOOTER_CONFIG_KV_KEY = "unsubscribe-footer-config";
+const EMAIL_STYLE_CONFIG_KV_KEY = "email-style-config-v1";
 const UNSUBSCRIBE_PLACEHOLDER_URL = "https://unsubscribe.letterdrop.invalid/";
 const DEFAULT_UNSUBSCRIBE_FOOTER_HTML = [
-  '<p style="font-size: 12px; color: #555;">',
+  '<p style="font-size: 12px;">',
   "You are receiving this email because you subscribed to this newsletter. ",
   `<a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">Unsubscribe</a>`,
   "</p>",
@@ -382,6 +444,10 @@ const NEWSLETTER_RECIPIENT_BATCH_SIZE = 25;
 const NEWSLETTER_ESTIMATED_SES_SEND_RATE_PER_SECOND = 14;
 const NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS = 60;
 const NEWSLETTER_SEND_RECIPIENT_SEARCH_MAX_BYTES = 256;
+const EMAIL_STYLE_ELEMENT_ID = "letterdrop-global-email-styles";
+const EMAIL_CONTENT_START_MARKER = "<!-- letterdrop-content-start -->";
+const EMAIL_CONTENT_END_MARKER = "<!-- letterdrop-content-end -->";
+const EMAIL_FOOTER_SLOT_MARKER = "<!-- letterdrop-footer-slot -->";
 
 let hasLoggedMissingAbuseEventMigration = false;
 
@@ -490,6 +556,414 @@ async function storePublishConfig(
     return;
   }
   await env.KV.put(PUBLISH_CONFIG_KV_KEY, JSON.stringify(config));
+}
+
+const EMAIL_FONT_PRESETS: EmailFontPreset[] = [
+  "system-ui",
+  "helvetica",
+  "arial",
+  "georgia",
+  "times-new-roman",
+  "verdana",
+  "trebuchet-ms",
+  "courier-new",
+];
+const EMAIL_FONT_STYLES: EmailFontStyle[] = ["normal", "italic"];
+const EMAIL_TEXT_ALIGNMENTS: EmailTextAlignment[] = [
+  "left",
+  "center",
+  "right",
+  "justify",
+];
+
+function defaultEmailTextStyle(
+  fontSizePx: number,
+  fontWeight: number,
+): EmailTextStyle {
+  return {
+    fontFamily: "helvetica",
+    fontSizePx,
+    fontWeight,
+    fontStyle: "normal",
+    lineHeight: 1.2,
+    letterSpacingPx: 0,
+    alignment: "left",
+  };
+}
+
+function defaultEmailStyleConfig(): EmailStyleConfig {
+  return {
+    version: 1,
+    layout: {
+      maxWidthPx: null,
+      outerPaddingHorizontalPx: 8,
+      outerPaddingVerticalPx: 8,
+      contentPaddingHorizontalPx: 0,
+      contentPaddingVerticalPx: 0,
+    },
+    body: {
+      ...defaultEmailTextStyle(14, 400),
+      paragraphMarginTopPx: 14,
+      paragraphMarginBottomPx: 14,
+    },
+    headings: {
+      h1: { ...defaultEmailTextStyle(28, 700), marginTopPx: 18.76, marginBottomPx: 18.76 },
+      h2: { ...defaultEmailTextStyle(25, 700), marginTopPx: 20.75, marginBottomPx: 20.75 },
+      h3: { ...defaultEmailTextStyle(21, 700), marginTopPx: 21, marginBottomPx: 21 },
+      h4: { ...defaultEmailTextStyle(18, 700), marginTopPx: 23.94, marginBottomPx: 23.94 },
+      h5: { ...defaultEmailTextStyle(16, 700), marginTopPx: 26.72, marginBottomPx: 26.72 },
+    },
+    lists: {
+      indentationPx: 40,
+      marginTopPx: 14,
+      marginBottomPx: 14,
+      itemSpacingPx: 0,
+    },
+    links: {
+      underline: true,
+    },
+  };
+}
+
+type EmailStyleConfigValidation =
+  | { ok: true; config: EmailStyleConfig }
+  | { ok: false; error: string };
+
+function exactRecord(
+  value: unknown,
+  path: string,
+  keys: string[],
+): { ok: true; record: Record<string, unknown> } | { ok: false; error: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, error: `${path} must be an object` };
+  }
+  const record = value as Record<string, unknown>;
+  const actualKeys = Object.keys(record);
+  const unexpectedKey = actualKeys.find((key) => !keys.includes(key));
+  if (unexpectedKey) {
+    return { ok: false, error: `${path}.${unexpectedKey} is not supported` };
+  }
+  const missingKey = keys.find((key) => !Object.hasOwn(record, key));
+  if (missingKey) {
+    return { ok: false, error: `${path}.${missingKey} is required` };
+  }
+  return { ok: true, record };
+}
+
+function validateNumber(
+  value: unknown,
+  path: string,
+  minimum: number,
+  maximum: number,
+  integer = false,
+): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return `${path} must be a number`;
+  }
+  if (integer && !Number.isInteger(value)) {
+    return `${path} must be an integer`;
+  }
+  if (value < minimum || value > maximum) {
+    return `${path} must be between ${minimum} and ${maximum}`;
+  }
+  return null;
+}
+
+function validateEmailTextStyle(
+  value: unknown,
+  path: string,
+  maximumFontSize: number,
+  additionalKeys: string[],
+): string | null {
+  const keys = [
+    "fontFamily",
+    "fontSizePx",
+    "fontWeight",
+    "fontStyle",
+    "lineHeight",
+    "letterSpacingPx",
+    "alignment",
+    ...additionalKeys,
+  ];
+  const checked = exactRecord(value, path, keys);
+  if (!checked.ok) return checked.error;
+  const record = checked.record;
+  if (!EMAIL_FONT_PRESETS.includes(record.fontFamily as EmailFontPreset)) {
+    return `${path}.fontFamily is not supported`;
+  }
+  if (!EMAIL_FONT_STYLES.includes(record.fontStyle as EmailFontStyle)) {
+    return `${path}.fontStyle is not supported`;
+  }
+  if (!EMAIL_TEXT_ALIGNMENTS.includes(record.alignment as EmailTextAlignment)) {
+    return `${path}.alignment is not supported`;
+  }
+  return validateNumber(record.fontSizePx, `${path}.fontSizePx`, 8, maximumFontSize)
+    ?? validateNumber(record.fontWeight, `${path}.fontWeight`, 100, 900, true)
+    ?? (typeof record.fontWeight === "number" && record.fontWeight % 100 !== 0
+      ? `${path}.fontWeight must use 100-point steps`
+      : null)
+    ?? validateNumber(record.lineHeight, `${path}.lineHeight`, 1, 3)
+    ?? validateNumber(record.letterSpacingPx, `${path}.letterSpacingPx`, -2, 10);
+}
+
+function validateEmailStyleConfig(value: unknown): EmailStyleConfigValidation {
+  const topLevel = exactRecord(
+    value,
+    "config",
+    ["version", "layout", "body", "headings", "lists", "links"],
+  );
+  if (!topLevel.ok) return topLevel;
+  const config = topLevel.record;
+  if (config.version !== 1) {
+    return { ok: false, error: "config.version must be 1" };
+  }
+
+  const layout = exactRecord(config.layout, "config.layout", [
+    "maxWidthPx",
+    "outerPaddingHorizontalPx",
+    "outerPaddingVerticalPx",
+    "contentPaddingHorizontalPx",
+    "contentPaddingVerticalPx",
+  ]);
+  if (!layout.ok) return layout;
+  const maxWidthError = layout.record.maxWidthPx === null
+    ? null
+    : validateNumber(layout.record.maxWidthPx, "config.layout.maxWidthPx", 320, 1200);
+  const layoutError = maxWidthError
+    ?? validateNumber(
+      layout.record.outerPaddingHorizontalPx,
+      "config.layout.outerPaddingHorizontalPx",
+      0,
+      160,
+    )
+    ?? validateNumber(
+      layout.record.outerPaddingVerticalPx,
+      "config.layout.outerPaddingVerticalPx",
+      0,
+      160,
+    )
+    ?? validateNumber(
+      layout.record.contentPaddingHorizontalPx,
+      "config.layout.contentPaddingHorizontalPx",
+      0,
+      160,
+    )
+    ?? validateNumber(
+      layout.record.contentPaddingVerticalPx,
+      "config.layout.contentPaddingVerticalPx",
+      0,
+      160,
+    );
+  if (layoutError) return { ok: false, error: layoutError };
+
+  const bodyError = validateEmailTextStyle(
+    config.body,
+    "config.body",
+    72,
+    ["paragraphMarginTopPx", "paragraphMarginBottomPx"],
+  );
+  if (bodyError) return { ok: false, error: bodyError };
+  const body = config.body as Record<string, unknown>;
+  const bodySpacingError = validateNumber(
+    body.paragraphMarginTopPx,
+    "config.body.paragraphMarginTopPx",
+    0,
+    160,
+  ) ?? validateNumber(
+    body.paragraphMarginBottomPx,
+    "config.body.paragraphMarginBottomPx",
+    0,
+    160,
+  );
+  if (bodySpacingError) return { ok: false, error: bodySpacingError };
+
+  const headings = exactRecord(config.headings, "config.headings", ["h1", "h2", "h3", "h4", "h5"]);
+  if (!headings.ok) return headings;
+  for (const key of ["h1", "h2", "h3", "h4", "h5"]) {
+    const path = `config.headings.${key}`;
+    const headingError = validateEmailTextStyle(
+      headings.record[key],
+      path,
+      120,
+      ["marginTopPx", "marginBottomPx"],
+    );
+    if (headingError) return { ok: false, error: headingError };
+    const heading = headings.record[key] as Record<string, unknown>;
+    const marginError = validateNumber(heading.marginTopPx, `${path}.marginTopPx`, 0, 160)
+      ?? validateNumber(heading.marginBottomPx, `${path}.marginBottomPx`, 0, 160);
+    if (marginError) return { ok: false, error: marginError };
+  }
+
+  const lists = exactRecord(config.lists, "config.lists", [
+    "indentationPx",
+    "marginTopPx",
+    "marginBottomPx",
+    "itemSpacingPx",
+  ]);
+  if (!lists.ok) return lists;
+  const listError = validateNumber(lists.record.indentationPx, "config.lists.indentationPx", 0, 160)
+    ?? validateNumber(lists.record.marginTopPx, "config.lists.marginTopPx", 0, 160)
+    ?? validateNumber(lists.record.marginBottomPx, "config.lists.marginBottomPx", 0, 160)
+    ?? validateNumber(lists.record.itemSpacingPx, "config.lists.itemSpacingPx", 0, 160);
+  if (listError) return { ok: false, error: listError };
+
+  const links = exactRecord(config.links, "config.links", ["underline"]);
+  if (!links.ok) return links;
+  if (typeof links.record.underline !== "boolean") {
+    return { ok: false, error: "config.links.underline must be a boolean" };
+  }
+
+  return { ok: true, config: value as EmailStyleConfig };
+}
+
+function parseStoredEmailStyleConfig(value: string | null): EmailStyleConfig {
+  if (!value) return defaultEmailStyleConfig();
+  try {
+    const validated = validateEmailStyleConfig(JSON.parse(value) as unknown);
+    return validated.ok ? validated.config : defaultEmailStyleConfig();
+  } catch {
+    return defaultEmailStyleConfig();
+  }
+}
+
+async function getEmailStyleConfig(env: Bindings): Promise<EmailStyleConfig> {
+  return parseStoredEmailStyleConfig(await env.KV.get(EMAIL_STYLE_CONFIG_KV_KEY));
+}
+
+async function storeEmailStyleConfig(env: Bindings, config: EmailStyleConfig): Promise<void> {
+  await env.KV.put(EMAIL_STYLE_CONFIG_KV_KEY, JSON.stringify(config));
+}
+
+function emailFontStack(preset: EmailFontPreset): string {
+  switch (preset) {
+    case "system-ui":
+      return 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+    case "helvetica":
+      return 'Helvetica, "Helvetica Neue", Arial, sans-serif';
+    case "arial":
+      return 'Arial, Helvetica, sans-serif';
+    case "georgia":
+      return 'Georgia, "Times New Roman", serif';
+    case "times-new-roman":
+      return '"Times New Roman", Times, serif';
+    case "verdana":
+      return 'Verdana, Geneva, sans-serif';
+    case "trebuchet-ms":
+      return '"Trebuchet MS", Helvetica, sans-serif';
+    case "courier-new":
+      return '"Courier New", Courier, monospace';
+  }
+}
+
+function emailTextStyleDeclarations(style: EmailTextStyle): string {
+  return [
+    `font-family: ${emailFontStack(style.fontFamily)}`,
+    `font-size: ${style.fontSizePx}px`,
+    `font-weight: ${style.fontWeight}`,
+    `font-style: ${style.fontStyle}`,
+    `line-height: ${style.lineHeight}`,
+    `letter-spacing: ${style.letterSpacingPx}px`,
+    `text-align: ${style.alignment}`,
+  ].join("; ");
+}
+
+function emailStyleSheet(config: EmailStyleConfig): string {
+  const headingRules = Object.entries(config.headings)
+    .map(([tag, style]) => [
+      `.letterdrop-content ${tag} {`,
+      `  ${emailTextStyleDeclarations(style)};`,
+      `  margin-top: ${style.marginTopPx}px;`,
+      `  margin-bottom: ${style.marginBottomPx}px;`,
+      "}",
+    ].join("\n"))
+    .join("\n");
+  const linkDecoration = config.links.underline ? "underline" : "none";
+  return `
+:root { color-scheme: light dark; supported-color-schemes: light dark; }
+body { margin: 0; padding: 0; color: #111111; background-color: #FFFFFF; }
+.letterdrop-shell, .letterdrop-card { background-color: #FFFFFF; }
+.letterdrop-content { color: #111111; ${emailTextStyleDeclarations(config.body)}; }
+.letterdrop-content p {
+  margin-top: ${config.body.paragraphMarginTopPx}px;
+  margin-bottom: ${config.body.paragraphMarginBottomPx}px;
+}
+${headingRules}
+.letterdrop-content ul, .letterdrop-content ol {
+  margin-top: ${config.lists.marginTopPx}px;
+  margin-bottom: ${config.lists.marginBottomPx}px;
+  padding-left: ${config.lists.indentationPx}px;
+}
+.letterdrop-content li { margin-bottom: ${config.lists.itemSpacingPx}px; }
+.letterdrop-content a { color: #0066CC; text-decoration: ${linkDecoration}; }
+.letterdrop-footer, .letterdrop-footer p { color: #555555; }
+.letterdrop-footer hr { border: 0; border-top: 1px solid #D1D1D6; }
+.letterdrop-footer a { color: #0066CC; }
+@media (prefers-color-scheme: dark) {
+  body, .letterdrop-shell, .letterdrop-card { background-color: #1C1C1E !important; }
+  .letterdrop-content, .letterdrop-content p,
+  .letterdrop-content h1, .letterdrop-content h2, .letterdrop-content h3,
+  .letterdrop-content h4, .letterdrop-content h5 { color: #F5F5F7 !important; }
+  .letterdrop-content a, .letterdrop-footer a { color: #64D2FF !important; }
+  .letterdrop-footer, .letterdrop-footer p { color: #C7C7CC !important; }
+  .letterdrop-footer hr { border-top-color: #3A3A3C !important; }
+}`.trim();
+}
+
+function removeManagedEmailStyle(value: string): string {
+  const pattern = new RegExp(
+    `<style[^>]*id=["']${EMAIL_STYLE_ELEMENT_ID}["'][^>]*>[\\s\\S]*?<\\/style>`,
+    "gi",
+  );
+  return value.replace(pattern, "");
+}
+
+function managedEmailContent(value: string): string | null {
+  const start = value.indexOf(EMAIL_CONTENT_START_MARKER);
+  const end = value.indexOf(EMAIL_CONTENT_END_MARKER);
+  if (start < 0 || end < start) return null;
+  return value.slice(start + EMAIL_CONTENT_START_MARKER.length, end);
+}
+
+function renderStyledNewsletterHtml(html: string, config: EmailStyleConfig): string {
+  const withoutManagedStyle = removeManagedEmailStyle(html);
+  const bodyMatch = withoutManagedStyle.match(/<body\b([^>]*)>([\s\S]*?)<\/body>/i);
+  const headMatch = withoutManagedStyle.match(/<head\b[^>]*>([\s\S]*?)<\/head>/i);
+  const sourceBody = bodyMatch?.[2] ?? withoutManagedStyle;
+  const content = managedEmailContent(sourceBody) ?? sourceBody;
+  const sourceHead = (headMatch?.[1] ?? "")
+    .replace(/<meta[^>]+name=["'](?:color-scheme|supported-color-schemes)["'][^>]*>/gi, "")
+    .trim();
+  const bodyAttributes = bodyMatch?.[1]?.trim();
+  const bodyOpenTag = bodyAttributes ? `<body ${bodyAttributes}>` : "<body>";
+  const maximumWidth = config.layout.maxWidthPx === null
+    ? ""
+    : ` max-width: ${config.layout.maxWidthPx}px;`;
+  const outerPadding = `${config.layout.outerPaddingVerticalPx}px ${config.layout.outerPaddingHorizontalPx}px`;
+  const contentPadding = `${config.layout.contentPaddingVerticalPx}px ${config.layout.contentPaddingHorizontalPx}px`;
+
+  return `<!doctype html>
+<html>
+<head>
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+${sourceHead}
+<style id="${EMAIL_STYLE_ELEMENT_ID}">
+${emailStyleSheet(config)}
+</style>
+</head>
+${bodyOpenTag}
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" class="letterdrop-shell" style="width: 100%; background-color: #FFFFFF;">
+<tr><td align="center" style="padding: ${outerPadding};">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" class="letterdrop-card" style="width: 100%;${maximumWidth} background-color: #FFFFFF;">
+<tr><td class="letterdrop-content" style='padding: ${contentPadding}; color: #111111; ${emailTextStyleDeclarations(config.body)};'>
+${EMAIL_CONTENT_START_MARKER}${content}${EMAIL_CONTENT_END_MARKER}
+</td></tr>
+${EMAIL_FOOTER_SLOT_MARKER}
+</table>
+</td></tr>
+</table>
+</body>
+</html>`;
 }
 
 type UnsubscribeFooterConfigValidation =
@@ -1579,6 +2053,31 @@ app.put("/api/newsletter/publish-config", async (c) => {
     return c.json({ emailAddress, fromName: normalized.fromName });
   } catch (error: unknown) {
     return internalServerError(c, "update-publish-config", error);
+  }
+});
+
+app.get("/api/newsletter/email-style-config", async (c) => {
+  try {
+    return c.json(await getEmailStyleConfig(c.env));
+  } catch (error: unknown) {
+    return internalServerError(c, "get-email-style-config", error);
+  }
+});
+
+app.put("/api/newsletter/email-style-config", async (c) => {
+  try {
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const validated = validateEmailStyleConfig(parsedBody.body);
+    if (!validated.ok) {
+      return c.json({ error: validated.error }, 400);
+    }
+    await storeEmailStyleConfig(c.env, validated.config);
+    return c.json(validated.config);
+  } catch (error: unknown) {
+    return internalServerError(c, "update-email-style-config", error);
   }
 });
 
@@ -3827,7 +4326,19 @@ function appendUnsubscribeFooterToHtml(
     footerHtml,
     DEFAULT_UNSUBSCRIBE_FOOTER_TEXT,
   ).html;
-  const footer = `<hr>${template.replace(UNSUBSCRIBE_PLACEHOLDER_URL, safeUrl)}`;
+  const footer = [
+    '<div class="letterdrop-footer">',
+    "<hr>",
+    template.replace(UNSUBSCRIBE_PLACEHOLDER_URL, safeUrl),
+    "</div>",
+  ].join("");
+
+  if (html.includes(EMAIL_FOOTER_SLOT_MARKER)) {
+    return html.replace(
+      EMAIL_FOOTER_SLOT_MARKER,
+      `<tr><td>${footer}</td></tr>`,
+    );
+  }
 
   if (/<\/body>/i.test(html)) {
     return html.replace(/<\/body>/i, `${footer}</body>`);
@@ -5698,13 +6209,16 @@ async function publishNewsletter(
   const fileName = `newsletters/${input.newsletterId}/${timestamp}.html`;
   const textFileName = `newsletters/${input.newsletterId}/${timestamp}.txt`;
 
-  await env.R2.put(fileName, html);
-  await env.R2.put(textFileName, text);
-
-  const [recipientCount, publishConfig, footerConfig] = await Promise.all([
+  const [recipientCount, publishConfig, footerConfig, emailStyleConfig] = await Promise.all([
     countSubscribedSubscribers(input.newsletterId, env.DB, now),
     getPublishConfig(env),
     getUnsubscribeFooterConfig(env),
+    getEmailStyleConfig(env),
+  ]);
+  const styledHtml = renderStyledNewsletterHtml(html, emailStyleConfig);
+  await Promise.all([
+    env.R2.put(fileName, styledHtml),
+    env.R2.put(textFileName, text),
   ]);
   let send: NewsletterSendSummary;
   try {
