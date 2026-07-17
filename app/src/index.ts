@@ -350,6 +350,8 @@ const MAX_SUPPRESSION_PAYLOAD_LENGTH = 20_000;
 const NEWSLETTER_SEND_EVENT_PAGE_SIZE = 500;
 const NEWSLETTER_SEND_RECIPIENT_PAGE_SIZE = 100;
 const NEWSLETTER_SEND_MAX_RECIPIENT_PAGE_SIZE = 250;
+const DEFAULT_MAX_PAGE_SIZE = 100;
+const SUBSCRIBER_LIST_MAX_PAGE_SIZE = 1_000;
 const NEWSLETTER_SEND_STREAM_REPLAY_LIMIT = 100;
 const NEWSLETTER_FANOUT_PAGE_SIZE = 100;
 const NEWSLETTER_RECIPIENT_BATCH_SIZE = 25;
@@ -373,9 +375,15 @@ function escapeHtml(str: string): string {
 }
 
 // Parse and clamp pagination parameters
-function parsePagination(query: { page?: string; limit?: string }) {
+function parsePagination(
+  query: { page?: string; limit?: string },
+  maxLimit = DEFAULT_MAX_PAGE_SIZE,
+) {
   const page = Math.max(1, parseInt(query.page || "1") || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(query.limit || "50") || 50));
+  const limit = Math.min(
+    maxLimit,
+    Math.max(1, parseInt(query.limit || "50") || 50),
+  );
   const offset = (page - 1) * limit;
   return { page, limit, offset };
 }
@@ -2228,10 +2236,13 @@ app.delete("/api/newsletter/:newsletterId", async (c) => {
 // List subscribers for a newsletter
 app.get("/api/newsletter/:newsletterId/subscribers", async (c) => {
   const { newsletterId } = c.req.param();
-  const { page, limit, offset } = parsePagination({
-    page: c.req.query("page"),
-    limit: c.req.query("limit"),
-  });
+  const { page, limit, offset } = parsePagination(
+    {
+      page: c.req.query("page"),
+      limit: c.req.query("limit"),
+    },
+    SUBSCRIBER_LIST_MAX_PAGE_SIZE,
+  );
 
   try {
     const newsletter = await c.env.DB.prepare(

@@ -1730,6 +1730,86 @@ describe('admin subscriber notes', () => {
   })
 })
 
+describe('admin subscriber pagination', () => {
+  const adminHeaders = { Authorization: 'Bearer admin-token' }
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  function seedSubscribers(db: FakeD1Database, count: number) {
+    for (let index = 0; index < count; index += 1) {
+      const email = `subscriber-${String(index).padStart(4, '0')}@example.com`
+      db.subscribers.set(`${NEWSLETTER_ID}:${email}`, {
+        email,
+        newsletterId: NEWSLETTER_ID,
+        firstName: null,
+        lastName: null,
+        isSubscribed: 1,
+        upsertedAt: new Date(index * 1_000).toISOString(),
+      })
+    }
+  }
+
+  it('returns subscriber pages of up to 1000 rows with accurate metadata', async () => {
+    const { env, db } = createEnv()
+    seedSubscribers(db, 1_001)
+
+    const firstResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers?page=1&limit=1000`,
+      adminHeaders
+    )
+    const secondResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers?page=2&limit=1000`,
+      adminHeaders
+    )
+
+    expect(firstResponse.status).toBe(200)
+    expect(secondResponse.status).toBe(200)
+    const firstPage = await firstResponse.json() as {
+      subscribers: unknown[]
+      pagination: { page: number; limit: number; total: number }
+    }
+    const secondPage = await secondResponse.json() as {
+      subscribers: unknown[]
+      pagination: { page: number; limit: number; total: number }
+    }
+    expect(firstPage.subscribers).toHaveLength(1_000)
+    expect(firstPage.pagination).toEqual({ page: 1, limit: 1_000, total: 1_001 })
+    expect(secondPage.subscribers).toHaveLength(1)
+    expect(secondPage.pagination).toEqual({ page: 2, limit: 1_000, total: 1_001 })
+  })
+
+  it('clamps only subscriber lists to the larger maximum', async () => {
+    const { env, db } = createEnv()
+    seedSubscribers(db, 1_001)
+
+    const subscriberResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers?limit=5000`,
+      adminHeaders
+    )
+    const newsletterResponse = await getJson(
+      env,
+      '/api/newsletter?limit=5000',
+      adminHeaders
+    )
+
+    const subscriberPage = await subscriberResponse.json() as {
+      subscribers: unknown[]
+      pagination: { limit: number }
+    }
+    const newsletterPage = await newsletterResponse.json() as {
+      pagination: { limit: number }
+    }
+    expect(subscriberPage.subscribers).toHaveLength(1_000)
+    expect(subscriberPage.pagination.limit).toBe(1_000)
+    expect(newsletterPage.pagination.limit).toBe(100)
+  })
+})
+
 describe('admin subscriber imports', () => {
   const adminHeaders = { Authorization: 'Bearer admin-token' }
 

@@ -361,6 +361,7 @@ paths:
           in: query
           type: integer
           default: 50
+          maximum: 1000
       responses:
         '200':
           description: Subscribers retrieved successfully
