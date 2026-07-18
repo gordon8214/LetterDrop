@@ -104,6 +104,13 @@ type EmailHeadingStyle = EmailTextStyle & {
   marginBottomPx: number;
 };
 
+type EmailLinkPreviewStyle = {
+  fontFamily: EmailFontPreset;
+  titleFontSizePx: number;
+  hostFontSizePx: number;
+  titleURLSpacingPx: number;
+};
+
 type EmailStyleConfig = {
   version: 1;
   layout: {
@@ -130,6 +137,7 @@ type EmailStyleConfig = {
   links: {
     underline: boolean;
   };
+  linkPreviews: EmailLinkPreviewStyle;
 };
 
 type PublishNewsletterInput = {
@@ -622,6 +630,12 @@ function defaultEmailStyleConfig(): EmailStyleConfig {
     links: {
       underline: true,
     },
+    linkPreviews: {
+      fontFamily: "system-ui",
+      titleFontSizePx: 20,
+      hostFontSizePx: 16,
+      titleURLSpacingPx: 8,
+    },
   };
 }
 
@@ -710,7 +724,7 @@ function validateEmailStyleConfig(value: unknown): EmailStyleConfigValidation {
   const topLevel = exactRecord(
     value,
     "config",
-    ["version", "layout", "body", "headings", "lists", "links"],
+    ["version", "layout", "body", "headings", "lists", "links", "linkPreviews"],
   );
   if (!topLevel.ok) return topLevel;
   const config = topLevel.record;
@@ -813,13 +827,69 @@ function validateEmailStyleConfig(value: unknown): EmailStyleConfigValidation {
     return { ok: false, error: "config.links.underline must be a boolean" };
   }
 
+  const linkPreviews = exactRecord(config.linkPreviews, "config.linkPreviews", [
+    "fontFamily",
+    "titleFontSizePx",
+    "hostFontSizePx",
+    "titleURLSpacingPx",
+  ]);
+  if (!linkPreviews.ok) return linkPreviews;
+  if (!EMAIL_FONT_PRESETS.includes(linkPreviews.record.fontFamily as EmailFontPreset)) {
+    return { ok: false, error: "config.linkPreviews.fontFamily is not supported" };
+  }
+  const linkPreviewError = validateNumber(
+    linkPreviews.record.titleFontSizePx,
+    "config.linkPreviews.titleFontSizePx",
+    8,
+    48,
+  ) ?? validateNumber(
+    linkPreviews.record.hostFontSizePx,
+    "config.linkPreviews.hostFontSizePx",
+    8,
+    32,
+  ) ?? validateNumber(
+    linkPreviews.record.titleURLSpacingPx,
+    "config.linkPreviews.titleURLSpacingPx",
+    0,
+    160,
+  );
+  if (linkPreviewError) return { ok: false, error: linkPreviewError };
+
   return { ok: true, config: value as EmailStyleConfig };
+}
+
+function addEmailStyleConfigDefaults(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || (value as Record<string, unknown>).version !== 1) {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  if (!Object.hasOwn(record, "linkPreviews")) {
+    return {
+      ...record,
+      linkPreviews: defaultEmailStyleConfig().linkPreviews,
+    };
+  }
+  const linkPreviews = record.linkPreviews;
+  if (linkPreviews && typeof linkPreviews === "object" && !Array.isArray(linkPreviews)
+      && !Object.hasOwn(linkPreviews, "titleURLSpacingPx")) {
+    return {
+      ...record,
+      linkPreviews: {
+        ...(linkPreviews as Record<string, unknown>),
+        titleURLSpacingPx: defaultEmailStyleConfig().linkPreviews.titleURLSpacingPx,
+      },
+    };
+  }
+  return value;
 }
 
 function parseStoredEmailStyleConfig(value: string | null): EmailStyleConfig {
   if (!value) return defaultEmailStyleConfig();
   try {
-    const validated = validateEmailStyleConfig(JSON.parse(value) as unknown);
+    const validated = validateEmailStyleConfig(
+      addEmailStyleConfigDefaults(JSON.parse(value) as unknown),
+    );
     return validated.ok ? validated.config : defaultEmailStyleConfig();
   } catch {
     return defaultEmailStyleConfig();
@@ -895,6 +965,17 @@ ${headingRules}
 }
 .letterdrop-content li { margin-bottom: ${config.lists.itemSpacingPx}px; }
 .letterdrop-content a { color: #0066CC; text-decoration: ${linkDecoration}; }
+.letterdrop-link-preview-title {
+  font-family: ${emailFontStack(config.linkPreviews.fontFamily)} !important;
+  font-size: ${config.linkPreviews.titleFontSizePx}px !important;
+  line-height: ${config.linkPreviews.titleFontSizePx * 1.2}px !important;
+}
+.letterdrop-link-preview-host {
+  font-family: ${emailFontStack(config.linkPreviews.fontFamily)} !important;
+  font-size: ${config.linkPreviews.hostFontSizePx}px !important;
+  line-height: ${config.linkPreviews.hostFontSizePx * 1.25}px !important;
+  padding-top: ${config.linkPreviews.titleURLSpacingPx}px !important;
+}
 .letterdrop-footer, .letterdrop-footer p { color: #555555; }
 .letterdrop-footer hr { border: 0; border-top: 1px solid #D1D1D6; }
 .letterdrop-footer a { color: #0066CC; }
@@ -2070,7 +2151,7 @@ app.put("/api/newsletter/email-style-config", async (c) => {
     if (!parsedBody.ok) {
       return parsedBody.response;
     }
-    const validated = validateEmailStyleConfig(parsedBody.body);
+    const validated = validateEmailStyleConfig(addEmailStyleConfigDefaults(parsedBody.body));
     if (!validated.ok) {
       return c.json({ error: validated.error }, 400);
     }

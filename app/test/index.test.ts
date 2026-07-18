@@ -54,6 +54,12 @@ function factoryEmailStyleConfig() {
       itemSpacingPx: 0,
     },
     links: { underline: true },
+    linkPreviews: {
+      fontFamily: 'system-ui',
+      titleFontSizePx: 20,
+      hostFontSizePx: 16,
+      titleURLSpacingPx: 8,
+    },
   }
 }
 
@@ -2085,6 +2091,53 @@ describe('email style config', () => {
     await expect(corruptResponse.json()).resolves.toEqual(factoryEmailStyleConfig())
   })
 
+  it('adds the spacing default to a stored legacy rich link preview configuration', async () => {
+    const { env } = createEnv()
+    const legacyConfig = structuredClone(factoryEmailStyleConfig())
+    legacyConfig.linkPreviews.fontFamily = 'georgia'
+    const legacyLinkPreviews = legacyConfig.linkPreviews as Partial<
+      typeof legacyConfig.linkPreviews
+    >
+    delete legacyLinkPreviews.titleURLSpacingPx
+    await env.KV.put('email-style-config-v1', JSON.stringify(legacyConfig))
+
+    const response = await getJson(
+      env,
+      '/api/newsletter/email-style-config',
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      ...legacyConfig,
+      linkPreviews: {
+        ...legacyConfig.linkPreviews,
+        titleURLSpacingPx: 8,
+      },
+    })
+  })
+
+  it('accepts a full replacement from a legacy client without rich link preview settings', async () => {
+    const { env } = createEnv()
+    const legacyConfig = structuredClone(factoryEmailStyleConfig()) as Partial<
+      ReturnType<typeof factoryEmailStyleConfig>
+    >
+    delete legacyConfig.linkPreviews
+
+    const response = await putJson(
+      env,
+      '/api/newsletter/email-style-config',
+      legacyConfig,
+      { Authorization: 'Bearer admin-token' }
+    )
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      ...legacyConfig,
+      linkPreviews: factoryEmailStyleConfig().linkPreviews,
+    })
+  })
+
   it('stores and returns a full replacement configuration', async () => {
     const { env } = createEnv()
     const config = factoryEmailStyleConfig()
@@ -2093,6 +2146,10 @@ describe('email style config', () => {
     config.body.fontFamily = 'georgia'
     config.headings.h2.fontSizePx = 31
     config.links.underline = false
+    config.linkPreviews.fontFamily = 'georgia'
+    config.linkPreviews.titleFontSizePx = 28
+    config.linkPreviews.hostFontSizePx = 14
+    config.linkPreviews.titleURLSpacingPx = 32
 
     const saveResponse = await putJson(
       env,
@@ -2125,8 +2182,19 @@ describe('email style config', () => {
     outOfRange.body.fontSizePx = 73
     const unsupportedWeight = structuredClone(factoryEmailStyleConfig())
     unsupportedWeight.body.fontWeight = 550
+    const outOfRangeLinkPreview = structuredClone(factoryEmailStyleConfig())
+    outOfRangeLinkPreview.linkPreviews.titleFontSizePx = 49
+    const outOfRangeLinkPreviewSpacing = structuredClone(factoryEmailStyleConfig())
+    outOfRangeLinkPreviewSpacing.linkPreviews.titleURLSpacingPx = 161
 
-    for (const config of [missing, unknown, outOfRange, unsupportedWeight]) {
+    for (const config of [
+      missing,
+      unknown,
+      outOfRange,
+      unsupportedWeight,
+      outOfRangeLinkPreview,
+      outOfRangeLinkPreviewSpacing,
+    ]) {
       const response = await putJson(
         env,
         '/api/newsletter/email-style-config',
@@ -2506,6 +2574,10 @@ describe('direct newsletter publish endpoint', () => {
     config.body.fontFamily = 'georgia'
     config.body.fontSizePx = 18
     config.links.underline = false
+    config.linkPreviews.fontFamily = 'arial'
+    config.linkPreviews.titleFontSizePx = 29
+    config.linkPreviews.hostFontSizePx = 13
+    config.linkPreviews.titleURLSpacingPx = 27
     const saveResponse = await putJson(
       env,
       '/api/newsletter/email-style-config',
@@ -2537,6 +2609,10 @@ describe('direct newsletter publish endpoint', () => {
     expect(firstHtml).toContain('padding: 16px 0px')
     expect(firstHtml).toContain('font-family: Georgia, "Times New Roman", serif')
     expect(firstHtml).toContain('text-decoration: none')
+    expect(firstHtml).toContain('.letterdrop-link-preview-title')
+    expect(firstHtml).toContain('font-size: 29px !important')
+    expect(firstHtml).toContain('font-size: 13px !important')
+    expect(firstHtml).toContain('padding-top: 27px !important')
     expect(firstHtml).toContain('style="font-size: 44px"')
     expect(firstHtml.match(/letterdrop-content-start/g)).toHaveLength(1)
     expect(firstHtml.match(/letterdrop-global-email-styles/g)).toHaveLength(1)
