@@ -3776,10 +3776,10 @@ describe('newsletter draft admin endpoints', () => {
         subject: TRACKED_PUBLISH_PAYLOAD.subject,
         sourceMessageId: expect.stringMatching(/^draft:/),
       }),
+      html: TRACKED_PUBLISH_PAYLOAD.html,
       text: TRACKED_PUBLISH_PAYLOAD.text,
     }))
-    expect(String(template.html)).toContain(TRACKED_PUBLISH_PAYLOAD.html)
-    expect(String(template.html)).toContain('letterdrop-global-email-styles')
+    expect(String(template.html)).not.toContain('letterdrop-global-email-styles')
     expect(template.draft.sourceMessageId).not.toBe(TRACKED_PUBLISH_PAYLOAD.sourceMessageId)
   })
 

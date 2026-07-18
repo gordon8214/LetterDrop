@@ -2767,14 +2767,15 @@ app.post("/api/newsletter/:newsletterId/sends/:sendId/draft", async (c) => {
     if (html === null || text === null) {
       return c.json({ error: "Newsletter send content not found" }, 404);
     }
+    const editableHtml = managedEmailContent(html) ?? html;
     try {
       const draft = await createNewsletterDraft(c.env, {
         newsletterId,
         subject: send.subject,
-        html,
+        html: editableHtml,
         text,
       });
-      return c.json({ draft, html, text }, 201);
+      return c.json({ draft, html: editableHtml, text }, 201);
     } catch (error: unknown) {
       if (error instanceof NewsletterDraftSourceConflictError) {
         return c.json({ error: error.message }, 409);
