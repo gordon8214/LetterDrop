@@ -37,6 +37,7 @@ type SubscriptionTokenPayload = {
   newsletterId?: string;
   firstName?: string | null;
   lastName?: string | null;
+  usedAt?: string | null;
 };
 
 type UnsubscribeTokenPayload = {
@@ -436,6 +437,13 @@ const PRE_TURNSTILE_WINDOW_SECONDS = 60;
 const POST_TURNSTILE_IP_MAX_REQUESTS = 20;
 const POST_TURNSTILE_TARGET_MAX_REQUESTS = 3;
 const POST_TURNSTILE_WINDOW_SECONDS = 60 * 60;
+// 24h so links still work when the email is opened much later; the GET
+// interstitial keeps scanners from consuming tokens, so the longer window
+// adds no prefetch risk.
+const SUBSCRIPTION_TOKEN_TTL_SECONDS = 60 * 60 * 24;
+// How long a consumed token keeps resolving to the "already used" page
+// before degrading to the generic invalid/expired page.
+const USED_SUBSCRIPTION_TOKEN_TTL_SECONDS = 60 * 60 * 24;
 const MISSING_ABUSE_EVENT_TABLE_FRAGMENT = "no such table: AbuseEvent";
 const MAX_PUBLISH_REQUEST_BYTES = 5 * 1024 * 1024;
 const MAX_FROM_NAME_LENGTH = 120;
@@ -1398,6 +1406,47 @@ function parseSubscriptionToken(
   } catch {
     return null;
   }
+}
+
+type SubscriptionTokenLookup =
+  | { state: "invalid" }
+  | { state: "used" }
+  | {
+      state: "pending";
+      payload: SubscriptionTokenPayload;
+      email: string;
+      newsletterId: string;
+    };
+
+async function loadSubscriptionToken(
+  kv: KVNamespace,
+  token: string,
+  action: SubscriptionAction,
+): Promise<SubscriptionTokenLookup> {
+  const tokenString = await kv.get(token);
+  if (!tokenString) {
+    return { state: "invalid" };
+  }
+
+  const payload = parseSubscriptionToken(tokenString);
+  if (!payload || payload.action !== action) {
+    return { state: "invalid" };
+  }
+
+  // Used tokens are stored stripped of subscriber PII, so classify them
+  // before requiring the email/newsletterId fields.
+  if (typeof payload.usedAt === "string" && payload.usedAt) {
+    return { state: "used" };
+  }
+
+  const email = typeof payload.email === "string" ? payload.email : "";
+  const newsletterId =
+    typeof payload.newsletterId === "string" ? payload.newsletterId : "";
+  if (!email || !newsletterId || !isValidUuid(newsletterId)) {
+    return { state: "invalid" };
+  }
+
+  return { state: "pending", payload, email, newsletterId };
 }
 
 async function sha256Hex(input: string): Promise<string> {
@@ -3287,34 +3336,46 @@ app.delete("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
 });
 
 // Public Routes for managing Subscriptions
+//
+// Confirmation/cancellation links in emails must stay side-effect free on GET:
+// email security scanners and link prefetchers issue GETs before the human
+// clicks, so the GET renders an interstitial page and the POST (triggered by
+// the page's button) performs the actual state change.
 app.get("/api/subscribe/confirm/:token", async (c) => {
   const { token } = c.req.param();
 
   try {
-    // Validate Token and Get Email
-    const tokenString = await c.env.KV.get(token);
-    if (!tokenString) {
-      return c.json({ error: "Invalid or expired token" }, 400);
+    const lookup = await loadSubscriptionToken(c.env.KV, token, "confirm");
+    if (lookup.state === "used") {
+      return renderSubscriptionAlreadyConfirmedHtml(c);
+    }
+    if (lookup.state !== "pending") {
+      return renderConfirmLinkInvalidHtml(c);
     }
 
-    const tokenPayload = parseSubscriptionToken(tokenString);
-    if (!tokenPayload || tokenPayload.action !== "confirm") {
-      return c.json({ error: "Invalid or expired token" }, 400);
+    return renderConfirmSubscriptionFormHtml(c, token);
+  } catch (error: unknown) {
+    return internalServerError(c, "confirm-subscription-page", error);
+  }
+});
+
+app.post("/api/subscribe/confirm/:token", async (c) => {
+  const { token } = c.req.param();
+
+  try {
+    const lookup = await loadSubscriptionToken(c.env.KV, token, "confirm");
+    if (lookup.state === "used") {
+      // A replayed POST (double-click, retry) is idempotent success; keep
+      // the "already confirmed" notice for GET only.
+      return c.redirect("https://habengirma.com/subscription-successful/", 303);
+    }
+    if (lookup.state !== "pending") {
+      return renderConfirmLinkInvalidHtml(c);
     }
 
-    const email =
-      typeof tokenPayload.email === "string" ? tokenPayload.email : "";
-    const newsletterId =
-      typeof tokenPayload.newsletterId === "string"
-        ? tokenPayload.newsletterId
-        : "";
-
-    if (!email || !newsletterId || !isValidUuid(newsletterId)) {
-      return c.json({ error: "Invalid or expired token" }, 400);
-    }
-
-    const firstName = normalizeOptionalName(tokenPayload.firstName);
-    const lastName = normalizeOptionalName(tokenPayload.lastName);
+    const { email, newsletterId, payload } = lookup;
+    const firstName = normalizeOptionalName(payload.firstName);
+    const lastName = normalizeOptionalName(payload.lastName);
 
     const now = new Date().toISOString();
     // Upsert Subscription
@@ -3340,10 +3401,16 @@ app.get("/api/subscribe/confirm/:token", async (c) => {
       .bind(email, firstName, lastName, newsletterId, now, now)
       .run();
 
-    // Enforce one-time use semantics for confirmation links.
-    await c.env.KV.delete(token);
+    // Mark the token used instead of deleting it so a repeat visit can show
+    // the "already confirmed" page rather than an error. Store only the
+    // action so subscriber PII doesn't outlive its purpose in KV.
+    await c.env.KV.put(
+      token,
+      JSON.stringify({ action: "confirm", usedAt: now }),
+      { expirationTtl: USED_SUBSCRIPTION_TOKEN_TTL_SECONDS },
+    );
 
-    return c.redirect("https://habengirma.com/subscription-successful/");
+    return c.redirect("https://habengirma.com/subscription-successful/", 303);
   } catch (error: unknown) {
     return internalServerError(c, "confirm-subscription", error);
   }
@@ -3353,33 +3420,43 @@ app.get("/api/subscribe/cancel/:token", async (c) => {
   const { token } = c.req.param();
 
   try {
-    // Validate Token and Get Email
-    const tokenString = await c.env.KV.get(token);
-    if (!tokenString) {
-      return c.json({ error: "Invalid or expired token" }, 400);
+    const lookup = await loadSubscriptionToken(c.env.KV, token, "cancel");
+    if (lookup.state === "used") {
+      return renderAlreadyUnsubscribedHtml(c);
+    }
+    if (lookup.state !== "pending") {
+      return renderCancelLinkInvalidHtml(c);
     }
 
-    const tokenPayload = parseSubscriptionToken(tokenString);
-    if (!tokenPayload || tokenPayload.action !== "cancel") {
-      return c.json({ error: "Invalid or expired token" }, 400);
+    return renderCancelSubscriptionFormHtml(c, token);
+  } catch (error: unknown) {
+    return internalServerError(c, "cancel-subscription-page", error);
+  }
+});
+
+app.post("/api/subscribe/cancel/:token", async (c) => {
+  const { token } = c.req.param();
+
+  try {
+    const lookup = await loadSubscriptionToken(c.env.KV, token, "cancel");
+    if (lookup.state === "used") {
+      return renderAlreadyUnsubscribedHtml(c);
     }
-
-    const email =
-      typeof tokenPayload.email === "string" ? tokenPayload.email : "";
-    const newsletterId =
-      typeof tokenPayload.newsletterId === "string"
-        ? tokenPayload.newsletterId
-        : "";
-
-    if (!email || !newsletterId || !isValidUuid(newsletterId)) {
-      return c.json({ error: "Invalid or expired token" }, 400);
+    if (lookup.state !== "pending") {
+      return renderCancelLinkInvalidHtml(c);
     }
 
     // Update Subscription Status
-    await markSubscriberUnsubscribed(c.env.DB, email, newsletterId);
+    await markSubscriberUnsubscribed(c.env.DB, lookup.email, lookup.newsletterId);
 
-    // Enforce one-time use semantics for cancellation links.
-    await c.env.KV.delete(token);
+    // Mark the token used instead of deleting it so a repeat visit can show
+    // the "already unsubscribed" page rather than an error. Store only the
+    // action so subscriber PII doesn't outlive its purpose in KV.
+    await c.env.KV.put(
+      token,
+      JSON.stringify({ action: "cancel", usedAt: new Date().toISOString() }),
+      { expirationTtl: USED_SUBSCRIPTION_TOKEN_TTL_SECONDS },
+    );
 
     return renderHtml(c, "Unsubscribed successfully", "取消订阅成功");
   } catch (error: unknown) {
@@ -3548,7 +3625,7 @@ app.post("/api/subscribe/send-confirmation", async (c) => {
     }
 
     const token = crypto.randomUUID();
-    const expiry = 60 * 60; // 1 hour in seconds
+    const expiry = SUBSCRIPTION_TOKEN_TTL_SECONDS;
 
     // Store Token
     await c.env.KV.put(
@@ -3655,7 +3732,7 @@ app.post("/api/subscribe/send-cancellation", async (c) => {
     }
 
     const token = crypto.randomUUID();
-    const expiry = 60 * 60; // 1 hour in seconds
+    const expiry = SUBSCRIPTION_TOKEN_TTL_SECONDS;
 
     // Store Token
     await c.env.KV.put(
@@ -4242,17 +4319,27 @@ app.get("/newsletter/:newsletterId", async (c) => {
 
 // Common Functions
 
+type LocalizedText = { en: string; zh: string };
+
+function resolvePageLanguage(c: AppContext): "en" | "zh" {
+  return c.req.header("Accept-Language")?.toLowerCase().startsWith("zh")
+    ? "zh"
+    : "en";
+}
+
+// Subscription pages embed capability tokens in their URLs and vary with
+// token state, so they must never be cached or indexed.
+function setUncachedPageHeaders(c: AppContext) {
+  c.header("Cache-Control", "no-store");
+  c.header("X-Robots-Tag", "noindex");
+}
+
 function renderHtml(
   c: AppContext,
   englishMessage: string,
   chineseMessage: string = englishMessage,
 ) {
-  const language = c.req
-    .header("Accept-Language")
-    ?.toLowerCase()
-    .startsWith("zh")
-    ? "zh"
-    : "en";
+  const language = resolvePageLanguage(c);
   const message = language === "zh" ? chineseMessage : englishMessage;
   const safeMessage = escapeHtml(message);
   const html = `
@@ -4269,27 +4356,52 @@ function renderHtml(
     </html>
   `;
 
+  setUncachedPageHeaders(c);
   return c.html(html);
 }
 
-function renderUnsubscribeConfirmationHtml(c: AppContext, token: string) {
-  const language = c.req
-    .header("Accept-Language")
-    ?.toLowerCase()
-    .startsWith("zh")
-    ? "zh"
-    : "en";
-  const title =
-    language === "zh" ? "确认取消订阅" : "Confirm unsubscribe";
-  const description =
-    language === "zh"
-      ? "请选择下方按钮以取消订阅。"
-      : "Choose the button below to unsubscribe.";
-  const buttonLabel = language === "zh" ? "取消订阅" : "Unsubscribe";
-  const safeTitle = escapeHtml(title);
-  const safeDescription = escapeHtml(description);
-  const safeButtonLabel = escapeHtml(buttonLabel);
-  const safeAction = `/api/subscribe/unsubscribe/${escapeHtml(token)}`;
+function renderNoticeHtml(
+  c: AppContext,
+  title: LocalizedText,
+  description: LocalizedText,
+  status: 200 | 400 = 200,
+) {
+  const language = resolvePageLanguage(c);
+  const safeTitle = escapeHtml(title[language]);
+  const safeDescription = escapeHtml(description[language]);
+  const html = `
+    <!DOCTYPE html>
+    <html lang="${language}">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${safeTitle}</title>
+      </head>
+      <body>
+        <h1>${safeTitle}</h1>
+        <p>${safeDescription}</p>
+      </body>
+    </html>
+  `;
+
+  setUncachedPageHeaders(c);
+  return c.html(html, status);
+}
+
+function renderConfirmationFormHtml(
+  c: AppContext,
+  options: {
+    title: LocalizedText;
+    description: LocalizedText;
+    buttonLabel: LocalizedText;
+    action: string;
+  },
+) {
+  const language = resolvePageLanguage(c);
+  const safeTitle = escapeHtml(options.title[language]);
+  const safeDescription = escapeHtml(options.description[language]);
+  const safeButtonLabel = escapeHtml(options.buttonLabel[language]);
+  const safeAction = escapeHtml(options.action);
   const html = `
     <!DOCTYPE html>
     <html lang="${language}">
@@ -4308,7 +4420,92 @@ function renderUnsubscribeConfirmationHtml(c: AppContext, token: string) {
     </html>
   `;
 
+  setUncachedPageHeaders(c);
   return c.html(html);
+}
+
+function renderUnsubscribeFormHtml(c: AppContext, action: string) {
+  return renderConfirmationFormHtml(c, {
+    title: { en: "Confirm unsubscribe", zh: "确认取消订阅" },
+    description: {
+      en: "Choose the button below to unsubscribe.",
+      zh: "请选择下方按钮以取消订阅。",
+    },
+    buttonLabel: { en: "Unsubscribe", zh: "取消订阅" },
+    action,
+  });
+}
+
+function renderUnsubscribeConfirmationHtml(c: AppContext, token: string) {
+  return renderUnsubscribeFormHtml(c, `/api/subscribe/unsubscribe/${token}`);
+}
+
+function renderCancelSubscriptionFormHtml(c: AppContext, token: string) {
+  return renderUnsubscribeFormHtml(c, `/api/subscribe/cancel/${token}`);
+}
+
+function renderConfirmSubscriptionFormHtml(c: AppContext, token: string) {
+  return renderConfirmationFormHtml(c, {
+    title: { en: "Confirm your subscription", zh: "确认订阅" },
+    description: {
+      en: "Choose the button below to confirm your newsletter subscription.",
+      zh: "请选择下方按钮以确认订阅。",
+    },
+    buttonLabel: { en: "Confirm subscription", zh: "确认订阅" },
+    action: `/api/subscribe/confirm/${token}`,
+  });
+}
+
+function renderSubscriptionAlreadyConfirmedHtml(c: AppContext) {
+  return renderNoticeHtml(
+    c,
+    { en: "Subscription already confirmed", zh: "订阅已确认" },
+    {
+      en: "This confirmation link has already been used — your subscription is confirmed. No further action is needed.",
+      zh: "此确认链接已被使用，您的订阅已确认，无需进一步操作。",
+    },
+  );
+}
+
+function renderAlreadyUnsubscribedHtml(c: AppContext) {
+  return renderNoticeHtml(
+    c,
+    { en: "Already unsubscribed", zh: "已取消订阅" },
+    {
+      en: "This link has already been used — you have been unsubscribed.",
+      zh: "此链接已被使用，您已取消订阅。",
+    },
+  );
+}
+
+function renderConfirmLinkInvalidHtml(c: AppContext) {
+  return renderNoticeHtml(
+    c,
+    {
+      en: "Confirmation link is invalid or has expired",
+      zh: "确认链接无效或已过期",
+    },
+    {
+      en: "This confirmation link is invalid or has expired. Please subscribe again to receive a new confirmation email.",
+      zh: "此确认链接无效或已过期。请重新订阅以获取新的确认邮件。",
+    },
+    400,
+  );
+}
+
+function renderCancelLinkInvalidHtml(c: AppContext) {
+  return renderNoticeHtml(
+    c,
+    {
+      en: "Unsubscribe link is invalid or has expired",
+      zh: "取消订阅链接无效或已过期",
+    },
+    {
+      en: "This unsubscribe link is invalid or has expired. Please request a new unsubscribe email.",
+      zh: "此取消订阅链接无效或已过期。请重新获取取消订阅邮件。",
+    },
+    400,
+  );
 }
 
 const streamToArrayBuffer = async function (

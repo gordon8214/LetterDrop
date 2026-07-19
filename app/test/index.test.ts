@@ -194,17 +194,20 @@ type NewsletterDraftRecord = {
 
 class FakeKVNamespace {
   readonly store = new Map<string, string>()
+  readonly ttls = new Map<string, number | undefined>()
 
   async get(key: string): Promise<string | null> {
     return this.store.get(key) ?? null
   }
 
-  async put(key: string, value: string): Promise<void> {
+  async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
     this.store.set(key, value)
+    this.ttls.set(key, options?.expirationTtl)
   }
 
   async delete(key: string): Promise<void> {
     this.store.delete(key)
+    this.ttls.delete(key)
   }
 }
 
@@ -5290,8 +5293,8 @@ describe('single-use subscription tokens', () => {
     vi.restoreAllMocks()
   })
 
-  it('enforces single-use confirm tokens', async () => {
-    const { env, kv } = createEnv()
+  it('renders a confirmation page on GET without consuming the token', async () => {
+    const { env, db, kv } = createEnv()
     const token = 'confirm-token'
     await kv.put(token, JSON.stringify({
       action: 'confirm',
@@ -5299,13 +5302,63 @@ describe('single-use subscription tokens', () => {
       newsletterId: NEWSLETTER_ID,
     }))
 
-    const firstResponse = await app.request(`https://example.com/api/subscribe/confirm/${token}`, {}, env)
-    expect(firstResponse.status).toBe(302)
-    expect(firstResponse.headers.get('location')).toBe('https://habengirma.com/subscription-successful/')
+    // Scanner-style repeated GETs must never mutate state.
+    for (let i = 0; i < 3; i += 1) {
+      const response = await app.request(`https://example.com/api/subscribe/confirm/${token}`, {}, env)
+      expect(response.status).toBe(200)
+      expect(response.headers.get('cache-control')).toBe('no-store')
+      const body = await response.text()
+      expect(body).toContain('Confirm your subscription')
+      expect(body).toContain(`/api/subscribe/confirm/${token}`)
+    }
 
-    const replayResponse = await app.request(`https://example.com/api/subscribe/confirm/${token}`, {}, env)
-    expect(replayResponse.status).toBe(400)
-    await expect(replayResponse.json()).resolves.toEqual({ error: 'Invalid or expired token' })
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)).toBeUndefined()
+    expect(JSON.parse(kv.store.get(token) ?? '{}')).not.toHaveProperty('usedAt')
+  })
+
+  it('confirms on POST and shows an already-confirmed page on reuse', async () => {
+    const { env, db, kv } = createEnv()
+    const token = 'confirm-token'
+    await kv.put(token, JSON.stringify({
+      action: 'confirm',
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+    }))
+
+    const postResponse = await app.request(`https://example.com/api/subscribe/confirm/${token}`, { method: 'POST' }, env)
+    expect(postResponse.status).toBe(303)
+    expect(postResponse.headers.get('location')).toBe('https://habengirma.com/subscription-successful/')
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(1)
+
+    // The used marker keeps only the action — subscriber PII must not
+    // outlive its purpose in KV — and gets the 24h notice TTL.
+    const usedToken = JSON.parse(kv.store.get(token) ?? '{}')
+    expect(typeof usedToken.usedAt).toBe('string')
+    expect(usedToken).not.toHaveProperty('email')
+    expect(usedToken).not.toHaveProperty('firstName')
+    expect(kv.ttls.get(token)).toBe(60 * 60 * 24)
+
+    const replayGet = await app.request(`https://example.com/api/subscribe/confirm/${token}`, {}, env)
+    expect(replayGet.status).toBe(200)
+    await expect(replayGet.text()).resolves.toContain('already been used')
+
+    // A replayed POST (double-click) is idempotent success.
+    const replayPost = await app.request(`https://example.com/api/subscribe/confirm/${token}`, { method: 'POST' }, env)
+    expect(replayPost.status).toBe(303)
+    expect(replayPost.headers.get('location')).toBe('https://habengirma.com/subscription-successful/')
+  })
+
+  it('renders a friendly page for missing or expired confirm tokens', async () => {
+    const { env } = createEnv()
+
+    const getResponse = await app.request('https://example.com/api/subscribe/confirm/unknown-token', {}, env)
+    expect(getResponse.status).toBe(400)
+    expect(getResponse.headers.get('content-type')).toContain('text/html')
+    await expect(getResponse.text()).resolves.toContain('invalid or has expired')
+
+    const postResponse = await app.request('https://example.com/api/subscribe/confirm/unknown-token', { method: 'POST' }, env)
+    expect(postResponse.status).toBe(400)
+    await expect(postResponse.text()).resolves.toContain('invalid or has expired')
   })
 
   it('preserves manager notes when a subscriber confirms again', async () => {
@@ -5334,11 +5387,11 @@ describe('single-use subscription tokens', () => {
 
     const response = await app.request(
       `https://example.com/api/subscribe/confirm/${token}`,
-      {},
+      { method: 'POST' },
       env
     )
 
-    expect(response.status).toBe(302)
+    expect(response.status).toBe(303)
     expect(db.subscribers.get(subscriberKey)).toMatchObject({
       isSubscribed: 1,
       firstName: 'Updated',
@@ -5346,7 +5399,7 @@ describe('single-use subscription tokens', () => {
     })
   })
 
-  it('enforces single-use cancel tokens and preserves locale rendering', async () => {
+  it('splits cancel into GET interstitial and POST, preserving locale rendering', async () => {
     const { env, db, kv } = createEnv()
     const subscriberKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
     db.subscribers.set(subscriberKey, {
@@ -5364,16 +5417,77 @@ describe('single-use subscription tokens', () => {
       newsletterId: NEWSLETTER_ID,
     }))
 
-    const firstResponse = await app.request(`https://example.com/api/subscribe/cancel/${token}`, {
-      headers: { 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
+    const zhHeaders = { 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' }
+
+    const getResponse = await app.request(`https://example.com/api/subscribe/cancel/${token}`, {
+      headers: zhHeaders,
     }, env)
-    expect(firstResponse.status).toBe(200)
-    await expect(firstResponse.text()).resolves.toContain('取消订阅成功')
+    expect(getResponse.status).toBe(200)
+    const interstitial = await getResponse.text()
+    expect(interstitial).toContain('确认取消订阅')
+    expect(interstitial).toContain(`/api/subscribe/cancel/${token}`)
+    expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(1)
+
+    const postResponse = await app.request(`https://example.com/api/subscribe/cancel/${token}`, {
+      method: 'POST',
+      headers: zhHeaders,
+    }, env)
+    expect(postResponse.status).toBe(200)
+    await expect(postResponse.text()).resolves.toContain('取消订阅成功')
     expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(0)
 
-    const replayResponse = await app.request(`https://example.com/api/subscribe/cancel/${token}`, {}, env)
-    expect(replayResponse.status).toBe(400)
-    await expect(replayResponse.json()).resolves.toEqual({ error: 'Invalid or expired token' })
+    const usedToken = JSON.parse(kv.store.get(token) ?? '{}')
+    expect(typeof usedToken.usedAt).toBe('string')
+    expect(usedToken).not.toHaveProperty('email')
+    expect(kv.ttls.get(token)).toBe(60 * 60 * 24)
+
+    const replayResponse = await app.request(`https://example.com/api/subscribe/cancel/${token}`, {
+      method: 'POST',
+      headers: zhHeaders,
+    }, env)
+    expect(replayResponse.status).toBe(200)
+    await expect(replayResponse.text()).resolves.toContain('已取消订阅')
+
+    const replayEnglish = await app.request(`https://example.com/api/subscribe/cancel/${token}`, {}, env)
+    expect(replayEnglish.status).toBe(200)
+    await expect(replayEnglish.text()).resolves.toContain('Already unsubscribed')
+  })
+
+  it('renders a friendly page for missing or expired cancel tokens', async () => {
+    const { env } = createEnv()
+
+    const getResponse = await app.request('https://example.com/api/subscribe/cancel/unknown-token', {}, env)
+    expect(getResponse.status).toBe(400)
+    expect(getResponse.headers.get('content-type')).toContain('text/html')
+    await expect(getResponse.text()).resolves.toContain('invalid or has expired')
+
+    const postResponse = await app.request('https://example.com/api/subscribe/cancel/unknown-token', { method: 'POST' }, env)
+    expect(postResponse.status).toBe(400)
+    await expect(postResponse.text()).resolves.toContain('invalid or has expired')
+  })
+
+  it('rejects tokens presented to the wrong endpoint', async () => {
+    const { env, db, kv } = createEnv()
+    await kv.put('stray-cancel-token', JSON.stringify({
+      action: 'cancel',
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+    }))
+    await kv.put('stray-confirm-token', JSON.stringify({
+      action: 'confirm',
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+    }))
+
+    const confirmWithCancelToken = await app.request('https://example.com/api/subscribe/confirm/stray-cancel-token', { method: 'POST' }, env)
+    expect(confirmWithCancelToken.status).toBe(400)
+    await expect(confirmWithCancelToken.text()).resolves.toContain('invalid or has expired')
+
+    const cancelWithConfirmToken = await app.request('https://example.com/api/subscribe/cancel/stray-confirm-token', { method: 'POST' }, env)
+    expect(cancelWithConfirmToken.status).toBe(400)
+    await expect(cancelWithConfirmToken.text()).resolves.toContain('invalid or has expired')
+
+    expect(db.subscribers.size).toBe(0)
   })
 })
 
@@ -5482,7 +5596,7 @@ describe('anti-abuse enforcement', () => {
   })
 
   it('fails open with a clear response when AbuseEvent migration is missing', async () => {
-    const { env, notificationFetch } = createEnv({
+    const { env, notificationFetch, kv } = createEnv({
       missingAbuseEventTable: true,
     })
     vi.stubGlobal('fetch', vi.fn(async () => (
@@ -5505,5 +5619,9 @@ describe('anti-abuse enforcement', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({ message: 'Confirmation email sent' })
     expect(notificationFetch).toHaveBeenCalledTimes(1)
+
+    const [issuedToken] = [...kv.store.keys()]
+    expect(issuedToken).toBeDefined()
+    expect(kv.ttls.get(issuedToken)).toBe(60 * 60 * 24)
   })
 })
