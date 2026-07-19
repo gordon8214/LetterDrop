@@ -579,9 +579,12 @@ class FakeD1Database {
       const firstName = normalizeNameParam(params[1])
       const lastName = normalizeNameParam(params[2])
       const notes = normalizeNameParam(params[3])
-      const upsertedAt = String(params[4] ?? new Date().toISOString())
-      const originalEmail = String(params[5] ?? '')
-      const newsletterId = String(params[6] ?? '')
+      const requestedSubscriptionState = params[4] === null
+        ? null
+        : Number(params[4])
+      const upsertedAt = String(params[5] ?? new Date().toISOString())
+      const originalEmail = String(params[params.length - 2] ?? '')
+      const newsletterId = String(params[params.length - 1] ?? '')
       const originalKey = `${newsletterId}:${originalEmail}`
       const updatedKey = `${newsletterId}:${email}`
       const existing = this.subscribers.get(originalKey)
@@ -593,13 +596,26 @@ class FakeD1Database {
       }
 
       this.subscribers.delete(originalKey)
+      const isSubscribed = requestedSubscriptionState ?? existing.isSubscribed
       this.subscribers.set(updatedKey, {
         ...existing,
         email,
         firstName,
         lastName,
         notes,
+        isSubscribed,
         upsertedAt,
+        subscribedAt: requestedSubscriptionState === 1
+          ? (existing.isSubscribed === 1 ? existing.subscribedAt ?? upsertedAt : upsertedAt)
+          : existing.subscribedAt,
+        unsubscribedAt: requestedSubscriptionState === 1
+          ? null
+          : requestedSubscriptionState === 0
+            ? (existing.isSubscribed === 1
+                ? upsertedAt
+                : existing.unsubscribedAt ?? upsertedAt)
+            : existing.unsubscribedAt,
+        deletedAt: requestedSubscriptionState === 1 ? null : existing.deletedAt,
       })
       return { meta: { changes: 1 } }
     }
@@ -1671,6 +1687,64 @@ describe('admin subscriber notes', () => {
     })
   })
 
+  it('updates subscriber state and its lifecycle timestamps', async () => {
+    const { env, db } = createEnv()
+    const subscriberKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
+    const originalSubscribedAt = '2026-01-01T00:00:00.000Z'
+    db.subscribers.set(subscriberKey, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      notes: null,
+      isSubscribed: 1,
+      subscribedAt: originalSubscribedAt,
+      unsubscribedAt: null,
+      deletedAt: null,
+    })
+
+    const unsubscribeResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: SUBSCRIBER_EMAIL,
+        firstName: 'Ada',
+        lastName: 'Lovelace',
+        notes: null,
+        isSubscribed: false,
+      },
+      adminHeaders
+    )
+
+    expect(unsubscribeResponse.status).toBe(200)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      isSubscribed: 0,
+      subscribedAt: originalSubscribedAt,
+      unsubscribedAt: expect.any(String),
+    })
+
+    const resubscribeResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: SUBSCRIBER_EMAIL,
+        firstName: 'Ada',
+        lastName: 'Lovelace',
+        notes: null,
+        isSubscribed: true,
+      },
+      adminHeaders
+    )
+
+    expect(resubscribeResponse.status).toBe(200)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      isSubscribed: 1,
+      unsubscribedAt: null,
+      deletedAt: null,
+    })
+    expect(db.subscribers.get(subscriberKey)?.subscribedAt).not.toBe(originalSubscribedAt)
+  })
+
   it('rejects conflicting email changes and updates to unknown subscribers', async () => {
     const { env, db } = createEnv()
     for (const email of [SUBSCRIBER_EMAIL, 'existing@example.com']) {
@@ -1750,6 +1824,23 @@ describe('admin subscriber notes', () => {
     expect(malformedResponse.status).toBe(400)
     await expect(malformedResponse.json()).resolves.toEqual({
       error: 'firstName must be a string or null',
+    })
+
+    const malformedStatusResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}`,
+      {
+        email: SUBSCRIBER_EMAIL,
+        firstName: 'Ada',
+        lastName: 'Lovelace',
+        notes: 'Replacement context',
+        isSubscribed: 'yes',
+      },
+      adminHeaders
+    )
+    expect(malformedStatusResponse.status).toBe(400)
+    await expect(malformedStatusResponse.json()).resolves.toEqual({
+      error: 'isSubscribed must be a boolean',
     })
     expect(db.subscribers.get(subscriberKey)).toMatchObject({
       firstName: 'Ada',

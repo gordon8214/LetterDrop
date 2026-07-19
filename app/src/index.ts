@@ -3245,6 +3245,13 @@ app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
         return c.json({ error: `${field} must be a string or null` }, 400);
       }
     }
+    const hasSubscriptionState = Object.hasOwn(parsedBody.body, "isSubscribed");
+    if (hasSubscriptionState && typeof parsedBody.body.isSubscribed !== "boolean") {
+      return c.json({ error: "isSubscribed must be a boolean" }, 400);
+    }
+    const requestedSubscriptionState = hasSubscriptionState
+      ? (parsedBody.body.isSubscribed ? 1 : 0)
+      : null;
 
     const existing = await c.env.DB.prepare(
       `SELECT email FROM Subscriber
@@ -3275,7 +3282,23 @@ app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
              first_name = ?,
              last_name = ?,
              notes = ?,
-             upsertedAt = ?
+             isSubscribed = COALESCE(?, isSubscribed),
+             upsertedAt = ?,
+             subscribed_at = CASE
+               WHEN ? IS NULL OR ? = 0 THEN subscribed_at
+               WHEN isSubscribed = 1 THEN COALESCE(subscribed_at, ?)
+               ELSE ?
+             END,
+             unsubscribed_at = CASE
+               WHEN ? IS NULL THEN unsubscribed_at
+               WHEN ? = 1 THEN NULL
+               WHEN isSubscribed = 1 THEN ?
+               ELSE COALESCE(unsubscribed_at, ?)
+             END,
+             deleted_at = CASE
+               WHEN ? = 1 THEN NULL
+               ELSE deleted_at
+             END
          WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
       )
         .bind(
@@ -3283,7 +3306,17 @@ app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
           normalizeOptionalName(parsedBody.body.firstName),
           normalizeOptionalName(parsedBody.body.lastName),
           normalizeNonEmptyString(parsedBody.body.notes),
+          requestedSubscriptionState,
           now,
+          requestedSubscriptionState,
+          requestedSubscriptionState,
+          now,
+          now,
+          requestedSubscriptionState,
+          requestedSubscriptionState,
+          now,
+          now,
+          requestedSubscriptionState,
           originalEmail,
           newsletterId,
         )
