@@ -195,11 +195,36 @@ type NewsletterDraftSummary = {
   sourceMessageId: string;
   contentFileName: string;
   textFileName: string;
-  status: "draft" | "sent";
+  status: "draft" | "scheduled" | "dispatching" | "sent";
   sendId: string | null;
+  scheduledAt: string | null;
+  scheduleNextAttemptAt: string | null;
+  scheduleClaimedAt: string | null;
+  scheduleLastAttemptAt: string | null;
+  scheduleAttemptCount: number;
+  scheduleLastError: string | null;
+  scheduledContentFileName: string | null;
+  scheduledTextFileName: string | null;
+  scheduledFromName: string | null;
+  scheduledFooterHtml: string | null;
+  scheduledFooterText: string | null;
+  scheduledEmailStyleConfig: string | null;
   createdAt: string;
   updatedAt: string;
   sentAt: string | null;
+};
+
+type NewsletterScheduledSendSummary = {
+  draftId: string;
+  newsletterId: string;
+  subject: string;
+  state: "scheduled" | "dispatching";
+  scheduledAt: string;
+  nextAttemptAt: string | null;
+  attemptCount: number;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 type NewsletterDraftContent = {
@@ -208,9 +233,42 @@ type NewsletterDraftContent = {
   text: string;
 };
 
+type TrashItemKind = "newsletter" | "subscriber" | "draft";
+
+type TrashItem = {
+  kind: TrashItemKind;
+  id: string;
+  newsletterId: string;
+  title: string;
+  subtitle: string;
+  deletedAt: string;
+};
+
+type TrashDeletionCounts = {
+  newsletters: number;
+  subscribers: number;
+  drafts: number;
+};
+
+type TrashPurgeJob = {
+  kind: "newsletter" | "draft";
+  newsletterId: string;
+  itemId: string;
+  contentFileName: string | null;
+  textFileName: string | null;
+};
+
 class NewsletterDraftSourceConflictError extends Error {
   constructor() {
     super("Newsletter draft sourceMessageId is already associated with a sent draft");
+  }
+}
+
+class NewsletterScheduleConflictError extends Error {
+  constructor() {
+    super(
+      "Delivery has already started. Refresh Send Activity to see the current status.",
+    );
   }
 }
 
@@ -310,6 +368,7 @@ type NewsletterSendSummary = {
   contentFileName: string | null;
   textFileName: string | null;
   fromName: string | null;
+  scheduledAt: string | null;
   fanoutSnapshotAt: string | null;
   fanoutCursorEmail: string | null;
   fanoutCompletedAt: string | null;
@@ -459,6 +518,10 @@ const NEWSLETTER_FANOUT_PAGE_SIZE = 100;
 const NEWSLETTER_RECIPIENT_BATCH_SIZE = 25;
 const NEWSLETTER_ESTIMATED_SES_SEND_RATE_PER_SECOND = 14;
 const NEWSLETTER_QUEUE_RETRY_DELAY_SECONDS = 60;
+const NEWSLETTER_SCHEDULE_CLAIM_LIMIT = 100;
+const NEWSLETTER_SCHEDULE_DISPATCH_CONCURRENCY = 10;
+const NEWSLETTER_SCHEDULE_STALE_CLAIM_MILLISECONDS = 5 * 60 * 1_000;
+const NEWSLETTER_SCHEDULE_RETRY_MINUTES = [1, 2, 5, 10, 15] as const;
 const NEWSLETTER_SEND_RECIPIENT_SEARCH_MAX_BYTES = 256;
 const EMAIL_STYLE_ELEMENT_ID = "letterdrop-global-email-styles";
 const EMAIL_CONTENT_START_MARKER = "<!-- letterdrop-content-start -->";
@@ -2086,11 +2149,14 @@ app.put("/api/newsletter/:newsletterId/offline", async (c) => {
   const { newsletterId } = c.req.param();
 
   try {
-    await c.env.DB.prepare(
-      `UPDATE Newsletter SET subscribable = ? WHERE id = ?`,
+    const result = await c.env.DB.prepare(
+      `UPDATE Newsletter SET subscribable = ? WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(0, newsletterId)
       .run();
+    if ((result.meta.changes ?? 0) === 0) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
 
     return c.json({ message: "Newsletter taken offline successfully" });
   } catch (error: unknown) {
@@ -2102,11 +2168,14 @@ app.put("/api/newsletter/:newsletterId/online", async (c) => {
   const { newsletterId } = c.req.param();
 
   try {
-    await c.env.DB.prepare(
-      `UPDATE Newsletter SET subscribable = ? WHERE id = ?`,
+    const result = await c.env.DB.prepare(
+      `UPDATE Newsletter SET subscribable = ? WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(1, newsletterId)
       .run();
+    if ((result.meta.changes ?? 0) === 0) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
 
     return c.json({ message: "Newsletter brought online successfully" });
   } catch (error: unknown) {
@@ -2123,14 +2192,18 @@ app.get("/api/newsletter", async (c) => {
 
   try {
     const countResult = await c.env.DB.prepare(
-      `SELECT COUNT(*) as total FROM Newsletter`,
+      `SELECT COUNT(*) as total FROM Newsletter WHERE deletedAt IS NULL`,
     ).first<{ total: number }>();
     const total = countResult?.total ?? 0;
 
     const { results } = await c.env.DB.prepare(
       `SELECT n.*, COUNT(s.email) as subscriberCount
        FROM Newsletter n
-       LEFT JOIN Subscriber s ON n.id = s.newsletter_id AND s.isSubscribed = 1
+       LEFT JOIN Subscriber s
+         ON n.id = s.newsletter_id
+        AND s.isSubscribed = 1
+        AND s.deleted_at IS NULL
+       WHERE n.deletedAt IS NULL
        GROUP BY n.id
        ORDER BY n.createdAt DESC
        LIMIT ? OFFSET ?`,
@@ -2143,6 +2216,180 @@ app.get("/api/newsletter", async (c) => {
     return internalServerError(c, "list-newsletters", error);
   }
 });
+
+app.get("/api/newsletter/trash", async (c) => {
+  const { page, limit, offset } = parsePagination({
+    page: c.req.query("page"),
+    limit: c.req.query("limit"),
+  });
+
+  try {
+    const { items, total } = await listTrashItems(c.env.DB, limit, offset);
+    return c.json({ items, pagination: { page, limit, total } });
+  } catch (error: unknown) {
+    return internalServerError(c, "list-trash", error);
+  }
+});
+
+app.delete("/api/newsletter/trash", async (c) => {
+  try {
+    const deleted = await emptyTrash(c.env);
+    return c.json({ message: "Trash emptied successfully", deleted });
+  } catch (error: unknown) {
+    return internalServerError(c, "empty-trash", error);
+  }
+});
+
+app.post("/api/newsletter/trash/newsletters/:newsletterId/restore", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+
+  try {
+    const result = await c.env.DB.prepare(
+      `UPDATE Newsletter SET deletedAt = NULL WHERE id = ? AND deletedAt IS NOT NULL`,
+    )
+      .bind(newsletterId)
+      .run();
+    if ((result.meta.changes ?? 0) === 0) {
+      return c.json({ error: "Trashed newsletter not found" }, 404);
+    }
+    return c.json({ message: "Newsletter restored successfully" });
+  } catch (error: unknown) {
+    return internalServerError(c, "restore-newsletter", error);
+  }
+});
+
+app.delete("/api/newsletter/trash/newsletters/:newsletterId", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+
+  try {
+    if (!(await purgeTrashedNewsletter(c.env, newsletterId))) {
+      return c.json({ error: "Trashed newsletter not found" }, 404);
+    }
+    return c.json({ message: "Newsletter permanently deleted" });
+  } catch (error: unknown) {
+    return internalServerError(c, "purge-newsletter", error);
+  }
+});
+
+app.post(
+  "/api/newsletter/trash/newsletters/:newsletterId/drafts/:draftId/restore",
+  async (c) => {
+    const { newsletterId, draftId } = c.req.param();
+    if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+      return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+    }
+
+    try {
+      const result = await c.env.DB.prepare(
+        `UPDATE NewsletterDraft
+         SET deletedAt = NULL
+         WHERE id = ? AND newsletter_id = ? AND deletedAt IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM Newsletter
+             WHERE id = ? AND deletedAt IS NULL
+           )`,
+      )
+        .bind(draftId, newsletterId, newsletterId)
+        .run();
+      if ((result.meta.changes ?? 0) === 0) {
+        return c.json({ error: "Trashed newsletter draft not found" }, 404);
+      }
+      return c.json({ message: "Newsletter draft restored successfully" });
+    } catch (error: unknown) {
+      if (isNewsletterDraftSourceUniqueError(error)) {
+        return c.json(
+          { error: "A draft with the same source message already exists" },
+          409,
+        );
+      }
+      return internalServerError(c, "restore-newsletter-draft", error);
+    }
+  },
+);
+
+app.delete(
+  "/api/newsletter/trash/newsletters/:newsletterId/drafts/:draftId",
+  async (c) => {
+    const { newsletterId, draftId } = c.req.param();
+    if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+      return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+    }
+
+    try {
+      if (!(await purgeTrashedDraft(c.env, newsletterId, draftId))) {
+        return c.json({ error: "Trashed newsletter draft not found" }, 404);
+      }
+      return c.json({ message: "Newsletter draft permanently deleted" });
+    } catch (error: unknown) {
+      return internalServerError(c, "purge-newsletter-draft", error);
+    }
+  },
+);
+
+app.post(
+  "/api/newsletter/trash/newsletters/:newsletterId/subscribers/:email/restore",
+  async (c) => {
+    const { newsletterId, email } = c.req.param();
+    if (!isValidUuid(newsletterId)) {
+      return c.json({ error: "Invalid newsletterId" }, 400);
+    }
+
+    try {
+      const result = await c.env.DB.prepare(
+        `UPDATE Subscriber
+         SET deleted_at = NULL
+         WHERE email = ? AND newsletter_id = ? AND deleted_at IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM Newsletter
+             WHERE id = ? AND deletedAt IS NULL
+           )`,
+      )
+        .bind(email, newsletterId, newsletterId)
+        .run();
+      if ((result.meta.changes ?? 0) === 0) {
+        return c.json({ error: "Trashed subscriber not found" }, 404);
+      }
+      return c.json({ message: "Subscriber restored successfully" });
+    } catch (error: unknown) {
+      return internalServerError(c, "restore-subscriber", error);
+    }
+  },
+);
+
+app.delete(
+  "/api/newsletter/trash/newsletters/:newsletterId/subscribers/:email",
+  async (c) => {
+    const { newsletterId, email } = c.req.param();
+    if (!isValidUuid(newsletterId)) {
+      return c.json({ error: "Invalid newsletterId" }, 400);
+    }
+
+    try {
+      const result = await c.env.DB.prepare(
+        `DELETE FROM Subscriber
+         WHERE email = ? AND newsletter_id = ? AND deleted_at IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM Newsletter
+             WHERE id = ? AND deletedAt IS NULL
+           )`,
+      )
+        .bind(email, newsletterId, newsletterId)
+        .run();
+      if ((result.meta.changes ?? 0) === 0) {
+        return c.json({ error: "Trashed subscriber not found" }, 404);
+      }
+      return c.json({ message: "Subscriber permanently deleted" });
+    } catch (error: unknown) {
+      return internalServerError(c, "purge-subscriber", error);
+    }
+  },
+);
 
 app.get("/api/newsletter/publish-config", async (c) => {
   const emailAddress = normalizeEmail(c.env.PUBLISH_EMAIL_ADDRESS);
@@ -2288,7 +2535,7 @@ app.post("/api/newsletter/:newsletterId/publish/dry-run", async (c) => {
 
   try {
     const newsletter = await c.env.DB.prepare(
-      `SELECT id FROM Newsletter WHERE id = ?`,
+      `SELECT id FROM Newsletter WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(newsletterId)
       .first<{ id: string }>();
@@ -2366,7 +2613,7 @@ app.post("/api/newsletter/:newsletterId/publish", async (c) => {
 
   try {
     const newsletter = await c.env.DB.prepare(
-      `SELECT id FROM Newsletter WHERE id = ?`,
+      `SELECT id FROM Newsletter WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(newsletterId)
       .first<{ id: string }>();
@@ -2417,6 +2664,9 @@ app.get("/api/newsletter/:newsletterId/sends", async (c) => {
   }
 
   try {
+    if (!(await newsletterExists(c.env.DB, newsletterId))) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
     const sends = await listNewsletterSendSummaries(c.env.DB, newsletterId);
     return c.json({ sends });
   } catch (error: unknown) {
@@ -2431,8 +2681,8 @@ app.get("/api/newsletter/:newsletterId/sends/:sendId", async (c) => {
   }
 
   try {
-    const send = await getNewsletterSendSummary(c.env.DB, sendId);
-    if (!send || send.newsletterId !== newsletterId) {
+    const send = await getActiveNewsletterSendSummary(c.env.DB, newsletterId, sendId);
+    if (!send) {
       return c.json({ error: "Newsletter send not found" }, 404);
     }
     const recipientPage = await getNewsletterSendRecipientsPage(c.env.DB, sendId);
@@ -2457,8 +2707,8 @@ app.get("/api/newsletter/:newsletterId/sends/:sendId/recipients", async (c) => {
   }
 
   try {
-    const send = await getNewsletterSendSummary(c.env.DB, sendId);
-    if (!send || send.newsletterId !== newsletterId) {
+    const send = await getActiveNewsletterSendSummary(c.env.DB, newsletterId, sendId);
+    if (!send) {
       return c.json({ error: "Newsletter send not found" }, 404);
     }
     const rawStatus = c.req.query("status");
@@ -2497,8 +2747,8 @@ app.get("/api/newsletter/:newsletterId/sends/:sendId/events", async (c) => {
   }
 
   try {
-    const send = await getNewsletterSendSummary(c.env.DB, sendId);
-    if (!send || send.newsletterId !== newsletterId) {
+    const send = await getActiveNewsletterSendSummary(c.env.DB, newsletterId, sendId);
+    if (!send) {
       return c.json({ error: "Newsletter send not found" }, 404);
     }
     const afterEventId = Math.max(
@@ -2540,8 +2790,8 @@ app.get("/api/newsletter/:newsletterId/sends/:sendId/stream", async (c) => {
   }
 
   try {
-    const send = await getNewsletterSendSummary(c.env.DB, sendId);
-    if (!send || send.newsletterId !== newsletterId) {
+    const send = await getActiveNewsletterSendSummary(c.env.DB, newsletterId, sendId);
+    if (!send) {
       return c.json({ error: "Newsletter send not found" }, 404);
     }
     const afterEventId = Math.max(
@@ -2628,7 +2878,11 @@ app.get("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
 
   try {
     const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
-    if (!draft || draft.newsletterId !== newsletterId || draft.status !== "draft") {
+    if (
+      !draft ||
+      draft.newsletterId !== newsletterId ||
+      draft.status === "sent"
+    ) {
       return c.json({ error: "Newsletter draft not found" }, 404);
     }
     const content = await getNewsletterDraftContent(c.env, draft);
@@ -2652,7 +2906,10 @@ app.put("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
     if (!draft || draft.newsletterId !== newsletterId) {
       return c.json({ error: "Newsletter draft not found" }, 404);
     }
-    if (draft.status !== "draft") {
+    if (draft.status === "dispatching") {
+      return c.json({ error: new NewsletterScheduleConflictError().message }, 409);
+    }
+    if (draft.status === "sent") {
       return c.json({ error: "Newsletter draft has already been sent" }, 409);
     }
     const content = await getNewsletterDraftContent(c.env, draft);
@@ -2677,9 +2934,226 @@ app.put("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
     });
     return c.json({ draft: updated, html: html.value, text: text.value });
   } catch (error: unknown) {
+    if (error instanceof NewsletterScheduleConflictError) {
+      return c.json({ error: error.message }, 409);
+    }
     return internalServerError(c, "update-newsletter-draft", error);
   }
 });
+
+app.post("/api/newsletter/:newsletterId/drafts/:draftId/schedule", async (c) => {
+  const { newsletterId, draftId } = c.req.param();
+  if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+    return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+  }
+
+  try {
+    const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+    if (!draft || draft.newsletterId !== newsletterId) {
+      return c.json({ error: "Newsletter draft not found" }, 404);
+    }
+    if (draft.status === "dispatching") {
+      return c.json({ error: new NewsletterScheduleConflictError().message }, 409);
+    }
+    if (draft.status === "sent") {
+      return c.json({ error: "Newsletter draft has already been sent" }, 409);
+    }
+
+    const parsedBody = await readLimitedJsonObject(c);
+    if (!parsedBody.ok) {
+      return parsedBody.response;
+    }
+    const body = parsedBody.body;
+    const sourceMessageId = normalizeNonEmptyString(body.sourceMessageId);
+    if (!sourceMessageId) {
+      return c.json({ error: "sourceMessageId is required" }, 400);
+    }
+    if (sourceMessageId !== draft.sourceMessageId) {
+      return c.json({ error: "sourceMessageId does not match the draft" }, 409);
+    }
+    const subject = draftStringField(body, "subject", draft.subject);
+    const html = draftStringField(body, "html", "");
+    const text = draftStringField(body, "text", "");
+    const scheduledAt = parseFutureScheduledAt(body.scheduledAt);
+    if (!subject.ok) return c.json({ error: subject.error }, 400);
+    if (!html.ok) return c.json({ error: html.error }, 400);
+    if (!text.ok) return c.json({ error: text.error }, 400);
+    if (!scheduledAt.ok) return c.json({ error: scheduledAt.error }, 400);
+    if (subject.value.trim().length === 0) {
+      return c.json({ error: "Subject is required" }, 400);
+    }
+    if (html.value.trim().length === 0 || text.value.trim().length === 0) {
+      return c.json({ error: "Email html and text are required" }, 400);
+    }
+
+    const scheduled = await scheduleNewsletterDraft(c.env, draft, {
+      subject: subject.value.trim(),
+      html: html.value,
+      text: text.value,
+      scheduledAt: scheduledAt.value,
+    });
+    return c.json({ scheduledSend: mapNewsletterScheduledSendSummary(scheduled) });
+  } catch (error: unknown) {
+    if (
+      error instanceof NewsletterScheduleConflictError ||
+      error instanceof NewsletterDraftSourceConflictError
+    ) {
+      return c.json({ error: error.message }, 409);
+    }
+    return internalServerError(c, "schedule-newsletter-draft", error);
+  }
+});
+
+app.get("/api/newsletter/:newsletterId/scheduled-sends", async (c) => {
+  const { newsletterId } = c.req.param();
+  if (!isValidUuid(newsletterId)) {
+    return c.json({ error: "Invalid newsletterId" }, 400);
+  }
+  try {
+    if (!(await newsletterExists(c.env.DB, newsletterId))) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
+    const scheduledSends = await listNewsletterScheduledSendSummaries(
+      c.env.DB,
+      newsletterId,
+    );
+    return c.json({ scheduledSends });
+  } catch (error: unknown) {
+    return internalServerError(c, "list-scheduled-newsletter-sends", error);
+  }
+});
+
+app.patch(
+  "/api/newsletter/:newsletterId/scheduled-sends/:draftId",
+  async (c) => {
+    const { newsletterId, draftId } = c.req.param();
+    if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+      return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+    }
+    try {
+      const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+      if (!draft || draft.newsletterId !== newsletterId) {
+        return c.json({ error: "Scheduled send not found" }, 404);
+      }
+      if (draft.status === "dispatching") {
+        return c.json({ error: new NewsletterScheduleConflictError().message }, 409);
+      }
+      if (draft.status !== "scheduled") {
+        return c.json({ error: "Scheduled send not found" }, 404);
+      }
+      const parsedBody = await readLimitedJsonObject(c);
+      if (!parsedBody.ok) {
+        return parsedBody.response;
+      }
+      const scheduledAt = parseFutureScheduledAt(parsedBody.body.scheduledAt);
+      if (!scheduledAt.ok) {
+        return c.json({ error: scheduledAt.error }, 400);
+      }
+      const updated = await rescheduleNewsletterDraft(
+        c.env.DB,
+        draftId,
+        scheduledAt.value,
+      );
+      return c.json({ scheduledSend: mapNewsletterScheduledSendSummary(updated) });
+    } catch (error: unknown) {
+      if (error instanceof NewsletterScheduleConflictError) {
+        return c.json({ error: error.message }, 409);
+      }
+      return internalServerError(c, "reschedule-newsletter-send", error);
+    }
+  },
+);
+
+app.delete(
+  "/api/newsletter/:newsletterId/scheduled-sends/:draftId",
+  async (c) => {
+    const { newsletterId, draftId } = c.req.param();
+    if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+      return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+    }
+    try {
+      const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+      if (!draft || draft.newsletterId !== newsletterId) {
+        return c.json({ error: "Scheduled send not found" }, 404);
+      }
+      if (draft.status === "dispatching") {
+        return c.json({ error: new NewsletterScheduleConflictError().message }, 409);
+      }
+      if (draft.status !== "scheduled") {
+        return c.json({ error: "Scheduled send not found" }, 404);
+      }
+      const cancelled = await cancelScheduledNewsletterDraft(c.env, draft);
+      const content = await getNewsletterDraftContent(c.env, cancelled);
+      if (!content) {
+        return c.json({ error: "Newsletter draft content not found" }, 404);
+      }
+      return c.json(content);
+    } catch (error: unknown) {
+      if (error instanceof NewsletterScheduleConflictError) {
+        return c.json({ error: error.message }, 409);
+      }
+      return internalServerError(c, "cancel-scheduled-newsletter-send", error);
+    }
+  },
+);
+
+app.post(
+  "/api/newsletter/:newsletterId/scheduled-sends/:draftId/send-now",
+  async (c) => {
+    const { newsletterId, draftId } = c.req.param();
+    if (!isValidUuid(newsletterId) || !isValidUuid(draftId)) {
+      return c.json({ error: "Invalid newsletterId or draftId" }, 400);
+    }
+    try {
+      const draft = await getNewsletterDraftSummary(c.env.DB, draftId);
+      if (!draft || draft.newsletterId !== newsletterId) {
+        return c.json({ error: "Scheduled send not found" }, 404);
+      }
+      if (draft.status === "dispatching") {
+        return c.json({ error: new NewsletterScheduleConflictError().message }, 409);
+      }
+      if (draft.status !== "scheduled") {
+        return c.json({ error: "Scheduled send not found" }, 404);
+      }
+      const claimed = await claimNewsletterSchedule(
+        c.env.DB,
+        draftId,
+        new Date().toISOString(),
+        true,
+      );
+      if (!claimed) {
+        return c.json({ error: new NewsletterScheduleConflictError().message }, 409);
+      }
+      try {
+        const result = await dispatchClaimedNewsletterSchedule(c.env, claimed);
+        return c.json({
+          newsletterId: result.newsletterId,
+          subject: result.subject,
+          fileName: result.fileName,
+          textFileName: result.textFileName,
+          sendId: result.sendId,
+          send: result.send,
+          recipientCount: result.recipientCount,
+          queuedCount: result.queuedCount,
+          queueFailedCount: result.queueFailedCount ?? 0,
+          duplicate: result.duplicate,
+        });
+      } catch (error: unknown) {
+        logError("send-scheduled-newsletter-now", error);
+        await releaseNewsletterScheduleClaim(c.env.DB, claimed, error);
+        return c.json(
+          {
+            error:
+              "Send Now could not start delivery. The schedule will retry automatically.",
+          },
+          503,
+        );
+      }
+    } catch (error: unknown) {
+      return internalServerError(c, "send-scheduled-newsletter-now", error);
+    }
+  },
+);
 
 app.delete("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
   const { newsletterId, draftId } = c.req.param();
@@ -2692,14 +3166,18 @@ app.delete("/api/newsletter/:newsletterId/drafts/:draftId", async (c) => {
     if (!draft || draft.newsletterId !== newsletterId || draft.status !== "draft") {
       return c.json({ error: "Newsletter draft not found" }, 404);
     }
-    await c.env.DB.prepare(`DELETE FROM NewsletterDraft WHERE id = ?`)
-      .bind(draftId)
+    const result = await c.env.DB.prepare(
+      `UPDATE NewsletterDraft
+       SET deletedAt = ?
+       WHERE id = ? AND newsletter_id = ? AND status = 'draft'
+         AND deletedAt IS NULL`,
+    )
+      .bind(new Date().toISOString(), draftId, newsletterId)
       .run();
-    await Promise.allSettled([
-      c.env.R2.delete(draft.contentFileName),
-      c.env.R2.delete(draft.textFileName),
-    ]);
-    return c.json({ message: "Newsletter draft deleted successfully" });
+    if ((result.meta.changes ?? 0) === 0) {
+      return c.json({ error: "Newsletter draft not found" }, 404);
+    }
+    return c.json({ message: "Newsletter draft moved to Trash successfully" });
   } catch (error: unknown) {
     return internalServerError(c, "delete-newsletter-draft", error);
   }
@@ -2781,8 +3259,8 @@ app.get("/api/newsletter/:newsletterId/sends/:sendId/content", async (c) => {
   }
 
   try {
-    const send = await getNewsletterSendSummary(c.env.DB, sendId);
-    if (!send || send.newsletterId !== newsletterId) {
+    const send = await getActiveNewsletterSendSummary(c.env.DB, newsletterId, sendId);
+    if (!send) {
       return c.json({ error: "Newsletter send not found" }, 404);
     }
     const [html, text] = await Promise.all([
@@ -2805,8 +3283,8 @@ app.post("/api/newsletter/:newsletterId/sends/:sendId/draft", async (c) => {
   }
 
   try {
-    const send = await getNewsletterSendSummary(c.env.DB, sendId);
-    if (!send || send.newsletterId !== newsletterId) {
+    const send = await getActiveNewsletterSendSummary(c.env.DB, newsletterId, sendId);
+    if (!send) {
       return c.json({ error: "Newsletter send not found" }, 404);
     }
     const [html, text] = await Promise.all([
@@ -2895,8 +3373,11 @@ app.get("/api/newsletter/:newsletterId", async (c) => {
     const newsletter = await c.env.DB.prepare(
       `SELECT n.*, COUNT(s.email) as subscriberCount
        FROM Newsletter n
-       LEFT JOIN Subscriber s ON n.id = s.newsletter_id AND s.isSubscribed = 1
-       WHERE n.id = ?
+       LEFT JOIN Subscriber s
+         ON n.id = s.newsletter_id
+        AND s.isSubscribed = 1
+        AND s.deleted_at IS NULL
+       WHERE n.id = ? AND n.deletedAt IS NULL
        GROUP BY n.id`,
     )
       .bind(newsletterId)
@@ -2923,7 +3404,7 @@ app.put("/api/newsletter/:newsletterId", async (c) => {
 
   try {
     const existing = await c.env.DB.prepare(
-      `SELECT * FROM Newsletter WHERE id = ?`,
+      `SELECT * FROM Newsletter WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(newsletterId)
       .first();
@@ -2939,7 +3420,9 @@ app.put("/api/newsletter/:newsletterId", async (c) => {
     const updatedAt = new Date().toISOString();
 
     await c.env.DB.prepare(
-      `UPDATE Newsletter SET title = ?, description = ?, logo = ?, updatedAt = ? WHERE id = ?`,
+      `UPDATE Newsletter
+       SET title = ?, description = ?, logo = ?, updatedAt = ?
+       WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(title, description, logo, updatedAt, newsletterId)
       .run();
@@ -2950,7 +3433,9 @@ app.put("/api/newsletter/:newsletterId", async (c) => {
     );
 
     const subscriberCount = await c.env.DB.prepare(
-      `SELECT COUNT(*) as count FROM Subscriber WHERE newsletter_id = ? AND isSubscribed = 1`,
+      `SELECT COUNT(*) as count
+       FROM Subscriber
+       WHERE newsletter_id = ? AND isSubscribed = 1 AND deleted_at IS NULL`,
     )
       .bind(newsletterId)
       .first<{ count: number }>();
@@ -2970,53 +3455,47 @@ app.put("/api/newsletter/:newsletterId", async (c) => {
   }
 });
 
-// Delete newsletter + subscribers + R2 cleanup
+// Move a newsletter to Trash. Child content remains intact for restoration.
 app.delete("/api/newsletter/:newsletterId", async (c) => {
   const { newsletterId } = c.req.param();
 
   try {
-    const existing = await c.env.DB.prepare(
-      `SELECT id FROM Newsletter WHERE id = ?`,
+    const result = await c.env.DB.prepare(
+      `UPDATE Newsletter
+       SET deletedAt = ?
+       WHERE id = ? AND deletedAt IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM NewsletterDraft
+           WHERE newsletter_id = Newsletter.id
+             AND status IN ('scheduled', 'dispatching')
+             AND deletedAt IS NULL
+         )`,
     )
-      .bind(newsletterId)
-      .first();
+      .bind(new Date().toISOString(), newsletterId)
+      .run();
 
-    if (!existing) {
+    if ((result.meta.changes ?? 0) === 0) {
+      const activeSchedule = await c.env.DB.prepare(
+        `SELECT id
+         FROM NewsletterDraft
+         WHERE newsletter_id = ?
+           AND status IN ('scheduled', 'dispatching')
+           AND deletedAt IS NULL
+         LIMIT 1`,
+      )
+        .bind(newsletterId)
+        .first();
+      if (activeSchedule) {
+        return c.json(
+          { error: "Cancel or send all scheduled messages before deleting this newsletter." },
+          409,
+        );
+      }
       return c.json({ error: "Newsletter not found" }, 404);
     }
 
-    await c.env.DB.batch([
-      c.env.DB.prepare(`DELETE FROM NewsletterDraft WHERE newsletter_id = ?`).bind(
-        newsletterId,
-      ),
-      c.env.DB.prepare(`DELETE FROM Subscriber WHERE newsletter_id = ?`).bind(
-        newsletterId,
-      ),
-      c.env.DB.prepare(`DELETE FROM Newsletter WHERE id = ?`).bind(
-        newsletterId,
-      ),
-    ]);
-
-    // Best-effort R2 cleanup with cursor pagination
-    try {
-      let cursor: string | undefined;
-      do {
-        const objects = await c.env.R2.list({
-          prefix: `newsletters/${newsletterId}/`,
-          cursor,
-        });
-        if (objects.objects.length > 0) {
-          await Promise.all(
-            objects.objects.map((obj) => c.env.R2.delete(obj.key)),
-          );
-        }
-        cursor = objects.truncated ? objects.cursor : undefined;
-      } while (cursor);
-    } catch {
-      // R2 cleanup is best-effort
-    }
-
-    return c.json({ message: "Newsletter deleted successfully" });
+    return c.json({ message: "Newsletter moved to Trash successfully" });
   } catch (error: unknown) {
     return internalServerError(c, "delete-newsletter", error);
   }
@@ -3035,7 +3514,7 @@ app.get("/api/newsletter/:newsletterId/subscribers", async (c) => {
 
   try {
     const newsletter = await c.env.DB.prepare(
-      `SELECT id FROM Newsletter WHERE id = ?`,
+      `SELECT id FROM Newsletter WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(newsletterId)
       .first();
@@ -3135,7 +3614,7 @@ async function upsertAdminSubscribers(
 
   try {
     const newsletter = await c.env.DB.prepare(
-      `SELECT id FROM Newsletter WHERE id = ?`,
+      `SELECT id FROM Newsletter WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(newsletterId)
       .first();
@@ -3222,6 +3701,9 @@ app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
   }
 
   try {
+    if (!(await newsletterExists(c.env.DB, newsletterId))) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
     const parsedBody = await readLimitedJsonObject(c);
     if (!parsedBody.ok) {
       return parsedBody.response;
@@ -3340,8 +3822,12 @@ app.delete("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
   const { newsletterId, email } = c.req.param();
 
   try {
+    if (!(await newsletterExists(c.env.DB, newsletterId))) {
+      return c.json({ error: "Newsletter not found" }, 404);
+    }
     const subscriber = await c.env.DB.prepare(
-      `SELECT email FROM Subscriber WHERE email = ? AND newsletter_id = ?`,
+      `SELECT email FROM Subscriber
+       WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
     )
       .bind(email, newsletterId)
       .first();
@@ -3357,12 +3843,12 @@ app.delete("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
            upsertedAt = ?,
            unsubscribed_at = COALESCE(unsubscribed_at, ?),
            deleted_at = ?
-       WHERE email = ? AND newsletter_id = ?`,
+       WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
     )
       .bind(now, now, now, email, newsletterId)
       .run();
 
-    return c.json({ message: "Subscriber removed successfully" });
+    return c.json({ message: "Subscriber moved to Trash successfully" });
   } catch (error: unknown) {
     return internalServerError(c, "delete-subscriber", error);
   }
@@ -3385,6 +3871,9 @@ app.get("/api/subscribe/confirm/:token", async (c) => {
     if (lookup.state !== "pending") {
       return renderConfirmLinkInvalidHtml(c);
     }
+    if (!(await newsletterExists(c.env.DB, lookup.newsletterId))) {
+      return renderConfirmLinkInvalidHtml(c);
+    }
 
     return renderConfirmSubscriptionFormHtml(c, token);
   } catch (error: unknown) {
@@ -3403,6 +3892,9 @@ app.post("/api/subscribe/confirm/:token", async (c) => {
       return c.redirect("https://habengirma.com/subscription-successful/", 303);
     }
     if (lookup.state !== "pending") {
+      return renderConfirmLinkInvalidHtml(c);
+    }
+    if (!(await newsletterExists(c.env.DB, lookup.newsletterId))) {
       return renderConfirmLinkInvalidHtml(c);
     }
 
@@ -3624,7 +4116,7 @@ app.post("/api/subscribe/send-confirmation", async (c) => {
     }
 
     const newsletter = await c.env.DB.prepare(
-      `SELECT id, subscribable FROM Newsletter WHERE id = ?`,
+      `SELECT id, subscribable FROM Newsletter WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(newsletterId)
       .first<{ id: string; subscribable: number }>();
@@ -4148,7 +4640,7 @@ app.get("/newsletter/:newsletterId", async (c) => {
 
   try {
     const newsletter = await c.env.DB.prepare(
-      `SELECT * FROM Newsletter WHERE id = ?`,
+      `SELECT * FROM Newsletter WHERE id = ? AND deletedAt IS NULL`,
     )
       .bind(newsletterId)
       .first();
@@ -4882,6 +5374,7 @@ function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendS
     contentFileName: asNullableString(row.contentFileName ?? row.content_file_name),
     textFileName: asNullableString(row.textFileName ?? row.text_file_name),
     fromName: asNullableString(row.fromName ?? row.from_name),
+    scheduledAt: asNullableString(row.scheduledAt ?? row.scheduled_at),
     fanoutSnapshotAt: asNullableString(row.fanoutSnapshotAt ?? row.fanout_snapshot_at),
     fanoutCursorEmail: asNullableString(row.fanoutCursorEmail ?? row.fanout_cursor_email),
     fanoutCompletedAt: asNullableString(row.fanoutCompletedAt ?? row.fanout_completed_at),
@@ -4892,7 +5385,10 @@ function mapNewsletterSendSummary(row: Record<string, unknown>): NewsletterSendS
 }
 
 function mapNewsletterDraftSummary(row: Record<string, unknown>): NewsletterDraftSummary {
-  const status = String(row.status ?? "draft") === "sent" ? "sent" : "draft";
+  const rawStatus = String(row.status ?? "draft");
+  const status = rawStatus === "scheduled" || rawStatus === "dispatching" || rawStatus === "sent"
+    ? rawStatus
+    : "draft";
   return {
     id: String(row.id ?? ""),
     newsletterId: String(row.newsletterId ?? row.newsletter_id ?? ""),
@@ -4902,10 +5398,409 @@ function mapNewsletterDraftSummary(row: Record<string, unknown>): NewsletterDraf
     textFileName: String(row.textFileName ?? row.text_file_name ?? ""),
     status,
     sendId: asNullableString(row.sendId ?? row.send_id),
+    scheduledAt: asNullableString(row.scheduledAt ?? row.scheduled_at),
+    scheduleNextAttemptAt: asNullableString(
+      row.scheduleNextAttemptAt ?? row.schedule_next_attempt_at,
+    ),
+    scheduleClaimedAt: asNullableString(row.scheduleClaimedAt ?? row.schedule_claimed_at),
+    scheduleLastAttemptAt: asNullableString(
+      row.scheduleLastAttemptAt ?? row.schedule_last_attempt_at,
+    ),
+    scheduleAttemptCount: asNumber(
+      row.scheduleAttemptCount ?? row.schedule_attempt_count,
+    ),
+    scheduleLastError: asNullableString(row.scheduleLastError ?? row.schedule_last_error),
+    scheduledContentFileName: asNullableString(
+      row.scheduledContentFileName ?? row.scheduled_content_file_name,
+    ),
+    scheduledTextFileName: asNullableString(
+      row.scheduledTextFileName ?? row.scheduled_text_file_name,
+    ),
+    scheduledFromName: asNullableString(row.scheduledFromName ?? row.scheduled_from_name),
+    scheduledFooterHtml: asNullableString(
+      row.scheduledFooterHtml ?? row.scheduled_footer_html,
+    ),
+    scheduledFooterText: asNullableString(
+      row.scheduledFooterText ?? row.scheduled_footer_text,
+    ),
+    scheduledEmailStyleConfig: asNullableString(
+      row.scheduledEmailStyleConfig ?? row.scheduled_email_style_config,
+    ),
     createdAt: String(row.createdAt ?? ""),
     updatedAt: String(row.updatedAt ?? ""),
     sentAt: asNullableString(row.sentAt ?? row.sent_at),
   };
+}
+
+function mapNewsletterScheduledSendSummary(
+  draft: NewsletterDraftSummary,
+): NewsletterScheduledSendSummary {
+  if (
+    (draft.status !== "scheduled" && draft.status !== "dispatching") ||
+    !draft.scheduledAt
+  ) {
+    throw new Error(`Draft ${draft.id} is not an active scheduled send`);
+  }
+  return {
+    draftId: draft.id,
+    newsletterId: draft.newsletterId,
+    subject: draft.subject,
+    state: draft.status,
+    scheduledAt: draft.scheduledAt,
+    nextAttemptAt: draft.scheduleNextAttemptAt,
+    attemptCount: draft.scheduleAttemptCount,
+    lastError: draft.scheduleLastError,
+    createdAt: draft.createdAt,
+    updatedAt: draft.updatedAt,
+  };
+}
+
+function mapTrashItem(row: Record<string, unknown>): TrashItem {
+  return {
+    kind: String(row.kind) as TrashItemKind,
+    id: String(row.id ?? ""),
+    newsletterId: String(row.newsletterId ?? row.newsletter_id ?? ""),
+    title: String(row.title ?? ""),
+    subtitle: String(row.subtitle ?? ""),
+    deletedAt: String(row.deletedAt ?? row.deleted_at ?? ""),
+  };
+}
+
+async function listTrashItems(
+  db: D1Database,
+  limit: number,
+  offset: number,
+): Promise<{ items: TrashItem[]; total: number }> {
+  const count = await db.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM Newsletter WHERE deletedAt IS NOT NULL)
+       + (SELECT COUNT(*)
+          FROM Subscriber s
+          INNER JOIN Newsletter n ON n.id = s.newsletter_id
+          WHERE s.deleted_at IS NOT NULL AND n.deletedAt IS NULL)
+       + (SELECT COUNT(*)
+          FROM NewsletterDraft d
+          INNER JOIN Newsletter n ON n.id = d.newsletter_id
+          WHERE d.deletedAt IS NOT NULL AND n.deletedAt IS NULL) AS total`,
+  ).first<{ total: number }>();
+
+  const { results } = await db.prepare(
+    `SELECT kind, id, newsletterId, title, subtitle, deletedAt
+     FROM (
+       SELECT
+         'newsletter' AS kind,
+         n.id AS id,
+         n.id AS newsletterId,
+         n.title AS title,
+         'Newsletter' AS subtitle,
+         n.deletedAt AS deletedAt
+       FROM Newsletter n
+       WHERE n.deletedAt IS NOT NULL
+
+       UNION ALL
+
+       SELECT
+         'subscriber' AS kind,
+         s.email AS id,
+         s.newsletter_id AS newsletterId,
+         CASE
+           WHEN TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, '')) = ''
+             THEN s.email
+           ELSE TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, ''))
+         END AS title,
+         CASE
+           WHEN TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, '')) = ''
+             THEN 'Subscriber in “' || n.title || '”'
+           ELSE s.email || ' • Subscriber in “' || n.title || '”'
+         END AS subtitle,
+         s.deleted_at AS deletedAt
+       FROM Subscriber s
+       INNER JOIN Newsletter n ON n.id = s.newsletter_id
+       WHERE s.deleted_at IS NOT NULL AND n.deletedAt IS NULL
+
+       UNION ALL
+
+       SELECT
+         'draft' AS kind,
+         d.id AS id,
+         d.newsletter_id AS newsletterId,
+         CASE WHEN TRIM(d.subject) = '' THEN 'Untitled Draft' ELSE d.subject END AS title,
+         'Draft in “' || n.title || '”' AS subtitle,
+         d.deletedAt AS deletedAt
+       FROM NewsletterDraft d
+       INNER JOIN Newsletter n ON n.id = d.newsletter_id
+       WHERE d.deletedAt IS NOT NULL AND n.deletedAt IS NULL
+     )
+     ORDER BY deletedAt DESC, kind ASC, id ASC
+     LIMIT ? OFFSET ?`,
+  )
+    .bind(limit, offset)
+    .all<Record<string, unknown>>();
+
+  return {
+    items: results.map(mapTrashItem),
+    total: asNumber(count?.total),
+  };
+}
+
+async function deleteR2Keys(bucket: R2Bucket, keys: string[]): Promise<void> {
+  const uniqueKeys = [...new Set(keys.filter(Boolean))];
+  for (let index = 0; index < uniqueKeys.length; index += 1_000) {
+    await bucket.delete(uniqueKeys.slice(index, index + 1_000));
+  }
+}
+
+async function deleteNewsletterR2Prefix(
+  bucket: R2Bucket,
+  newsletterId: string,
+): Promise<void> {
+  let cursor: string | undefined;
+  do {
+    const objects = await bucket.list({
+      prefix: `newsletters/${newsletterId}/`,
+      cursor,
+    });
+    await deleteR2Keys(bucket, objects.objects.map((object) => object.key));
+    cursor = objects.truncated ? objects.cursor : undefined;
+  } while (cursor);
+}
+
+async function purgeTrashedNewsletter(
+  env: Bindings,
+  newsletterId: string,
+): Promise<boolean> {
+  const createdAt = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO TrashPurgeJob (
+         kind, newsletter_id, item_id, content_file_name, text_file_name, createdAt
+       )
+       SELECT 'newsletter', id, id, NULL, NULL, ?
+       FROM Newsletter
+       WHERE id = ? AND deletedAt IS NOT NULL`,
+    ).bind(createdAt, newsletterId),
+    env.DB.prepare(
+      `DELETE FROM NewsletterSendEvent
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql("?")})`,
+    ).bind(newsletterId),
+    env.DB.prepare(
+      `DELETE FROM NewsletterSendRecipient
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql("?")})`,
+    ).bind(newsletterId),
+    env.DB.prepare(
+      `DELETE FROM NewsletterDraft
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql("?")})`,
+    ).bind(newsletterId),
+    env.DB.prepare(
+      `DELETE FROM NewsletterSend
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql("?")})`,
+    ).bind(newsletterId),
+    env.DB.prepare(
+      `DELETE FROM Subscriber
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql("?")})`,
+    ).bind(newsletterId),
+    env.DB.prepare(
+      `DELETE FROM Newsletter
+       WHERE id = ? AND deletedAt IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM TrashPurgeJob
+           WHERE kind = 'newsletter' AND newsletter_id = ? AND item_id = ?
+         )`,
+    ).bind(newsletterId, newsletterId, newsletterId),
+  ]);
+
+  const job = await getTrashPurgeJob(env.DB, "newsletter", newsletterId, newsletterId);
+  if (!job) {
+    return false;
+  }
+  await cleanupTrashPurgeJob(env, job);
+  return true;
+}
+
+async function purgeTrashedDraft(
+  env: Bindings,
+  newsletterId: string,
+  draftId: string,
+): Promise<boolean> {
+  const createdAt = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO TrashPurgeJob (
+         kind, newsletter_id, item_id, content_file_name, text_file_name, createdAt
+       )
+       SELECT 'draft', d.newsletter_id, d.id, d.content_file_name, d.text_file_name, ?
+       FROM NewsletterDraft d
+       INNER JOIN Newsletter n ON n.id = d.newsletter_id
+       WHERE d.id = ? AND d.newsletter_id = ? AND d.deletedAt IS NOT NULL
+         AND n.deletedAt IS NULL`,
+    ).bind(createdAt, draftId, newsletterId),
+    env.DB.prepare(
+      `DELETE FROM NewsletterDraft
+       WHERE id = ? AND newsletter_id = ? AND deletedAt IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM TrashPurgeJob
+           WHERE kind = 'draft' AND newsletter_id = ? AND item_id = ?
+         )`,
+    ).bind(draftId, newsletterId, newsletterId, draftId),
+  ]);
+
+  const job = await getTrashPurgeJob(env.DB, "draft", newsletterId, draftId);
+  if (!job) {
+    return false;
+  }
+  await cleanupTrashPurgeJob(env, job);
+  return true;
+}
+
+async function emptyTrash(env: Bindings): Promise<TrashDeletionCounts> {
+  const createdAt = new Date().toISOString();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO TrashPurgeJob (
+         kind, newsletter_id, item_id, content_file_name, text_file_name, createdAt
+       )
+       SELECT 'newsletter', id, id, NULL, NULL, ?
+       FROM Newsletter
+       WHERE deletedAt IS NOT NULL`,
+    ).bind(createdAt),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO TrashPurgeJob (
+         kind, newsletter_id, item_id, content_file_name, text_file_name, createdAt
+       )
+       SELECT 'draft', d.newsletter_id, d.id, d.content_file_name, d.text_file_name, ?
+       FROM NewsletterDraft d
+       INNER JOIN Newsletter n ON n.id = d.newsletter_id
+       WHERE d.deletedAt IS NOT NULL AND n.deletedAt IS NULL`,
+    ).bind(createdAt),
+    env.DB.prepare(
+      `DELETE FROM NewsletterDraft
+       WHERE deletedAt IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM Newsletter
+           WHERE id = NewsletterDraft.newsletter_id AND deletedAt IS NULL
+         )
+         AND EXISTS (
+           SELECT 1 FROM TrashPurgeJob
+           WHERE kind = 'draft'
+             AND newsletter_id = NewsletterDraft.newsletter_id
+             AND item_id = NewsletterDraft.id
+         )`,
+    ),
+    env.DB.prepare(
+      `DELETE FROM Subscriber
+       WHERE deleted_at IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM Newsletter
+           WHERE id = Subscriber.newsletter_id AND deletedAt IS NULL
+         )`,
+    ),
+    env.DB.prepare(
+      `DELETE FROM NewsletterSendEvent
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql()})`,
+    ),
+    env.DB.prepare(
+      `DELETE FROM NewsletterSendRecipient
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql()})`,
+    ),
+    env.DB.prepare(
+      `DELETE FROM NewsletterDraft
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql()})`,
+    ),
+    env.DB.prepare(
+      `DELETE FROM NewsletterSend
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql()})`,
+    ),
+    env.DB.prepare(
+      `DELETE FROM Subscriber
+       WHERE newsletter_id IN (${newsletterPurgeJobIdsSql()})`,
+    ),
+    env.DB.prepare(
+      `DELETE FROM Newsletter
+       WHERE deletedAt IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM TrashPurgeJob
+           WHERE kind = 'newsletter'
+             AND newsletter_id = Newsletter.id
+             AND item_id = Newsletter.id
+         )`,
+    ),
+  ]);
+
+  const deleted = {
+    newsletters: results[9]?.meta.changes ?? 0,
+    subscribers: results[3]?.meta.changes ?? 0,
+    drafts: results[2]?.meta.changes ?? 0,
+  };
+
+  await drainTrashPurgeJobs(env);
+  return deleted;
+}
+
+function newsletterPurgeJobIdsSql(newsletterIdPlaceholder?: string): string {
+  const newsletterFilter = newsletterIdPlaceholder
+    ? `AND n.id = ${newsletterIdPlaceholder}`
+    : "";
+  return `SELECT n.id
+          FROM Newsletter n
+          INNER JOIN TrashPurgeJob p
+            ON p.kind = 'newsletter'
+           AND p.newsletter_id = n.id
+           AND p.item_id = n.id
+          WHERE n.deletedAt IS NOT NULL ${newsletterFilter}`;
+}
+
+async function getTrashPurgeJob(
+  db: D1Database,
+  kind: TrashPurgeJob["kind"],
+  newsletterId: string,
+  itemId: string,
+): Promise<TrashPurgeJob | null> {
+  const row = await db.prepare(
+    `SELECT kind,
+            newsletter_id AS newsletterId,
+            item_id AS itemId,
+            content_file_name AS contentFileName,
+            text_file_name AS textFileName
+     FROM TrashPurgeJob
+     WHERE kind = ? AND newsletter_id = ? AND item_id = ?`,
+  )
+    .bind(kind, newsletterId, itemId)
+    .first<TrashPurgeJob>();
+  return row ?? null;
+}
+
+async function drainTrashPurgeJobs(env: Bindings): Promise<void> {
+  const { results } = await env.DB.prepare(
+    `SELECT kind,
+            newsletter_id AS newsletterId,
+            item_id AS itemId,
+            content_file_name AS contentFileName,
+            text_file_name AS textFileName
+     FROM TrashPurgeJob
+     ORDER BY createdAt, kind, newsletter_id, item_id`,
+  ).all<TrashPurgeJob>();
+
+  for (const job of results) {
+    await cleanupTrashPurgeJob(env, job);
+  }
+}
+
+async function cleanupTrashPurgeJob(
+  env: Bindings,
+  job: TrashPurgeJob,
+): Promise<void> {
+  if (job.kind === "newsletter") {
+    await deleteNewsletterR2Prefix(env.R2, job.newsletterId);
+  } else {
+    await deleteR2Keys(env.R2, [job.contentFileName ?? "", job.textFileName ?? ""]);
+  }
+
+  await env.DB.prepare(
+    `DELETE FROM TrashPurgeJob
+     WHERE kind = ? AND newsletter_id = ? AND item_id = ?`,
+  )
+    .bind(job.kind, job.newsletterId, job.itemId)
+    .run();
 }
 
 async function readR2Text(env: Bindings, key: string | null): Promise<string | null> {
@@ -4918,7 +5813,7 @@ async function readR2Text(env: Bindings, key: string | null): Promise<string | n
 
 async function newsletterExists(db: D1Database, newsletterId: string): Promise<boolean> {
   const newsletter = await db
-    .prepare(`SELECT id FROM Newsletter WHERE id = ?`)
+    .prepare(`SELECT id FROM Newsletter WHERE id = ? AND deletedAt IS NULL`)
     .bind(newsletterId)
     .first<{ id: string }>();
   return Boolean(newsletter);
@@ -4930,6 +5825,50 @@ function draftContentFileName(newsletterId: string, draftId: string): string {
 
 function draftTextFileName(newsletterId: string, draftId: string): string {
   return `newsletters/${newsletterId}/drafts/${draftId}.txt`;
+}
+
+function draftRevisionFileNames(
+  newsletterId: string,
+  draftId: string,
+): { html: string; text: string } {
+  const revisionId = crypto.randomUUID();
+  const prefix = `newsletters/${newsletterId}/drafts/${draftId}/${revisionId}`;
+  return { html: `${prefix}.html`, text: `${prefix}.txt` };
+}
+
+function scheduledRevisionFileNames(
+  newsletterId: string,
+  draftId: string,
+): { html: string; text: string } {
+  const revisionId = crypto.randomUUID();
+  const prefix = `newsletters/${newsletterId}/scheduled/${draftId}/${revisionId}`;
+  return { html: `${prefix}.html`, text: `${prefix}.txt` };
+}
+
+function parseFutureScheduledAt(
+  value: unknown,
+  now = new Date(),
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return { ok: false, error: "scheduledAt is required" };
+  }
+  const normalized = value.trim();
+  const iso8601Pattern =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+  if (!iso8601Pattern.test(normalized)) {
+    return { ok: false, error: "scheduledAt must be a valid ISO-8601 timestamp" };
+  }
+  const parsed = new Date(normalized);
+  if (!Number.isFinite(parsed.getTime())) {
+    return { ok: false, error: "scheduledAt must be a valid ISO-8601 timestamp" };
+  }
+  if (parsed.getUTCSeconds() !== 0 || parsed.getUTCMilliseconds() !== 0) {
+    return { ok: false, error: "scheduledAt must use whole-minute precision" };
+  }
+  if (parsed.getTime() <= now.getTime()) {
+    return { ok: false, error: "scheduledAt must be in the future" };
+  }
+  return { ok: true, value: parsed.toISOString() };
 }
 
 function draftStringField(
@@ -4961,11 +5900,23 @@ async function listNewsletterDraftSummaries(
               text_file_name AS textFileName,
               status,
               send_id AS sendId,
+              scheduled_at AS scheduledAt,
+              schedule_next_attempt_at AS scheduleNextAttemptAt,
+              schedule_claimed_at AS scheduleClaimedAt,
+              schedule_last_attempt_at AS scheduleLastAttemptAt,
+              schedule_attempt_count AS scheduleAttemptCount,
+              schedule_last_error AS scheduleLastError,
+              scheduled_content_file_name AS scheduledContentFileName,
+              scheduled_text_file_name AS scheduledTextFileName,
+              scheduled_from_name AS scheduledFromName,
+              scheduled_footer_html AS scheduledFooterHtml,
+              scheduled_footer_text AS scheduledFooterText,
+              scheduled_email_style_config AS scheduledEmailStyleConfig,
               createdAt,
               updatedAt,
               sentAt
        FROM NewsletterDraft
-       WHERE newsletter_id = ? AND status = 'draft'
+       WHERE newsletter_id = ? AND status = 'draft' AND deletedAt IS NULL
        ORDER BY updatedAt DESC
        LIMIT 50`,
     )
@@ -4980,19 +5931,32 @@ async function getNewsletterDraftSummary(
 ): Promise<NewsletterDraftSummary | null> {
   const row = await db
     .prepare(
-      `SELECT id,
-              newsletter_id AS newsletterId,
-              subject,
-              source_message_id AS sourceMessageId,
-              content_file_name AS contentFileName,
-              text_file_name AS textFileName,
-              status,
-              send_id AS sendId,
-              createdAt,
-              updatedAt,
-              sentAt
-       FROM NewsletterDraft
-       WHERE id = ?`,
+      `SELECT d.id,
+              d.newsletter_id AS newsletterId,
+              d.subject,
+              d.source_message_id AS sourceMessageId,
+              d.content_file_name AS contentFileName,
+              d.text_file_name AS textFileName,
+              d.status,
+              d.send_id AS sendId,
+              d.scheduled_at AS scheduledAt,
+              d.schedule_next_attempt_at AS scheduleNextAttemptAt,
+              d.schedule_claimed_at AS scheduleClaimedAt,
+              d.schedule_last_attempt_at AS scheduleLastAttemptAt,
+              d.schedule_attempt_count AS scheduleAttemptCount,
+              d.schedule_last_error AS scheduleLastError,
+              d.scheduled_content_file_name AS scheduledContentFileName,
+              d.scheduled_text_file_name AS scheduledTextFileName,
+              d.scheduled_from_name AS scheduledFromName,
+              d.scheduled_footer_html AS scheduledFooterHtml,
+              d.scheduled_footer_text AS scheduledFooterText,
+              d.scheduled_email_style_config AS scheduledEmailStyleConfig,
+              d.createdAt,
+              d.updatedAt,
+              d.sentAt
+       FROM NewsletterDraft d
+       INNER JOIN Newsletter n ON n.id = d.newsletter_id
+       WHERE d.id = ? AND d.deletedAt IS NULL AND n.deletedAt IS NULL`,
     )
     .bind(draftId)
     .first<Record<string, unknown>>();
@@ -5006,19 +5970,33 @@ async function getNewsletterDraftBySourceMessageId(
 ): Promise<NewsletterDraftSummary | null> {
   const row = await db
     .prepare(
-      `SELECT id,
-              newsletter_id AS newsletterId,
-              subject,
-              source_message_id AS sourceMessageId,
-              content_file_name AS contentFileName,
-              text_file_name AS textFileName,
-              status,
-              send_id AS sendId,
-              createdAt,
-              updatedAt,
-              sentAt
-       FROM NewsletterDraft
-       WHERE newsletter_id = ? AND source_message_id = ?
+      `SELECT d.id,
+              d.newsletter_id AS newsletterId,
+              d.subject,
+              d.source_message_id AS sourceMessageId,
+              d.content_file_name AS contentFileName,
+              d.text_file_name AS textFileName,
+              d.status,
+              d.send_id AS sendId,
+              d.scheduled_at AS scheduledAt,
+              d.schedule_next_attempt_at AS scheduleNextAttemptAt,
+              d.schedule_claimed_at AS scheduleClaimedAt,
+              d.schedule_last_attempt_at AS scheduleLastAttemptAt,
+              d.schedule_attempt_count AS scheduleAttemptCount,
+              d.schedule_last_error AS scheduleLastError,
+              d.scheduled_content_file_name AS scheduledContentFileName,
+              d.scheduled_text_file_name AS scheduledTextFileName,
+              d.scheduled_from_name AS scheduledFromName,
+              d.scheduled_footer_html AS scheduledFooterHtml,
+              d.scheduled_footer_text AS scheduledFooterText,
+              d.scheduled_email_style_config AS scheduledEmailStyleConfig,
+              d.createdAt,
+              d.updatedAt,
+              d.sentAt
+       FROM NewsletterDraft d
+       INNER JOIN Newsletter n ON n.id = d.newsletter_id
+       WHERE d.newsletter_id = ? AND d.source_message_id = ?
+         AND d.deletedAt IS NULL AND n.deletedAt IS NULL
        LIMIT 1`,
     )
     .bind(newsletterId, sourceMessageId)
@@ -5134,19 +6112,32 @@ async function updateNewsletterDraft(
   draft: NewsletterDraftSummary,
   input: { subject: string; html: string; text: string },
 ): Promise<NewsletterDraftSummary> {
+  if (draft.status === "dispatching") {
+    throw new NewsletterScheduleConflictError();
+  }
+  if (draft.status === "sent") {
+    throw new NewsletterDraftSourceConflictError();
+  }
+  if (draft.status === "scheduled") {
+    return updateScheduledNewsletterDraftContent(env, draft, input);
+  }
+
   const now = new Date().toISOString();
   await Promise.all([
     env.R2.put(draft.contentFileName, input.html),
     env.R2.put(draft.textFileName, input.text),
   ]);
-  await env.DB.prepare(
+  const result = await env.DB.prepare(
     `UPDATE NewsletterDraft
      SET subject = ?,
          updatedAt = ?
-     WHERE id = ? AND status = 'draft'`,
+     WHERE id = ? AND status = 'draft' AND deletedAt IS NULL`,
   )
     .bind(input.subject, now, draft.id)
     .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    throw new NewsletterScheduleConflictError();
+  }
   const updated = await getNewsletterDraftSummary(env.DB, draft.id);
   if (!updated) {
     throw new Error("Failed to update newsletter draft");
@@ -5154,10 +6145,271 @@ async function updateNewsletterDraft(
   return updated;
 }
 
+async function updateScheduledNewsletterDraftContent(
+  env: Bindings,
+  draft: NewsletterDraftSummary,
+  input: { subject: string; html: string; text: string },
+): Promise<NewsletterDraftSummary> {
+  if (!draft.scheduledAt || !draft.scheduledEmailStyleConfig) {
+    throw new Error(`Scheduled draft ${draft.id} is missing captured configuration`);
+  }
+  const editableRevision = draftRevisionFileNames(draft.newsletterId, draft.id);
+  const deliveryRevision = scheduledRevisionFileNames(draft.newsletterId, draft.id);
+  const styledHtml = renderStyledNewsletterHtml(
+    input.html,
+    parseStoredEmailStyleConfig(draft.scheduledEmailStyleConfig),
+  );
+  await Promise.all([
+    env.R2.put(editableRevision.html, input.html),
+    env.R2.put(editableRevision.text, input.text),
+    env.R2.put(deliveryRevision.html, styledHtml),
+    env.R2.put(deliveryRevision.text, input.text),
+  ]);
+
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare(
+    `UPDATE NewsletterDraft
+     SET subject = ?,
+         content_file_name = ?,
+         text_file_name = ?,
+         scheduled_content_file_name = ?,
+         scheduled_text_file_name = ?,
+         schedule_next_attempt_at = scheduled_at,
+         schedule_claimed_at = NULL,
+         schedule_last_error = NULL,
+         updatedAt = ?
+     WHERE id = ? AND status = 'scheduled' AND deletedAt IS NULL
+       AND content_file_name = ? AND text_file_name = ?`,
+  )
+    .bind(
+      input.subject,
+      editableRevision.html,
+      editableRevision.text,
+      deliveryRevision.html,
+      deliveryRevision.text,
+      now,
+      draft.id,
+      draft.contentFileName,
+      draft.textFileName,
+    )
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    await Promise.allSettled([
+      deleteR2Keys(env.R2, [
+        editableRevision.html,
+        editableRevision.text,
+        deliveryRevision.html,
+        deliveryRevision.text,
+      ]),
+    ]);
+    throw new NewsletterScheduleConflictError();
+  }
+
+  await Promise.allSettled([
+    deleteR2Keys(env.R2, [
+      draft.contentFileName,
+      draft.textFileName,
+      draft.scheduledContentFileName ?? "",
+      draft.scheduledTextFileName ?? "",
+    ]),
+  ]);
+  const updated = await getNewsletterDraftSummary(env.DB, draft.id);
+  if (!updated) {
+    throw new Error("Failed to update scheduled newsletter draft");
+  }
+  return updated;
+}
+
+async function scheduleNewsletterDraft(
+  env: Bindings,
+  draft: NewsletterDraftSummary,
+  input: { subject: string; html: string; text: string; scheduledAt: string },
+): Promise<NewsletterDraftSummary> {
+  if (draft.status === "dispatching") {
+    throw new NewsletterScheduleConflictError();
+  }
+  if (draft.status === "sent") {
+    throw new NewsletterDraftSourceConflictError();
+  }
+
+  const editableRevision = draftRevisionFileNames(draft.newsletterId, draft.id);
+  const deliveryRevision = scheduledRevisionFileNames(draft.newsletterId, draft.id);
+  const [publishConfig, footerConfig, currentEmailStyleConfig] = draft.status === "scheduled"
+    ? [
+        { fromName: draft.scheduledFromName },
+        unsubscribeFooterConfigOrDefault(
+          draft.scheduledFooterHtml,
+          draft.scheduledFooterText,
+        ),
+        parseStoredEmailStyleConfig(draft.scheduledEmailStyleConfig),
+      ]
+    : await Promise.all([
+        getPublishConfig(env),
+        getUnsubscribeFooterConfig(env),
+        getEmailStyleConfig(env),
+      ]);
+  const serializedEmailStyleConfig = draft.status === "scheduled"
+    ? draft.scheduledEmailStyleConfig ?? JSON.stringify(currentEmailStyleConfig)
+    : JSON.stringify(currentEmailStyleConfig);
+  const styledHtml = renderStyledNewsletterHtml(input.html, currentEmailStyleConfig);
+
+  await Promise.all([
+    env.R2.put(editableRevision.html, input.html),
+    env.R2.put(editableRevision.text, input.text),
+    env.R2.put(deliveryRevision.html, styledHtml),
+    env.R2.put(deliveryRevision.text, input.text),
+  ]);
+
+  const now = new Date().toISOString();
+  const expectedStatus = draft.status;
+  const result = await env.DB.prepare(
+    `UPDATE NewsletterDraft
+     SET subject = ?,
+         content_file_name = ?,
+         text_file_name = ?,
+         status = 'scheduled',
+         scheduled_at = ?,
+         schedule_next_attempt_at = ?,
+         schedule_claimed_at = NULL,
+         schedule_last_attempt_at = NULL,
+         schedule_attempt_count = CASE WHEN status = 'draft' THEN 0 ELSE schedule_attempt_count END,
+         schedule_last_error = NULL,
+         scheduled_content_file_name = ?,
+         scheduled_text_file_name = ?,
+         scheduled_from_name = ?,
+         scheduled_footer_html = ?,
+         scheduled_footer_text = ?,
+         scheduled_email_style_config = ?,
+         updatedAt = ?
+     WHERE id = ? AND status = ? AND deletedAt IS NULL
+       AND content_file_name = ? AND text_file_name = ?
+       AND EXISTS (
+         SELECT 1
+         FROM Newsletter n
+         WHERE n.id = NewsletterDraft.newsletter_id AND n.deletedAt IS NULL
+       )`,
+  )
+    .bind(
+      input.subject,
+      editableRevision.html,
+      editableRevision.text,
+      input.scheduledAt,
+      input.scheduledAt,
+      deliveryRevision.html,
+      deliveryRevision.text,
+      publishConfig.fromName,
+      footerConfig.html,
+      footerConfig.text,
+      serializedEmailStyleConfig,
+      now,
+      draft.id,
+      expectedStatus,
+      draft.contentFileName,
+      draft.textFileName,
+    )
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    await Promise.allSettled([
+      deleteR2Keys(env.R2, [
+        editableRevision.html,
+        editableRevision.text,
+        deliveryRevision.html,
+        deliveryRevision.text,
+      ]),
+    ]);
+    throw new NewsletterScheduleConflictError();
+  }
+
+  await Promise.allSettled([
+    deleteR2Keys(env.R2, [
+      draft.contentFileName,
+      draft.textFileName,
+      draft.scheduledContentFileName ?? "",
+      draft.scheduledTextFileName ?? "",
+    ]),
+  ]);
+  const scheduled = await getNewsletterDraftSummary(env.DB, draft.id);
+  if (!scheduled) {
+    throw new Error("Failed to schedule newsletter draft");
+  }
+  return scheduled;
+}
+
+async function rescheduleNewsletterDraft(
+  db: D1Database,
+  draftId: string,
+  scheduledAt: string,
+): Promise<NewsletterDraftSummary> {
+  const now = new Date().toISOString();
+  const result = await db.prepare(
+    `UPDATE NewsletterDraft
+     SET scheduled_at = ?,
+         schedule_next_attempt_at = ?,
+         schedule_claimed_at = NULL,
+         schedule_last_error = NULL,
+         updatedAt = ?
+     WHERE id = ? AND status = 'scheduled' AND deletedAt IS NULL`,
+  )
+    .bind(scheduledAt, scheduledAt, now, draftId)
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    throw new NewsletterScheduleConflictError();
+  }
+  const updated = await getNewsletterDraftSummary(db, draftId);
+  if (!updated) {
+    throw new Error("Failed to reschedule newsletter draft");
+  }
+  return updated;
+}
+
+async function cancelScheduledNewsletterDraft(
+  env: Bindings,
+  draft: NewsletterDraftSummary,
+): Promise<NewsletterDraftSummary> {
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare(
+    `UPDATE NewsletterDraft
+     SET status = 'draft',
+         scheduled_at = NULL,
+         schedule_next_attempt_at = NULL,
+         schedule_claimed_at = NULL,
+         schedule_last_attempt_at = NULL,
+         schedule_attempt_count = 0,
+         schedule_last_error = NULL,
+         scheduled_content_file_name = NULL,
+         scheduled_text_file_name = NULL,
+         scheduled_from_name = NULL,
+         scheduled_footer_html = NULL,
+         scheduled_footer_text = NULL,
+         scheduled_email_style_config = NULL,
+         updatedAt = ?
+     WHERE id = ? AND status = 'scheduled' AND deletedAt IS NULL`,
+  )
+    .bind(now, draft.id)
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    throw new NewsletterScheduleConflictError();
+  }
+  await Promise.allSettled([
+    draft.scheduledContentFileName
+      ? env.R2.delete(draft.scheduledContentFileName)
+      : Promise.resolve(),
+    draft.scheduledTextFileName
+      ? env.R2.delete(draft.scheduledTextFileName)
+      : Promise.resolve(),
+  ]);
+  const cancelled = await getNewsletterDraftSummary(env.DB, draft.id);
+  if (!cancelled) {
+    throw new Error("Failed to cancel scheduled newsletter draft");
+  }
+  return cancelled;
+}
+
 async function markNewsletterDraftSent(
   db: D1Database,
   draftId: string,
   sendId: string | null,
+  expectedStatus: "draft" | "dispatching" = "draft",
 ): Promise<void> {
   const now = new Date().toISOString();
   await db
@@ -5166,11 +6418,290 @@ async function markNewsletterDraftSent(
        SET status = 'sent',
            send_id = ?,
            sentAt = ?,
+           schedule_next_attempt_at = NULL,
+           schedule_claimed_at = NULL,
+           schedule_last_error = NULL,
            updatedAt = ?
-       WHERE id = ? AND status = 'draft'`,
+       WHERE id = ? AND status = ? AND deletedAt IS NULL`,
     )
-    .bind(sendId, now, now, draftId)
+    .bind(sendId, now, now, draftId, expectedStatus)
     .run();
+}
+
+async function listNewsletterScheduledSendSummaries(
+  db: D1Database,
+  newsletterId: string,
+): Promise<NewsletterScheduledSendSummary[]> {
+  const { results } = await db.prepare(
+    `SELECT id,
+            newsletter_id AS newsletterId,
+            subject,
+            source_message_id AS sourceMessageId,
+            content_file_name AS contentFileName,
+            text_file_name AS textFileName,
+            status,
+            send_id AS sendId,
+            scheduled_at AS scheduledAt,
+            schedule_next_attempt_at AS scheduleNextAttemptAt,
+            schedule_claimed_at AS scheduleClaimedAt,
+            schedule_last_attempt_at AS scheduleLastAttemptAt,
+            schedule_attempt_count AS scheduleAttemptCount,
+            schedule_last_error AS scheduleLastError,
+            scheduled_content_file_name AS scheduledContentFileName,
+            scheduled_text_file_name AS scheduledTextFileName,
+            scheduled_from_name AS scheduledFromName,
+            scheduled_footer_html AS scheduledFooterHtml,
+            scheduled_footer_text AS scheduledFooterText,
+            scheduled_email_style_config AS scheduledEmailStyleConfig,
+            createdAt,
+            updatedAt,
+            sentAt
+     FROM NewsletterDraft
+     WHERE newsletter_id = ?
+       AND status IN ('scheduled', 'dispatching')
+       AND deletedAt IS NULL
+     ORDER BY scheduled_at ASC, createdAt ASC`,
+  )
+    .bind(newsletterId)
+    .all<Record<string, unknown>>();
+  return results
+    .map(mapNewsletterDraftSummary)
+    .map(mapNewsletterScheduledSendSummary);
+}
+
+async function claimNewsletterSchedule(
+  db: D1Database,
+  draftId: string,
+  now: string,
+  bypassSchedule: boolean,
+): Promise<NewsletterDraftSummary | null> {
+  const duePredicate = bypassSchedule
+    ? ""
+    : "AND schedule_next_attempt_at <= ?";
+  const params = bypassSchedule
+    ? [now, now, now, draftId]
+    : [now, now, now, draftId, now];
+  const result = await db.prepare(
+    `UPDATE NewsletterDraft
+     SET status = 'dispatching',
+         schedule_claimed_at = ?,
+         schedule_last_attempt_at = ?,
+         schedule_attempt_count = schedule_attempt_count + 1,
+         updatedAt = ?
+     WHERE id = ? AND status = 'scheduled' AND deletedAt IS NULL
+       ${duePredicate}`,
+  )
+    .bind(...params)
+    .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    return null;
+  }
+  const claimed = await getNewsletterDraftSummary(db, draftId);
+  return claimed?.status === "dispatching" ? claimed : null;
+}
+
+function scheduleRetryDelayMinutes(attemptCount: number): number {
+  const index = Math.max(
+    0,
+    Math.min(NEWSLETTER_SCHEDULE_RETRY_MINUTES.length - 1, attemptCount - 1),
+  );
+  return NEWSLETTER_SCHEDULE_RETRY_MINUTES[index];
+}
+
+async function releaseNewsletterScheduleClaim(
+  db: D1Database,
+  draft: NewsletterDraftSummary,
+  error: unknown,
+): Promise<void> {
+  if (!draft.scheduleClaimedAt) {
+    return;
+  }
+  const nowDate = new Date();
+  const delayMinutes = scheduleRetryDelayMinutes(draft.scheduleAttemptCount);
+  const nextAttemptAt = new Date(
+    nowDate.getTime() + delayMinutes * 60 * 1_000,
+  ).toISOString();
+  await db.prepare(
+    `UPDATE NewsletterDraft
+     SET status = 'scheduled',
+         schedule_next_attempt_at = ?,
+         schedule_claimed_at = NULL,
+         schedule_last_error = ?,
+         updatedAt = ?
+     WHERE id = ? AND status = 'dispatching' AND schedule_claimed_at = ?`,
+  )
+    .bind(
+      nextAttemptAt,
+      errorMessage(error, "Scheduled dispatch failed").slice(0, 2_000),
+      nowDate.toISOString(),
+      draft.id,
+      draft.scheduleClaimedAt,
+    )
+    .run();
+}
+
+async function dispatchClaimedNewsletterSchedule(
+  env: Bindings,
+  draft: NewsletterDraftSummary,
+): Promise<PublishNewsletterEmailSuccess> {
+  if (draft.status !== "dispatching" || !draft.scheduledAt) {
+    throw new NewsletterScheduleConflictError();
+  }
+  if (!draft.scheduledContentFileName || !draft.scheduledTextFileName) {
+    throw new Error(`Scheduled draft ${draft.id} is missing its delivery snapshot`);
+  }
+
+  const existingSend = await getNewsletterSendSummaryBySourceMessage(
+    env.DB,
+    draft.newsletterId,
+    draft.sourceMessageId,
+  );
+  if (existingSend) {
+    await enqueueNewsletterFanoutForSend(env, existingSend);
+    await markNewsletterDraftSent(env.DB, draft.id, existingSend.id, "dispatching");
+    return {
+      ok: true,
+      newsletterId: draft.newsletterId,
+      subject: existingSend.subject,
+      sendId: existingSend.id,
+      send: existingSend,
+      recipientCount: existingSend.recipientCount,
+      queuedCount: 0,
+      queueFailedCount: 0,
+      duplicate: true,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const recipientCount = await countSubscribedSubscribers(
+    draft.newsletterId,
+    env.DB,
+    now,
+  );
+  const sendId = crypto.randomUUID();
+  const footer = unsubscribeFooterConfigOrDefault(
+    draft.scheduledFooterHtml,
+    draft.scheduledFooterText,
+  );
+  let send: NewsletterSendSummary;
+  try {
+    send = await createNewsletterSend(env.DB, {
+      sendId,
+      newsletterId: draft.newsletterId,
+      subject: draft.subject,
+      sourceMessageId: draft.sourceMessageId,
+      recipientCount,
+      contentFileName: draft.scheduledContentFileName,
+      textFileName: draft.scheduledTextFileName,
+      fromName: draft.scheduledFromName,
+      footerHtml: footer.html,
+      footerText: footer.text,
+      scheduledAt: draft.scheduledAt,
+      fanoutSnapshotAt: now,
+      now,
+    });
+  } catch (error: unknown) {
+    const duplicateSend = await getNewsletterSendSummaryBySourceMessage(
+      env.DB,
+      draft.newsletterId,
+      draft.sourceMessageId,
+    );
+    if (!duplicateSend) {
+      throw error;
+    }
+    send = duplicateSend;
+  }
+
+  await recordNewsletterSendEvent(env.DB, {
+    sendId: send.id,
+    newsletterId: draft.newsletterId,
+    eventType: "scheduledSendCreated",
+    sendStatus: send.status,
+    message: `Dispatched scheduled send for ${recipientCount} subscriber(s).`,
+    now,
+  });
+  await enqueueNewsletterFanoutForSend(env, send);
+  await markNewsletterDraftSent(env.DB, draft.id, send.id, "dispatching");
+  return {
+    ok: true,
+    newsletterId: draft.newsletterId,
+    subject: send.subject,
+    fileName: send.contentFileName ?? undefined,
+    textFileName: send.textFileName ?? undefined,
+    sendId: send.id,
+    send,
+    recipientCount: send.recipientCount,
+    queuedCount: 0,
+    queueFailedCount: 0,
+    duplicate: send.id !== sendId,
+  };
+}
+
+async function recoverStaleNewsletterScheduleClaims(
+  db: D1Database,
+  nowDate: Date,
+): Promise<void> {
+  const now = nowDate.toISOString();
+  const staleBefore = new Date(
+    nowDate.getTime() - NEWSLETTER_SCHEDULE_STALE_CLAIM_MILLISECONDS,
+  ).toISOString();
+  await db.prepare(
+    `UPDATE NewsletterDraft
+     SET status = 'scheduled',
+         schedule_next_attempt_at = ?,
+         schedule_claimed_at = NULL,
+         schedule_last_error = 'Recovered a stale dispatch claim.',
+         updatedAt = ?
+     WHERE status = 'dispatching'
+       AND deletedAt IS NULL
+       AND schedule_claimed_at <= ?`,
+  )
+    .bind(now, now, staleBefore)
+    .run();
+}
+
+async function processDueNewsletterSchedules(env: Bindings): Promise<void> {
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  await recoverStaleNewsletterScheduleClaims(env.DB, nowDate);
+  const { results } = await env.DB.prepare(
+    `SELECT d.id
+     FROM NewsletterDraft d
+     INNER JOIN Newsletter n ON n.id = d.newsletter_id
+     WHERE d.status = 'scheduled'
+       AND d.deletedAt IS NULL
+       AND n.deletedAt IS NULL
+       AND d.schedule_next_attempt_at <= ?
+     ORDER BY d.schedule_next_attempt_at, d.createdAt
+     LIMIT ?`,
+  )
+    .bind(now, NEWSLETTER_SCHEDULE_CLAIM_LIMIT)
+    .all<{ id: string }>();
+
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < results.length) {
+      const index = cursor;
+      cursor += 1;
+      const candidate = results[index];
+      const claimed = await claimNewsletterSchedule(env.DB, candidate.id, now, false);
+      if (!claimed) {
+        continue;
+      }
+      try {
+        await dispatchClaimedNewsletterSchedule(env, claimed);
+      } catch (error: unknown) {
+        logError("scheduled-newsletter-dispatch", error);
+        await releaseNewsletterScheduleClaim(env.DB, claimed, error);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(NEWSLETTER_SCHEDULE_DISPATCH_CONCURRENCY, results.length) },
+      worker,
+    ),
+  );
 }
 
 function mapNewsletterSendRecipient(row: Record<string, unknown>): NewsletterSendRecipient {
@@ -5249,6 +6780,7 @@ async function getNewsletterSendSummary(
               content_file_name AS contentFileName,
               text_file_name AS textFileName,
               from_name AS fromName,
+              scheduled_at AS scheduledAt,
               fanout_snapshot_at AS fanoutSnapshotAt,
               fanout_cursor_email AS fanoutCursorEmail,
               fanout_completed_at AS fanoutCompletedAt,
@@ -5261,6 +6793,18 @@ async function getNewsletterSendSummary(
     .bind(sendId)
     .first<Record<string, unknown>>();
   return row ? mapNewsletterSendSummary(row) : null;
+}
+
+async function getActiveNewsletterSendSummary(
+  db: D1Database,
+  newsletterId: string,
+  sendId: string,
+): Promise<NewsletterSendSummary | null> {
+  if (!(await newsletterExists(db, newsletterId))) {
+    return null;
+  }
+  const send = await getNewsletterSendSummary(db, sendId);
+  return send?.newsletterId === newsletterId ? send : null;
 }
 
 async function getNewsletterSendFooterSnapshot(
@@ -5312,6 +6856,7 @@ async function getNewsletterSendSummaryBySourceMessage(
               content_file_name AS contentFileName,
               text_file_name AS textFileName,
               from_name AS fromName,
+              scheduled_at AS scheduledAt,
               fanout_snapshot_at AS fanoutSnapshotAt,
               fanout_cursor_email AS fanoutCursorEmail,
               fanout_completed_at AS fanoutCompletedAt,
@@ -5552,6 +7097,7 @@ async function listNewsletterSendSummaries(
               content_file_name AS contentFileName,
               text_file_name AS textFileName,
               from_name AS fromName,
+              scheduled_at AS scheduledAt,
               fanout_snapshot_at AS fanoutSnapshotAt,
               fanout_cursor_email AS fanoutCursorEmail,
               fanout_completed_at AS fanoutCompletedAt,
@@ -5581,6 +7127,7 @@ async function createNewsletterSend(
     fromName: string | null;
     footerHtml: string;
     footerText: string;
+    scheduledAt?: string | null;
     fanoutSnapshotAt: string;
     now: string;
   },
@@ -5594,10 +7141,10 @@ async function createNewsletterSend(
          delivered_count, delivery_delayed_count, bounced_count, complained_count,
          failed_count, dead_lettered_count, needs_review_count,
          content_file_name, text_file_name, from_name, footer_html, footer_text,
-         fanout_snapshot_at,
+         scheduled_at, fanout_snapshot_at,
          fanout_cursor_email, fanout_completed_at, createdAt, updatedAt
        )
-       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
     )
     .bind(
       input.sendId,
@@ -5611,6 +7158,7 @@ async function createNewsletterSend(
       input.fromName,
       input.footerHtml,
       input.footerText,
+      input.scheduledAt ?? null,
       input.fanoutSnapshotAt,
       input.now,
       input.now,
@@ -7027,6 +8575,13 @@ export class SendStatusBroker {
 
 export default {
   fetch: app.fetch,
+  async scheduled(
+    _controller: ScheduledController,
+    env: Bindings,
+    ctx: ExecutionContext,
+  ) {
+    ctx.waitUntil(processDueNewsletterSchedules(env));
+  },
   async email(
     message: ForwardableEmailMessage,
     env: Bindings,

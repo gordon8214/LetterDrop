@@ -144,6 +144,54 @@ async function checkMigrations(databaseName, envName) {
     )
   }
 
+  const newsletterColumns = await queryD1(databaseName, envName, "PRAGMA table_info('Newsletter')")
+  const newsletterColumnNames = new Set(
+    newsletterColumns.map((column) => String(column.name ?? ''))
+  )
+  if (!newsletterColumnNames.has('deletedAt')) {
+    throw new Error(
+      'Missing Newsletter.deletedAt. Apply db/20260719_add_trash.sql before deploy.'
+    )
+  }
+
+  const draftColumns = await queryD1(databaseName, envName, "PRAGMA table_info('NewsletterDraft')")
+  const draftColumnNames = new Set(draftColumns.map((column) => String(column.name ?? '')))
+  if (!draftColumnNames.has('deletedAt')) {
+    throw new Error(
+      'Missing NewsletterDraft.deletedAt. Apply db/20260719_add_trash.sql before deploy.'
+    )
+  }
+  const missingScheduleDraftColumns = [
+    'scheduled_at',
+    'schedule_next_attempt_at',
+    'schedule_claimed_at',
+    'schedule_last_attempt_at',
+    'schedule_attempt_count',
+    'schedule_last_error',
+    'scheduled_content_file_name',
+    'scheduled_text_file_name',
+    'scheduled_from_name',
+    'scheduled_footer_html',
+    'scheduled_footer_text',
+    'scheduled_email_style_config',
+  ].filter((column) => !draftColumnNames.has(column))
+  if (missingScheduleDraftColumns.length > 0) {
+    throw new Error(
+      `Missing NewsletterDraft schedule columns: ${missingScheduleDraftColumns.join(', ')}. Apply db/20260720_add_scheduled_sends.sql before deploy.`
+    )
+  }
+
+  const trashPurgeJobTables = await queryD1(
+    databaseName,
+    envName,
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='TrashPurgeJob'"
+  )
+  if (trashPurgeJobTables.length === 0) {
+    throw new Error(
+      'Missing TrashPurgeJob table. Apply db/20260719_add_trash_purge_jobs.sql before deploy.'
+    )
+  }
+
   const sendColumns = await queryD1(databaseName, envName, "PRAGMA table_info('NewsletterSend')")
   const sendColumnNames = new Set(sendColumns.map((column) => String(column.name ?? '')))
   const missingSendColumns = [
@@ -163,16 +211,26 @@ async function checkMigrations(databaseName, envName) {
       `Missing NewsletterSend columns: ${missingSendColumns.join(', ')}. Apply db/20260429_add_scalable_send_fanout.sql before deploy.`
     )
   }
+  if (!sendColumnNames.has('scheduled_at')) {
+    throw new Error(
+      'Missing NewsletterSend.scheduled_at. Apply db/20260720_add_scheduled_sends.sql before deploy.'
+    )
+  }
 
   const indexes = await queryD1(
     databaseName,
     envName,
-    `SELECT name FROM sqlite_master
+    `SELECT name, sql FROM sqlite_master
      WHERE type = 'index'
        AND name IN (
          'idx_subscriber_newsletter_snapshot_email',
          'idx_newsletter_send_recipient_status_email',
-         'idx_newsletter_send_recipient_email'
+         'idx_newsletter_send_recipient_email',
+         'idx_newsletter_deleted_at',
+         'idx_newsletter_draft_deleted_at',
+         'idx_subscriber_deleted_at',
+         'idx_newsletter_draft_due_schedule',
+         'idx_newsletter_draft_scheduled_list'
        )`
   )
   const indexNames = new Set(indexes.map((index) => String(index.name ?? '')))
@@ -180,11 +238,30 @@ async function checkMigrations(databaseName, envName) {
     'idx_subscriber_newsletter_snapshot_email',
     'idx_newsletter_send_recipient_status_email',
     'idx_newsletter_send_recipient_email',
+    'idx_newsletter_deleted_at',
+    'idx_newsletter_draft_deleted_at',
+    'idx_subscriber_deleted_at',
+    'idx_newsletter_draft_due_schedule',
+    'idx_newsletter_draft_scheduled_list',
   ].filter((index) => !indexNames.has(index))
 
   if (missingIndexes.length > 0) {
     throw new Error(
       `Missing D1 indexes: ${missingIndexes.join(', ')}. Apply db/20260429_add_scalable_send_fanout.sql before deploy.`
+    )
+  }
+
+  const dueScheduleIndex = indexes.find(
+    (index) => String(index.name ?? '') === 'idx_newsletter_draft_due_schedule'
+  )
+  const dueScheduleIndexSql = String(dueScheduleIndex?.sql ?? '')
+    .replace(/\s+/g, '')
+    .toLowerCase()
+  if (!dueScheduleIndexSql.includes(
+    'newsletterdraft(status,schedule_next_attempt_at,createdat)'
+  )) {
+    throw new Error(
+      'The due-schedule index has the old definition. Apply db/20260720_fix_scheduled_send_due_index.sql before deploy.'
     )
   }
 }

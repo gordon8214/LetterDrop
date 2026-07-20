@@ -7,6 +7,9 @@ compatibility_flags = ["nodejs_compat"]
 cpu_ms = 300_000
 subrequests = 10_000
 
+[triggers]
+crons = ["* * * * *"]
+
 [vars]
 ALLOWED_EMAILS = "replace-with-allowed-emails"
 PUBLISH_EMAIL_ADDRESS = "replace-with-publish-email-address"

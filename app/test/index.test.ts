@@ -66,6 +66,12 @@ function factoryEmailStyleConfig() {
 type NewsletterRecord = {
   id: string
   subscribable: number
+  title?: string
+  description?: string
+  logo?: string | null
+  createdAt?: string
+  updatedAt?: string
+  deletedAt?: string | null
 }
 
 type SubscriberRecord = {
@@ -87,6 +93,8 @@ type FakeDatabaseOptions = {
   failRecipientStatusUpdates?: string[]
   failFanoutAdvanceOnce?: boolean
   failQueueSendOnce?: boolean
+  failQueueSendCount?: number
+  failR2DeleteOnce?: boolean
 }
 
 type AbuseEvent = {
@@ -130,6 +138,7 @@ type NewsletterSendRecord = {
   fromName: string | null
   footerHtml: string | null
   footerText: string | null
+  scheduledAt?: string | null
   fanoutSnapshotAt: string | null
   fanoutCursorEmail: string | null
   fanoutCompletedAt: string | null
@@ -185,11 +194,33 @@ type NewsletterDraftRecord = {
   sourceMessageId: string
   contentFileName: string
   textFileName: string
-  status: 'draft' | 'sent'
+  status: 'draft' | 'scheduled' | 'dispatching' | 'sent'
   sendId: string | null
+  scheduledAt: string | null
+  scheduleNextAttemptAt: string | null
+  scheduleClaimedAt: string | null
+  scheduleLastAttemptAt: string | null
+  scheduleAttemptCount: number
+  scheduleLastError: string | null
+  scheduledContentFileName: string | null
+  scheduledTextFileName: string | null
+  scheduledFromName: string | null
+  scheduledFooterHtml: string | null
+  scheduledFooterText: string | null
+  scheduledEmailStyleConfig: string | null
   createdAt: string
   updatedAt: string
   sentAt: string | null
+  deletedAt?: string | null
+}
+
+type TrashPurgeJobRecord = {
+  kind: 'newsletter' | 'draft'
+  newsletterId: string
+  itemId: string
+  contentFileName: string | null
+  textFileName: string | null
+  createdAt: string
 }
 
 class FakeKVNamespace {
@@ -246,6 +277,7 @@ class FakeD1Database {
   readonly newsletterSendRecipients = new Map<string, NewsletterSendRecipientRecord>()
   readonly newsletterSendEvents: NewsletterSendEventRecord[] = []
   readonly newsletterDrafts = new Map<string, NewsletterDraftRecord>()
+  readonly trashPurgeJobs = new Map<string, TrashPurgeJobRecord>()
   readonly attemptedRateLimitBuckets: string[] = []
   operationCount = 0
 
@@ -255,6 +287,8 @@ class FakeD1Database {
   private failFanoutAdvanceOnce: boolean
   private sourceMessageLookupMisses = 0
   private nextNewsletterSendEventId = 1
+  private beforeBatchHook: (() => void) | null = null
+  private beforeScheduleWriteHook: (() => void) | null = null
 
   constructor(options: FakeDatabaseOptions = {}) {
     this.denyBuckets = new Set(options.denyBuckets ?? [])
@@ -275,8 +309,42 @@ class FakeD1Database {
     this.operationCount = 0
   }
 
+  beforeNextBatch(hook: () => void) {
+    this.beforeBatchHook = hook
+  }
+
+  beforeNextScheduleWrite(hook: () => void) {
+    this.beforeScheduleWriteHook = hook
+  }
+
+  private runBeforeScheduleWriteHook() {
+    const hook = this.beforeScheduleWriteHook
+    this.beforeScheduleWriteHook = null
+    hook?.()
+  }
+
+  private newsletterPurgeJobIds(newsletterId?: string) {
+    return new Set(
+      Array.from(this.trashPurgeJobs.values())
+        .filter((job) => (
+          job.kind === 'newsletter' &&
+          Boolean(this.newsletters.get(job.newsletterId)?.deletedAt) &&
+          (!newsletterId || job.newsletterId === newsletterId)
+        ))
+        .map((job) => job.newsletterId)
+    )
+  }
+
   async batch(statements: Array<FakeD1PreparedStatement>) {
-    return Promise.all(statements.map((statement) => statement.run()))
+    const hook = this.beforeBatchHook
+    this.beforeBatchHook = null
+    hook?.()
+
+    const results = []
+    for (const statement of statements) {
+      results.push(await statement.run())
+    }
+    return results
   }
 
   async first<T>(sql: string, params: unknown[]): Promise<T | null> {
@@ -284,13 +352,52 @@ class FakeD1Database {
     const normalized = normalizeSql(sql)
     if (normalized.includes('select id, subscribable from newsletter where id = ?')) {
       const newsletterId = String(params[0] ?? '')
-      return (this.newsletters.get(newsletterId) ?? null) as T | null
+      const newsletter = this.newsletters.get(newsletterId)
+      if (!newsletter || (normalized.includes('deletedat is null') && newsletter.deletedAt)) {
+        return null
+      }
+      return newsletter as T
     }
 
     if (normalized.includes('select id from newsletter where id = ?')) {
       const newsletterId = String(params[0] ?? '')
       const newsletter = this.newsletters.get(newsletterId)
-      return (newsletter ? { id: newsletter.id } : null) as T | null
+      if (!newsletter || (normalized.includes('deletedat is null') && newsletter.deletedAt)) {
+        return null
+      }
+      if (normalized.includes('deletedat is not null') && !newsletter.deletedAt) {
+        return null
+      }
+      return ({ id: newsletter.id } as T)
+    }
+
+    if (
+      normalized.includes('from trashpurgejob') &&
+      normalized.includes('where kind = ? and newsletter_id = ? and item_id = ?')
+    ) {
+      const kind = String(params[0] ?? '')
+      const newsletterId = String(params[1] ?? '')
+      const itemId = String(params[2] ?? '')
+      return (this.trashPurgeJobs.get(`${kind}:${newsletterId}:${itemId}`) ?? null) as T | null
+    }
+
+    if (normalized.startsWith('select (select count(*) from newsletter where deletedat is not null)')) {
+      const newsletters = Array.from(this.newsletters.values())
+        .filter((newsletter) => Boolean(newsletter.deletedAt)).length
+      const subscribers = Array.from(this.subscribers.values())
+        .filter((subscriber) => (
+          Boolean(subscriber.deletedAt) &&
+          !this.newsletters.get(subscriber.newsletterId)?.deletedAt
+        )).length
+      const drafts = Array.from(this.newsletterDrafts.values())
+        .filter((draft) => (
+          Boolean(draft.deletedAt) &&
+          !this.newsletters.get(draft.newsletterId)?.deletedAt
+        )).length
+      if (normalized.includes(' as newsletters,')) {
+        return ({ newsletters, subscribers, drafts } as T)
+      }
+      return ({ total: newsletters + subscribers + drafts } as T)
     }
 
     if (normalized.includes('select count(*) as subscribercount from subscriber')) {
@@ -371,17 +478,72 @@ class FakeD1Database {
       return (this.newsletterSendEvents.find((event) => event.id === id) ?? null) as T | null
     }
 
-    if (normalized.includes('from newsletterdraft') && normalized.includes('where id = ?')) {
+    if (
+      normalized.includes('select d.content_file_name as contentfilename') &&
+      normalized.includes('where d.id = ? and d.newsletter_id = ?')
+    ) {
       const draftId = String(params[0] ?? '')
-      return (this.newsletterDrafts.get(draftId) ?? null) as T | null
+      const newsletterId = String(params[1] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      const newsletter = this.newsletters.get(newsletterId)
+      if (
+        !draft || draft.newsletterId !== newsletterId || !draft.deletedAt ||
+        !newsletter || newsletter.deletedAt
+      ) {
+        return null
+      }
+      return ({
+        contentFileName: draft.contentFileName,
+        textFileName: draft.textFileName,
+      } as T)
     }
 
-    if (normalized.includes('from newsletterdraft') && normalized.includes('where newsletter_id = ? and source_message_id = ?')) {
+    if (
+      normalized.includes('select id from newsletterdraft') &&
+      normalized.includes("status in ('scheduled', 'dispatching')")
+    ) {
+      const newsletterId = String(params[0] ?? '')
+      const draft = Array.from(this.newsletterDrafts.values()).find((candidate) => (
+        candidate.newsletterId === newsletterId &&
+        (candidate.status === 'scheduled' || candidate.status === 'dispatching') &&
+        !candidate.deletedAt
+      ))
+      return (draft ? { id: draft.id } : null) as T | null
+    }
+
+    if (
+      normalized.includes('from newsletterdraft') &&
+      (normalized.includes('where id = ?') || normalized.includes('where d.id = ?'))
+    ) {
+      const draftId = String(params[0] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (
+        !draft ||
+        (normalized.includes('d.deletedat is null') && draft.deletedAt) ||
+        (
+          normalized.includes('n.deletedat is null') &&
+          this.newsletters.get(draft.newsletterId)?.deletedAt
+        )
+      ) {
+        return null
+      }
+      return draft as T
+    }
+
+    if (
+      normalized.includes('from newsletterdraft') &&
+      (
+        normalized.includes('where newsletter_id = ? and source_message_id = ?') ||
+        normalized.includes('where d.newsletter_id = ? and d.source_message_id = ?')
+      )
+    ) {
       const newsletterId = String(params[0] ?? '')
       const sourceMessageId = String(params[1] ?? '')
       const draft = Array.from(this.newsletterDrafts.values()).find((candidate) => (
         candidate.newsletterId === newsletterId &&
-        candidate.sourceMessageId === sourceMessageId
+        candidate.sourceMessageId === sourceMessageId &&
+        (!normalized.includes('d.deletedat is null') || !candidate.deletedAt) &&
+        (!normalized.includes('n.deletedat is null') || !this.newsletters.get(candidate.newsletterId)?.deletedAt)
       )) ?? null
       return draft as T | null
     }
@@ -414,6 +576,96 @@ class FakeD1Database {
   async all<T>(sql: string, params: unknown[]): Promise<{ results: T[] }> {
     this.operationCount += 1
     const normalized = normalizeSql(sql)
+
+    if (normalized.includes("select kind, id, newsletterid, title, subtitle, deletedat from (")) {
+      const limit = Number(params[0] ?? Number.MAX_SAFE_INTEGER)
+      const offset = Number(params[1] ?? 0)
+      const items = [
+        ...Array.from(this.newsletters.values())
+          .filter((newsletter) => Boolean(newsletter.deletedAt))
+          .map((newsletter) => ({
+            kind: 'newsletter',
+            id: newsletter.id,
+            newsletterId: newsletter.id,
+            title: newsletter.title ?? '',
+            subtitle: 'Newsletter',
+            deletedAt: newsletter.deletedAt,
+          })),
+        ...Array.from(this.subscribers.values())
+          .filter((subscriber) => (
+            Boolean(subscriber.deletedAt) &&
+            !this.newsletters.get(subscriber.newsletterId)?.deletedAt
+          ))
+          .map((subscriber) => {
+            const name = [subscriber.firstName, subscriber.lastName].filter(Boolean).join(' ')
+            const newsletterTitle = this.newsletters.get(subscriber.newsletterId)?.title ?? ''
+            return {
+              kind: 'subscriber',
+              id: subscriber.email,
+              newsletterId: subscriber.newsletterId,
+              title: name || subscriber.email,
+              subtitle: name
+                ? `${subscriber.email} • Subscriber in “${newsletterTitle}”`
+                : `Subscriber in “${newsletterTitle}”`,
+              deletedAt: subscriber.deletedAt,
+            }
+          }),
+        ...Array.from(this.newsletterDrafts.values())
+          .filter((draft) => (
+            Boolean(draft.deletedAt) &&
+            !this.newsletters.get(draft.newsletterId)?.deletedAt
+          ))
+          .map((draft) => ({
+            kind: 'draft',
+            id: draft.id,
+            newsletterId: draft.newsletterId,
+            title: draft.subject.trim() || 'Untitled Draft',
+            subtitle: `Draft in “${this.newsletters.get(draft.newsletterId)?.title ?? ''}”`,
+            deletedAt: draft.deletedAt,
+          })),
+      ].sort((first, second) => (
+        String(second.deletedAt).localeCompare(String(first.deletedAt)) ||
+        first.kind.localeCompare(second.kind) ||
+        first.id.localeCompare(second.id)
+      )).slice(offset, offset + limit)
+      return { results: items as T[] }
+    }
+
+    if (
+      normalized.includes('from trashpurgejob') &&
+      normalized.includes('order by createdat, kind, newsletter_id, item_id')
+    ) {
+      const jobs = Array.from(this.trashPurgeJobs.values()).sort((first, second) => (
+        first.createdAt.localeCompare(second.createdAt) ||
+        first.kind.localeCompare(second.kind) ||
+        first.newsletterId.localeCompare(second.newsletterId) ||
+        first.itemId.localeCompare(second.itemId)
+      ))
+      return { results: jobs as T[] }
+    }
+
+    if (normalized === 'select id from newsletter where deletedat is not null') {
+      const newsletters = Array.from(this.newsletters.values())
+        .filter((newsletter) => Boolean(newsletter.deletedAt))
+        .map((newsletter) => ({ id: newsletter.id }))
+      return { results: newsletters as T[] }
+    }
+
+    if (
+      normalized.includes('select d.content_file_name as contentfilename') &&
+      normalized.includes('where d.deletedat is not null and n.deletedat is null')
+    ) {
+      const drafts = Array.from(this.newsletterDrafts.values())
+        .filter((draft) => (
+          Boolean(draft.deletedAt) &&
+          !this.newsletters.get(draft.newsletterId)?.deletedAt
+        ))
+        .map((draft) => ({
+          contentFileName: draft.contentFileName,
+          textFileName: draft.textFileName,
+        }))
+      return { results: drafts as T[] }
+    }
 
     if (normalized.includes('select * from subscriber')) {
       const newsletterId = String(params[0] ?? '')
@@ -507,10 +759,56 @@ class FakeD1Database {
       return { results: events as T[] }
     }
 
+    if (
+      normalized.includes('select d.id from newsletterdraft d') &&
+      normalized.includes("d.status = 'scheduled'")
+    ) {
+      const now = String(params[0] ?? '')
+      const limit = Number(params[1] ?? 100)
+      const drafts = Array.from(this.newsletterDrafts.values())
+        .filter((draft) => (
+          draft.status === 'scheduled' &&
+          !draft.deletedAt &&
+          !this.newsletters.get(draft.newsletterId)?.deletedAt &&
+          draft.scheduleNextAttemptAt !== null &&
+          draft.scheduleNextAttemptAt <= now
+        ))
+        .sort((first, second) => (
+          String(first.scheduleNextAttemptAt)
+            .localeCompare(String(second.scheduleNextAttemptAt)) ||
+          first.createdAt.localeCompare(second.createdAt)
+        ))
+        .slice(0, limit)
+        .map((draft) => ({ id: draft.id }))
+      return { results: drafts as T[] }
+    }
+
+    if (
+      normalized.includes('from newsletterdraft') &&
+      normalized.includes("status in ('scheduled', 'dispatching')")
+    ) {
+      const newsletterId = String(params[0] ?? '')
+      const drafts = Array.from(this.newsletterDrafts.values())
+        .filter((draft) => (
+          draft.newsletterId === newsletterId &&
+          (draft.status === 'scheduled' || draft.status === 'dispatching') &&
+          !draft.deletedAt
+        ))
+        .sort((first, second) => (
+          String(first.scheduledAt).localeCompare(String(second.scheduledAt)) ||
+          first.createdAt.localeCompare(second.createdAt)
+        ))
+      return { results: drafts as T[] }
+    }
+
     if (normalized.includes('from newsletterdraft') && normalized.includes("where newsletter_id = ? and status = 'draft'")) {
       const newsletterId = String(params[0] ?? '')
       const drafts = Array.from(this.newsletterDrafts.values())
-        .filter((draft) => draft.newsletterId === newsletterId && draft.status === 'draft')
+        .filter((draft) => (
+          draft.newsletterId === newsletterId &&
+          draft.status === 'draft' &&
+          (!normalized.includes('deletedat is null') || !draft.deletedAt)
+        ))
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
         .slice(0, 50)
       return { results: drafts as T[] }
@@ -530,6 +828,144 @@ class FakeD1Database {
   async run(sql: string, params: unknown[]): Promise<{ meta: { changes: number } }> {
     this.operationCount += 1
     const normalized = normalizeSql(sql)
+
+    if (normalized.includes('update newsletter set deletedat = null')) {
+      const newsletterId = String(params[0] ?? '')
+      const newsletter = this.newsletters.get(newsletterId)
+      if (!newsletter?.deletedAt) {
+        return { meta: { changes: 0 } }
+      }
+      newsletter.deletedAt = null
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('update newsletter set deletedat = ?')) {
+      const deletedAt = String(params[0] ?? '')
+      const newsletterId = String(params[1] ?? '')
+      const newsletter = this.newsletters.get(newsletterId)
+      const hasActiveSchedule = Array.from(this.newsletterDrafts.values()).some((draft) => (
+        draft.newsletterId === newsletterId &&
+        (draft.status === 'scheduled' || draft.status === 'dispatching') &&
+        !draft.deletedAt
+      ))
+      if (
+        !newsletter || newsletter.deletedAt ||
+        (normalized.includes('not exists') && hasActiveSchedule)
+      ) {
+        return { meta: { changes: 0 } }
+      }
+      newsletter.deletedAt = deletedAt
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('update newsletter set subscribable = ?')) {
+      const subscribable = Number(params[0] ?? 0)
+      const newsletterId = String(params[1] ?? '')
+      const newsletter = this.newsletters.get(newsletterId)
+      if (!newsletter || newsletter.deletedAt) {
+        return { meta: { changes: 0 } }
+      }
+      newsletter.subscribable = subscribable
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('insert or ignore into trashpurgejob')) {
+      const createdAt = String(params[0] ?? '')
+      const candidates: TrashPurgeJobRecord[] = normalized.includes("select 'newsletter'")
+        ? Array.from(this.newsletters.values())
+          .filter((newsletter) => (
+            Boolean(newsletter.deletedAt) &&
+            (params.length === 1 || newsletter.id === String(params[1] ?? ''))
+          ))
+          .map((newsletter) => ({
+            kind: 'newsletter',
+            newsletterId: newsletter.id,
+            itemId: newsletter.id,
+            contentFileName: null,
+            textFileName: null,
+            createdAt,
+          }))
+        : Array.from(this.newsletterDrafts.values())
+          .filter((draft) => (
+            Boolean(draft.deletedAt) &&
+            !this.newsletters.get(draft.newsletterId)?.deletedAt &&
+            (
+              params.length === 1 ||
+              (draft.id === String(params[1] ?? '') && draft.newsletterId === String(params[2] ?? ''))
+            )
+          ))
+          .map((draft) => ({
+            kind: 'draft',
+            newsletterId: draft.newsletterId,
+            itemId: draft.id,
+            contentFileName: draft.contentFileName,
+            textFileName: draft.textFileName,
+            createdAt,
+          }))
+
+      let changes = 0
+      for (const job of candidates) {
+        const key = `${job.kind}:${job.newsletterId}:${job.itemId}`
+        if (!this.trashPurgeJobs.has(key)) {
+          this.trashPurgeJobs.set(key, job)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (normalized.includes('update newsletterdraft set deletedat = null')) {
+      const draftId = String(params[0] ?? '')
+      const newsletterId = String(params[1] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      const newsletter = this.newsletters.get(newsletterId)
+      if (
+        !draft?.deletedAt || draft.newsletterId !== newsletterId ||
+        !newsletter || newsletter.deletedAt
+      ) {
+        return { meta: { changes: 0 } }
+      }
+      const sourceConflict = Array.from(this.newsletterDrafts.values()).some((candidate) => (
+        candidate.id !== draft.id &&
+        candidate.newsletterId === newsletterId &&
+        candidate.sourceMessageId === draft.sourceMessageId &&
+        !candidate.deletedAt
+      ))
+      if (sourceConflict) {
+        throw new Error(
+          'D1_ERROR: UNIQUE constraint failed: NewsletterDraft.newsletter_id, NewsletterDraft.source_message_id'
+        )
+      }
+      draft.deletedAt = null
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('update newsletterdraft set deletedat = ?')) {
+      const deletedAt = String(params[0] ?? '')
+      const draftId = String(params[1] ?? '')
+      const newsletterId = String(params[2] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (
+        !draft || draft.newsletterId !== newsletterId ||
+        draft.status !== 'draft' || draft.deletedAt
+      ) {
+        return { meta: { changes: 0 } }
+      }
+      draft.deletedAt = deletedAt
+      return { meta: { changes: 1 } }
+    }
+
+    if (normalized.includes('update subscriber set deleted_at = null')) {
+      const email = String(params[0] ?? '')
+      const newsletterId = String(params[1] ?? '')
+      const subscriber = this.subscribers.get(`${newsletterId}:${email}`)
+      const newsletter = this.newsletters.get(newsletterId)
+      if (!subscriber?.deletedAt || !newsletter || newsletter.deletedAt) {
+        return { meta: { changes: 0 } }
+      }
+      subscriber.deletedAt = null
+      return { meta: { changes: 1 } }
+    }
 
     if (normalized.includes('insert into subscriber')) {
       const hasNotesColumn = normalized.includes(
@@ -746,7 +1182,8 @@ class FakeD1Database {
       if (
         Array.from(this.newsletterDrafts.values()).some((draft) => (
           draft.newsletterId === newsletterId &&
-          draft.sourceMessageId === sourceMessageId
+          draft.sourceMessageId === sourceMessageId &&
+          !draft.deletedAt
         ))
       ) {
         throw new Error(
@@ -763,11 +1200,209 @@ class FakeD1Database {
         textFileName: String(params[5] ?? ''),
         status: 'draft',
         sendId: null,
+        scheduledAt: null,
+        scheduleNextAttemptAt: null,
+        scheduleClaimedAt: null,
+        scheduleLastAttemptAt: null,
+        scheduleAttemptCount: 0,
+        scheduleLastError: null,
+        scheduledContentFileName: null,
+        scheduledTextFileName: null,
+        scheduledFromName: null,
+        scheduledFooterHtml: null,
+        scheduledFooterText: null,
+        scheduledEmailStyleConfig: null,
         createdAt: String(params[6] ?? ''),
         updatedAt: String(params[7] ?? ''),
         sentAt: null,
+        deletedAt: null,
       }
       this.newsletterDrafts.set(draft.id, draft)
+      return { meta: { changes: 1 } }
+    }
+
+    if (
+      normalized.includes('update newsletterdraft') &&
+      normalized.includes('set subject = ?') &&
+      normalized.includes("status = 'scheduled'") &&
+      normalized.includes('scheduled_at = ?')
+    ) {
+      this.runBeforeScheduleWriteHook()
+      const draftId = String(params[12] ?? '')
+      const expectedStatus = String(params[13] ?? '')
+      const expectedContentFileName = String(params[14] ?? '')
+      const expectedTextFileName = String(params[15] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      const newsletter = draft ? this.newsletters.get(draft.newsletterId) : null
+      if (
+        !draft || draft.status !== expectedStatus || draft.deletedAt ||
+        draft.contentFileName !== expectedContentFileName ||
+        draft.textFileName !== expectedTextFileName ||
+        (normalized.includes('n.deletedat is null') && (!newsletter || newsletter.deletedAt))
+      ) {
+        return { meta: { changes: 0 } }
+      }
+      const wasDraft = draft.status === 'draft'
+      draft.subject = String(params[0] ?? '')
+      draft.contentFileName = String(params[1] ?? '')
+      draft.textFileName = String(params[2] ?? '')
+      draft.status = 'scheduled'
+      draft.scheduledAt = String(params[3] ?? '')
+      draft.scheduleNextAttemptAt = String(params[4] ?? '')
+      draft.scheduleClaimedAt = null
+      draft.scheduleLastAttemptAt = null
+      draft.scheduleAttemptCount = wasDraft ? 0 : draft.scheduleAttemptCount
+      draft.scheduleLastError = null
+      draft.scheduledContentFileName = String(params[5] ?? '')
+      draft.scheduledTextFileName = String(params[6] ?? '')
+      draft.scheduledFromName = params[7] === null ? null : String(params[7] ?? '')
+      draft.scheduledFooterHtml = String(params[8] ?? '')
+      draft.scheduledFooterText = String(params[9] ?? '')
+      draft.scheduledEmailStyleConfig = String(params[10] ?? '')
+      draft.updatedAt = String(params[11] ?? '')
+      return { meta: { changes: 1 } }
+    }
+
+    if (
+      normalized.includes('update newsletterdraft') &&
+      normalized.includes('scheduled_content_file_name = ?') &&
+      normalized.includes("where id = ? and status = 'scheduled'")
+    ) {
+      this.runBeforeScheduleWriteHook()
+      const draftId = String(params[6] ?? '')
+      const expectedContentFileName = String(params[7] ?? '')
+      const expectedTextFileName = String(params[8] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (
+        !draft || draft.status !== 'scheduled' || draft.deletedAt ||
+        draft.contentFileName !== expectedContentFileName ||
+        draft.textFileName !== expectedTextFileName
+      ) {
+        return { meta: { changes: 0 } }
+      }
+      draft.subject = String(params[0] ?? '')
+      draft.contentFileName = String(params[1] ?? '')
+      draft.textFileName = String(params[2] ?? '')
+      draft.scheduledContentFileName = String(params[3] ?? '')
+      draft.scheduledTextFileName = String(params[4] ?? '')
+      draft.scheduleNextAttemptAt = draft.scheduledAt
+      draft.scheduleClaimedAt = null
+      draft.scheduleLastError = null
+      draft.updatedAt = String(params[5] ?? '')
+      return { meta: { changes: 1 } }
+    }
+
+    if (
+      normalized.includes('update newsletterdraft') &&
+      normalized.includes("set status = 'draft', scheduled_at = null")
+    ) {
+      const draftId = String(params[1] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (!draft || draft.status !== 'scheduled' || draft.deletedAt) {
+        return { meta: { changes: 0 } }
+      }
+      draft.status = 'draft'
+      draft.scheduledAt = null
+      draft.scheduleNextAttemptAt = null
+      draft.scheduleClaimedAt = null
+      draft.scheduleLastAttemptAt = null
+      draft.scheduleAttemptCount = 0
+      draft.scheduleLastError = null
+      draft.scheduledContentFileName = null
+      draft.scheduledTextFileName = null
+      draft.scheduledFromName = null
+      draft.scheduledFooterHtml = null
+      draft.scheduledFooterText = null
+      draft.scheduledEmailStyleConfig = null
+      draft.updatedAt = String(params[0] ?? '')
+      return { meta: { changes: 1 } }
+    }
+
+    if (
+      normalized.includes('update newsletterdraft') &&
+      normalized.includes("set status = 'dispatching'")
+    ) {
+      const draftId = String(params[3] ?? '')
+      const dueAt = params.length > 4 ? String(params[4] ?? '') : null
+      const draft = this.newsletterDrafts.get(draftId)
+      const nextAttemptAt = draft?.scheduleNextAttemptAt ?? draft?.scheduledAt ?? ''
+      if (
+        !draft || draft.status !== 'scheduled' || draft.deletedAt ||
+        (dueAt !== null && String(nextAttemptAt) > dueAt)
+      ) {
+        return { meta: { changes: 0 } }
+      }
+      draft.status = 'dispatching'
+      draft.scheduleClaimedAt = String(params[0] ?? '')
+      draft.scheduleLastAttemptAt = String(params[1] ?? '')
+      draft.scheduleAttemptCount += 1
+      draft.updatedAt = String(params[2] ?? '')
+      return { meta: { changes: 1 } }
+    }
+
+    if (
+      normalized.includes('update newsletterdraft') &&
+      normalized.includes("set status = 'scheduled'") &&
+      normalized.includes('where status = \'dispatching\'') &&
+      normalized.includes('schedule_claimed_at <= ?')
+    ) {
+      const nextAttemptAt = String(params[0] ?? '')
+      const updatedAt = String(params[1] ?? '')
+      const staleBefore = String(params[2] ?? '')
+      let changes = 0
+      for (const draft of this.newsletterDrafts.values()) {
+        if (
+          draft.status === 'dispatching' && !draft.deletedAt &&
+          String(draft.scheduleClaimedAt ?? '') <= staleBefore
+        ) {
+          draft.status = 'scheduled'
+          draft.scheduleNextAttemptAt = nextAttemptAt
+          draft.scheduleClaimedAt = null
+          draft.scheduleLastError = 'Recovered a stale dispatch claim.'
+          draft.updatedAt = updatedAt
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (
+      normalized.includes('update newsletterdraft') &&
+      normalized.includes("set status = 'scheduled'") &&
+      normalized.includes("where id = ? and status = 'dispatching'")
+    ) {
+      const draftId = String(params[3] ?? '')
+      const claimedAt = String(params[4] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (
+        !draft || draft.status !== 'dispatching' ||
+        draft.scheduleClaimedAt !== claimedAt
+      ) {
+        return { meta: { changes: 0 } }
+      }
+      draft.status = 'scheduled'
+      draft.scheduleNextAttemptAt = String(params[0] ?? '')
+      draft.scheduleClaimedAt = null
+      draft.scheduleLastError = String(params[1] ?? '')
+      draft.updatedAt = String(params[2] ?? '')
+      return { meta: { changes: 1 } }
+    }
+
+    if (
+      normalized.includes('update newsletterdraft') &&
+      normalized.includes('set scheduled_at = ?') &&
+      normalized.includes("where id = ? and status = 'scheduled'")
+    ) {
+      const draftId = String(params[3] ?? '')
+      const draft = this.newsletterDrafts.get(draftId)
+      if (!draft || draft.status !== 'scheduled' || draft.deletedAt) {
+        return { meta: { changes: 0 } }
+      }
+      draft.scheduledAt = String(params[0] ?? '')
+      draft.scheduleNextAttemptAt = String(params[1] ?? '')
+      draft.scheduleClaimedAt = null
+      draft.scheduleLastError = null
+      draft.updatedAt = String(params[2] ?? '')
       return { meta: { changes: 1 } }
     }
 
@@ -776,11 +1411,15 @@ class FakeD1Database {
       const sentAt = String(params[1] ?? '')
       const updatedAt = String(params[2] ?? '')
       const draftId = String(params[3] ?? '')
+      const expectedStatus = String(params[4] ?? 'draft')
       const draft = this.newsletterDrafts.get(draftId)
-      if (draft && draft.status === 'draft') {
+      if (draft && draft.status === expectedStatus) {
         draft.status = 'sent'
         draft.sendId = sendId
         draft.sentAt = sentAt
+        draft.scheduleNextAttemptAt = null
+        draft.scheduleClaimedAt = null
+        draft.scheduleLastError = null
         draft.updatedAt = updatedAt
         return { meta: { changes: 1 } }
       }
@@ -800,10 +1439,74 @@ class FakeD1Database {
       return { meta: { changes: 0 } }
     }
 
+    if (
+      normalized.includes('delete from newsletterdraft where deletedat is not null') &&
+      normalized.includes("where kind = 'draft'")
+    ) {
+      let changes = 0
+      for (const [draftId, draft] of Array.from(this.newsletterDrafts.entries())) {
+        const job = this.trashPurgeJobs.get(`draft:${draft.newsletterId}:${draft.id}`)
+        if (
+          draft.deletedAt &&
+          !this.newsletters.get(draft.newsletterId)?.deletedAt &&
+          job
+        ) {
+          this.newsletterDrafts.delete(draftId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
     if (normalized.includes('delete from newsletterdraft where id = ?')) {
       const draftId = String(params[0] ?? '')
-      const deleted = this.newsletterDrafts.delete(draftId)
+      const newsletterId = params.length > 1 ? String(params[1] ?? '') : null
+      const draft = this.newsletterDrafts.get(draftId)
+      const hasPurgeJob = !normalized.includes('from trashpurgejob') || Boolean(
+        newsletterId && this.trashPurgeJobs.has(`draft:${newsletterId}:${draftId}`)
+      )
+      const deleted = Boolean(
+        draft &&
+        (!newsletterId || draft.newsletterId === newsletterId) &&
+        (!normalized.includes('deletedat is not null') || draft.deletedAt) &&
+        hasPurgeJob
+      ) && this.newsletterDrafts.delete(draftId)
       return { meta: { changes: deleted ? 1 : 0 } }
+    }
+
+    if (
+      normalized.includes('delete from newsletterdraft') &&
+      normalized.includes('where newsletter_id in (select n.id')
+    ) {
+      const newsletterId = params.length > 0 ? String(params[0] ?? '') : undefined
+      const purgeIds = this.newsletterPurgeJobIds(newsletterId)
+      let changes = 0
+      for (const [draftId, draft] of Array.from(this.newsletterDrafts.entries())) {
+        if (purgeIds.has(draft.newsletterId)) {
+          this.newsletterDrafts.delete(draftId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (
+      normalized.includes('delete from newsletterdraft where deletedat is not null') ||
+      normalized.includes('delete from newsletterdraft where deletedat is not null or newsletter_id in')
+    ) {
+      const trashedNewsletterIds = new Set(
+        Array.from(this.newsletters.values())
+          .filter((newsletter) => Boolean(newsletter.deletedAt))
+          .map((newsletter) => newsletter.id)
+      )
+      let changes = 0
+      for (const [draftId, draft] of Array.from(this.newsletterDrafts.entries())) {
+        if (draft.deletedAt || trashedNewsletterIds.has(draft.newsletterId)) {
+          this.newsletterDrafts.delete(draftId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
     }
 
     if (normalized.includes('delete from newsletterdraft where newsletter_id = ?')) {
@@ -812,6 +1515,39 @@ class FakeD1Database {
       for (const [draftId, draft] of Array.from(this.newsletterDrafts.entries())) {
         if (draft.newsletterId === newsletterId) {
           this.newsletterDrafts.delete(draftId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (
+      normalized.includes('delete from subscriber where deleted_at is not null') &&
+      normalized.includes('where id = subscriber.newsletter_id and deletedat is null')
+    ) {
+      let changes = 0
+      for (const [subscriberId, subscriber] of Array.from(this.subscribers.entries())) {
+        if (
+          subscriber.deletedAt &&
+          !this.newsletters.get(subscriber.newsletterId)?.deletedAt
+        ) {
+          this.subscribers.delete(subscriberId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (
+      normalized.includes('delete from subscriber') &&
+      normalized.includes('where newsletter_id in (select n.id')
+    ) {
+      const newsletterId = params.length > 0 ? String(params[0] ?? '') : undefined
+      const purgeIds = this.newsletterPurgeJobIds(newsletterId)
+      let changes = 0
+      for (const [subscriberId, subscriber] of Array.from(this.subscribers.entries())) {
+        if (purgeIds.has(subscriber.newsletterId)) {
+          this.subscribers.delete(subscriberId)
           changes += 1
         }
       }
@@ -830,9 +1566,119 @@ class FakeD1Database {
       return { meta: { changes } }
     }
 
+    if (normalized.includes('delete from subscriber where email = ? and newsletter_id = ?')) {
+      const email = String(params[0] ?? '')
+      const newsletterId = String(params[1] ?? '')
+      const key = `${newsletterId}:${email}`
+      const subscriber = this.subscribers.get(key)
+      const newsletter = this.newsletters.get(newsletterId)
+      const canDelete = Boolean(
+        subscriber?.deletedAt && newsletter && !newsletter.deletedAt
+      )
+      if (canDelete) {
+        this.subscribers.delete(key)
+      }
+      return { meta: { changes: canDelete ? 1 : 0 } }
+    }
+
+    if (normalized.includes('delete from subscriber where deleted_at is not null')) {
+      const trashedNewsletterIds = new Set(
+        Array.from(this.newsletters.values())
+          .filter((newsletter) => Boolean(newsletter.deletedAt))
+          .map((newsletter) => newsletter.id)
+      )
+      let changes = 0
+      for (const [subscriberId, subscriber] of Array.from(this.subscribers.entries())) {
+        if (subscriber.deletedAt || trashedNewsletterIds.has(subscriber.newsletterId)) {
+          this.subscribers.delete(subscriberId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (normalized.includes('delete from newslettersendevent where newsletter_id')) {
+      const newsletterId = params.length > 0 ? String(params[0] ?? '') : undefined
+      const purgeIds = this.newsletterPurgeJobIds(newsletterId)
+      const shouldDelete = (event: NewsletterSendEventRecord) => (
+        purgeIds.has(event.newsletterId)
+      )
+      const remaining = this.newsletterSendEvents.filter((event) => !shouldDelete(event))
+      const changes = this.newsletterSendEvents.length - remaining.length
+      this.newsletterSendEvents.length = 0
+      this.newsletterSendEvents.push(...remaining)
+      return { meta: { changes } }
+    }
+
+    if (normalized.includes('delete from newslettersendrecipient where newsletter_id')) {
+      const newsletterId = params.length > 0 ? String(params[0] ?? '') : undefined
+      const purgeIds = this.newsletterPurgeJobIds(newsletterId)
+      let changes = 0
+      for (const [recipientId, recipient] of Array.from(this.newsletterSendRecipients.entries())) {
+        if (purgeIds.has(recipient.newsletterId)) {
+          this.newsletterSendRecipients.delete(recipientId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (normalized.includes('delete from newslettersend where newsletter_id')) {
+      const newsletterId = params.length > 0 ? String(params[0] ?? '') : undefined
+      const purgeIds = this.newsletterPurgeJobIds(newsletterId)
+      let changes = 0
+      for (const [sendId, send] of Array.from(this.newsletterSends.entries())) {
+        if (purgeIds.has(send.newsletterId)) {
+          this.newsletterSends.delete(sendId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (
+      normalized.includes('delete from newsletter where deletedat is not null') &&
+      normalized.includes('from trashpurgejob')
+    ) {
+      const purgeIds = this.newsletterPurgeJobIds()
+      let changes = 0
+      for (const newsletterId of purgeIds) {
+        if (this.newsletters.delete(newsletterId)) {
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
+    if (normalized === 'delete from newsletter where deletedat is not null') {
+      let changes = 0
+      for (const [newsletterId, newsletter] of Array.from(this.newsletters.entries())) {
+        if (newsletter.deletedAt) {
+          this.newsletters.delete(newsletterId)
+          changes += 1
+        }
+      }
+      return { meta: { changes } }
+    }
+
     if (normalized.includes('delete from newsletter where id = ?')) {
       const newsletterId = String(params[0] ?? '')
-      const deleted = this.newsletters.delete(newsletterId)
+      const newsletter = this.newsletters.get(newsletterId)
+      const hasPurgeJob = !normalized.includes('from trashpurgejob') ||
+        this.trashPurgeJobs.has(`newsletter:${newsletterId}:${newsletterId}`)
+      const deleted = Boolean(
+        newsletter &&
+        (!normalized.includes('deletedat is not null') || newsletter.deletedAt) &&
+        hasPurgeJob
+      ) && this.newsletters.delete(newsletterId)
+      return { meta: { changes: deleted ? 1 : 0 } }
+    }
+
+    if (normalized.includes('delete from trashpurgejob')) {
+      const kind = String(params[0] ?? '')
+      const newsletterId = String(params[1] ?? '')
+      const itemId = String(params[2] ?? '')
+      const deleted = this.trashPurgeJobs.delete(`${kind}:${newsletterId}:${itemId}`)
       return { meta: { changes: deleted ? 1 : 0 } }
     }
 
@@ -877,11 +1723,12 @@ class FakeD1Database {
         fromName: params[8] === null ? null : String(params[8] ?? ''),
         footerHtml: params[9] === null ? null : String(params[9] ?? ''),
         footerText: params[10] === null ? null : String(params[10] ?? ''),
-        fanoutSnapshotAt: params[11] === null ? null : String(params[11] ?? ''),
+        scheduledAt: params[11] === null ? null : String(params[11] ?? ''),
+        fanoutSnapshotAt: params[12] === null ? null : String(params[12] ?? ''),
         fanoutCursorEmail: null,
         fanoutCompletedAt: null,
-        createdAt: String(params[12] ?? ''),
-        updatedAt: String(params[13] ?? ''),
+        createdAt: String(params[13] ?? ''),
+        updatedAt: String(params[14] ?? ''),
         completedAt: null,
       }
       this.newsletterSends.set(send.id, send)
@@ -1112,7 +1959,16 @@ function subscriberEligibleAt(subscriber: SubscriberRecord, snapshotAt: string) 
 
 function createEnv(options: FakeDatabaseOptions = {}) {
   const db = new FakeD1Database(options)
-  db.newsletters.set(NEWSLETTER_ID, { id: NEWSLETTER_ID, subscribable: 1 })
+  db.newsletters.set(NEWSLETTER_ID, {
+    id: NEWSLETTER_ID,
+    subscribable: 1,
+    title: 'Test Newsletter',
+    description: 'Test description',
+    logo: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    deletedAt: null,
+  })
 
   const kv = new FakeKVNamespace()
   const notificationFetch = vi.fn(async () => (
@@ -1134,13 +1990,22 @@ function createEnv(options: FakeDatabaseOptions = {}) {
       text: async () => value,
     }
   })
-  const r2Delete = vi.fn(async (key: string) => {
-    r2Objects.delete(key)
+  let shouldFailR2Delete = options.failR2DeleteOnce ?? false
+  const r2Delete = vi.fn(async (keyOrKeys: string | string[]) => {
+    if (shouldFailR2Delete) {
+      shouldFailR2Delete = false
+      throw new Error('Simulated R2 delete failure')
+    }
+    const keys = Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]
+    for (const key of keys) {
+      r2Objects.delete(key)
+    }
   })
-  let shouldFailQueueSend = options.failQueueSendOnce ?? false
+  let remainingQueueSendFailures = options.failQueueSendCount
+    ?? (options.failQueueSendOnce ? 1 : 0)
   const queueSend = vi.fn(async () => {
-    if (shouldFailQueueSend) {
-      shouldFailQueueSend = false
+    if (remainingQueueSendFailures > 0) {
+      remainingQueueSendFailures -= 1
       throw new Error('Simulated queue send failure')
     }
   })
@@ -1162,7 +2027,12 @@ function createEnv(options: FakeDatabaseOptions = {}) {
     R2: {
       put: r2Put,
       get: r2Get,
-      list: vi.fn(async () => ({ objects: [], truncated: false })),
+      list: vi.fn(async (options?: { prefix?: string }) => ({
+        objects: Array.from(r2Objects.keys())
+          .filter((key) => !options?.prefix || key.startsWith(options.prefix))
+          .map((key) => ({ key })),
+        truncated: false,
+      })),
       delete: r2Delete,
     } as unknown as R2Bucket,
     QUEUE: {
@@ -1193,6 +2063,7 @@ function createEnv(options: FakeDatabaseOptions = {}) {
     r2Put,
     r2Get,
     r2Delete,
+    r2Objects,
     queueSend,
     queueSendBatch,
     sendStatusBrokerFetch,
@@ -1283,6 +2154,78 @@ async function deleteJson(
     method: 'DELETE',
     headers,
   }, env)
+}
+
+function futureWholeMinute(minutesFromNow = 10) {
+  const minute = Math.floor(Date.now() / 60_000) + minutesFromNow
+  return new Date(minute * 60_000).toISOString()
+}
+
+async function runScheduledHandler(env: ReturnType<typeof createEnv>['env']) {
+  const pending: Promise<unknown>[] = []
+  const context = {
+    waitUntil(promise: Promise<unknown>) {
+      pending.push(promise)
+    },
+  } as unknown as ExecutionContext
+  await worker.scheduled(
+    {} as ScheduledController,
+    env,
+    context
+  )
+  await Promise.all(pending)
+}
+
+async function createScheduledDraft(
+  env: ReturnType<typeof createEnv>['env'],
+  input: {
+    subject?: string
+    html?: string
+    text?: string
+    sourceMessageId?: string
+    scheduledAt?: string
+  } = {}
+) {
+  const subject = input.subject ?? 'Scheduled title'
+  const html = input.html ?? '<p>Scheduled body</p>'
+  const text = input.text ?? 'Scheduled body'
+  const createResponse = await postJson(
+    env,
+    `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+    {
+      subject,
+      html,
+      text,
+      sourceMessageId: input.sourceMessageId ?? 'scheduled-source-id',
+    },
+    { Authorization: 'Bearer admin-token' }
+  )
+  expect(createResponse.status).toBe(201)
+  const created = await createResponse.json() as {
+    draft: { id: string; sourceMessageId: string }
+  }
+  const scheduledAt = input.scheduledAt ?? futureWholeMinute()
+  const scheduleResponse = await postJson(
+    env,
+    `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}/schedule`,
+    {
+      subject,
+      html,
+      text,
+      sourceMessageId: created.draft.sourceMessageId,
+      scheduledAt,
+    },
+    { Authorization: 'Bearer admin-token' }
+  )
+  expect(scheduleResponse.status).toBe(200)
+  const scheduled = await scheduleResponse.json() as {
+    scheduledSend: {
+      draftId: string
+      scheduledAt: string
+      state: string
+    }
+  }
+  return { created, scheduled, scheduledAt }
 }
 
 function createRawEmailStream(subject: string, messageId: string) {
@@ -3334,7 +4277,7 @@ describe('direct newsletter publish endpoint', () => {
 
     expect(response.status).toBe(400)
     expect(body.error).toBe('Recipient search must be 256 bytes or fewer')
-    expect(db.operationCount).toBe(1)
+    expect(db.operationCount).toBe(2)
   })
 
   it('returns bounded snapshots and paged send event history', async () => {
@@ -3509,7 +4452,7 @@ describe('newsletter draft admin endpoints', () => {
     await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' })
   })
 
-  it('creates, lists, loads, updates, and deletes active drafts', async () => {
+  it('creates, lists, loads, updates, and trashes active drafts', async () => {
     const { env, db, r2Put, r2Delete } = createEnv()
 
     const createResponse = await postJson(
@@ -3573,9 +4516,10 @@ describe('newsletter draft admin endpoints', () => {
     )
 
     expect(deleteResponse.status).toBe(200)
-    expect(db.newsletterDrafts.has(created.draft.id)).toBe(false)
-    expect(r2Delete).toHaveBeenCalledWith(created.draft.contentFileName)
-    expect(r2Delete).toHaveBeenCalledWith(created.draft.textFileName)
+    expect(db.newsletterDrafts.get(created.draft.id)?.deletedAt).toEqual(expect.any(String))
+    expect(r2Delete).not.toHaveBeenCalled()
+    const afterDelete = await getJson(env, `/api/newsletter/${NEWSLETTER_ID}/drafts`, auth)
+    await expect(afterDelete.json()).resolves.toEqual({ drafts: [] })
   })
 
   it('treats repeated draft creates with the same sourceMessageId as an update', async () => {
@@ -3627,7 +4571,7 @@ describe('newsletter draft admin endpoints', () => {
     }))
   })
 
-  it('deletes draft metadata before deleting a newsletter', async () => {
+  it('keeps child content packaged when trashing a newsletter', async () => {
     const { env, db } = createEnv()
     const createResponse = await postJson(
       env,
@@ -3651,10 +4595,10 @@ describe('newsletter draft admin endpoints', () => {
 
     expect(deleteResponse.status).toBe(200)
     await expect(deleteResponse.json()).resolves.toEqual({
-      message: 'Newsletter deleted successfully',
+      message: 'Newsletter moved to Trash successfully',
     })
-    expect(db.newsletterDrafts.size).toBe(0)
-    expect(db.newsletters.has(NEWSLETTER_ID)).toBe(false)
+    expect(db.newsletterDrafts.size).toBe(1)
+    expect(db.newsletters.get(NEWSLETTER_ID)?.deletedAt).toEqual(expect.any(String))
   })
 
   it('sends a draft with its stable sourceMessageId and hides it from active drafts', async () => {
@@ -3906,6 +4850,890 @@ describe('newsletter draft admin endpoints', () => {
     await expect(missingContentResponse.json()).resolves.toEqual({
       error: 'Newsletter send content not found',
     })
+  })
+})
+
+describe('scheduled newsletter sends', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const auth = { Authorization: 'Bearer admin-token' }
+
+  it('validates source identity, content, and future whole-minute timestamps', async () => {
+    const { env, db } = createEnv()
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'Schedule validation',
+        html: '<p>Body</p>',
+        text: 'Body',
+        sourceMessageId: 'schedule-validation-source',
+      },
+      auth
+    )
+    const created = await createResponse.json() as {
+      draft: { id: string; sourceMessageId: string }
+    }
+    const schedulePath = `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}/schedule`
+    const validBody = {
+      subject: 'Schedule validation',
+      html: '<p>Body</p>',
+      text: 'Body',
+      sourceMessageId: created.draft.sourceMessageId,
+      scheduledAt: futureWholeMinute(),
+    }
+    const pastWholeMinute = new Date(
+      (Math.floor(Date.now() / 60_000) - 1) * 60_000
+    ).toISOString()
+    const futureWithSeconds = new Date(
+      Date.parse(futureWholeMinute()) + 1_000
+    ).toISOString()
+    const cases = [
+      {
+        body: { ...validBody, sourceMessageId: '' },
+        status: 400,
+        error: 'sourceMessageId is required',
+      },
+      {
+        body: { ...validBody, sourceMessageId: 'another-source' },
+        status: 409,
+        error: 'sourceMessageId does not match the draft',
+      },
+      {
+        body: { ...validBody, scheduledAt: 'not-a-date' },
+        status: 400,
+        error: 'scheduledAt must be a valid ISO-8601 timestamp',
+      },
+      {
+        body: { ...validBody, scheduledAt: 'July 21, 2026 12:00 PM' },
+        status: 400,
+        error: 'scheduledAt must be a valid ISO-8601 timestamp',
+      },
+      {
+        body: { ...validBody, scheduledAt: futureWithSeconds },
+        status: 400,
+        error: 'scheduledAt must use whole-minute precision',
+      },
+      {
+        body: { ...validBody, scheduledAt: pastWholeMinute },
+        status: 400,
+        error: 'scheduledAt must be in the future',
+      },
+      {
+        body: { ...validBody, html: '' },
+        status: 400,
+        error: 'Email html and text are required',
+      },
+    ]
+
+    for (const testCase of cases) {
+      const response = await postJson(env, schedulePath, testCase.body, auth)
+      expect(response.status).toBe(testCase.status)
+      await expect(response.json()).resolves.toEqual({ error: testCase.error })
+    }
+    expect(db.newsletterDrafts.get(created.draft.id)?.status).toBe('draft')
+  })
+
+  it('does not create a hidden schedule when newsletter deletion wins the write race', async () => {
+    const { env, db, r2Objects } = createEnv()
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      {
+        subject: 'Deletion race',
+        html: '<p>Original body</p>',
+        text: 'Original body',
+        sourceMessageId: 'schedule-deletion-race-source',
+      },
+      auth
+    )
+    const created = await createResponse.json() as {
+      draft: {
+        id: string
+        contentFileName: string
+        textFileName: string
+        sourceMessageId: string
+      }
+    }
+    const originalKeys = Array.from(r2Objects.keys()).sort()
+    const originalHtml = r2Objects.get(created.draft.contentFileName)
+    const originalText = r2Objects.get(created.draft.textFileName)
+    db.beforeNextScheduleWrite(() => {
+      const newsletter = db.newsletters.get(NEWSLETTER_ID)
+      if (newsletter) newsletter.deletedAt = new Date().toISOString()
+    })
+
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}/schedule`,
+      {
+        subject: 'Deletion race',
+        html: '<p>Scheduled body</p>',
+        text: 'Scheduled body',
+        sourceMessageId: created.draft.sourceMessageId,
+        scheduledAt: futureWholeMinute(),
+      },
+      auth
+    )
+
+    expect(response.status).toBe(409)
+    expect(db.newsletterDrafts.get(created.draft.id)).toEqual(expect.objectContaining({
+      status: 'draft',
+      contentFileName: created.draft.contentFileName,
+      textFileName: created.draft.textFileName,
+      scheduledAt: null,
+    }))
+    expect(r2Objects.get(created.draft.contentFileName)).toBe(originalHtml)
+    expect(r2Objects.get(created.draft.textFileName)).toBe(originalText)
+    expect(Array.from(r2Objects.keys()).sort()).toEqual(originalKeys)
+  })
+
+  it('keeps editable and delivery snapshots intact when dispatch claims an edit race', async () => {
+    const { env, db, r2Objects } = createEnv()
+    const fixture = await createScheduledDraft(env, {
+      sourceMessageId: 'scheduled-edit-claim-race-source',
+    })
+    const draftId = fixture.created.draft.id
+    const draft = db.newsletterDrafts.get(draftId)
+    if (!draft?.scheduledContentFileName || !draft.scheduledTextFileName) {
+      throw new Error('Expected scheduled draft snapshots')
+    }
+    const originalPointers = {
+      contentFileName: draft.contentFileName,
+      textFileName: draft.textFileName,
+      scheduledContentFileName: draft.scheduledContentFileName,
+      scheduledTextFileName: draft.scheduledTextFileName,
+    }
+    const originalContents = new Map(
+      Object.values(originalPointers).map((key) => [key, r2Objects.get(key)])
+    )
+    const originalKeys = Array.from(r2Objects.keys()).sort()
+    db.beforeNextScheduleWrite(() => {
+      draft.status = 'dispatching'
+      draft.scheduleClaimedAt = new Date().toISOString()
+    })
+
+    const response = await putJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${draftId}`,
+      {
+        subject: 'Too late to edit',
+        html: '<p>Too late to edit</p>',
+        text: 'Too late to edit',
+      },
+      auth
+    )
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Delivery has already started. Refresh Send Activity to see the current status.',
+    })
+    expect(db.newsletterDrafts.get(draftId)).toEqual(expect.objectContaining({
+      status: 'dispatching',
+      ...originalPointers,
+    }))
+    for (const [key, content] of originalContents) {
+      expect(r2Objects.get(key)).toBe(content)
+    }
+    expect(Array.from(r2Objects.keys()).sort()).toEqual(originalKeys)
+  })
+
+  it('stores versioned snapshots, freezes configuration, edits, reschedules, lists, and cancels', async () => {
+    const { env, db, kv, r2Objects } = createEnv()
+    const capturedStyle = factoryEmailStyleConfig()
+    capturedStyle.body.fontSizePx = 17
+    const capturedFooter = {
+      html: `<p>Captured <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">unsubscribe</a></p>`,
+      text: `Captured unsubscribe: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+    }
+    await kv.put('publish-config', JSON.stringify({ fromName: 'Captured Sender' }))
+    await kv.put('unsubscribe-footer-config', JSON.stringify(capturedFooter))
+    await kv.put('email-style-config-v1', JSON.stringify(capturedStyle))
+
+    const fixture = await createScheduledDraft(env, {
+      sourceMessageId: 'snapshot-schedule-source',
+    })
+    const draftId = fixture.created.draft.id
+    const initial = db.newsletterDrafts.get(draftId)
+    const firstEditableHtml = initial?.contentFileName
+    const firstEditableText = initial?.textFileName
+    const firstSnapshot = initial?.scheduledContentFileName
+    expect(initial).toEqual(expect.objectContaining({
+      status: 'scheduled',
+      scheduledFromName: 'Captured Sender',
+      scheduledFooterHtml: capturedFooter.html,
+      scheduledFooterText: capturedFooter.text,
+      scheduledEmailStyleConfig: JSON.stringify(capturedStyle),
+      scheduleAttemptCount: 0,
+      scheduleLastError: null,
+    }))
+    expect(firstSnapshot).toMatch(
+      new RegExp(`^newsletters/${NEWSLETTER_ID}/scheduled/${draftId}/.+\\.html$`)
+    )
+    expect(firstEditableHtml).toMatch(
+      new RegExp(`^newsletters/${NEWSLETTER_ID}/drafts/${draftId}/.+\\.html$`)
+    )
+    expect(r2Objects.get(String(firstSnapshot))).toContain('font-size: 17px')
+
+    const changedStyle = factoryEmailStyleConfig()
+    changedStyle.body.fontSizePx = 31
+    await kv.put('publish-config', JSON.stringify({ fromName: 'New Sender' }))
+    await kv.put('unsubscribe-footer-config', JSON.stringify({
+      html: `<p>New <a href="${UNSUBSCRIBE_PLACEHOLDER_URL}">unsubscribe</a></p>`,
+      text: `New unsubscribe: ${UNSUBSCRIBE_PLACEHOLDER_URL}`,
+    }))
+    await kv.put('email-style-config-v1', JSON.stringify(changedStyle))
+
+    const rescheduledAt = futureWholeMinute(20)
+    const rescheduleResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/scheduled-sends/${draftId}`,
+      { scheduledAt: rescheduledAt },
+      auth
+    )
+    expect(rescheduleResponse.status).toBe(200)
+    expect(db.newsletterDrafts.get(draftId)).toEqual(expect.objectContaining({
+      scheduledAt: rescheduledAt,
+      scheduledContentFileName: firstSnapshot,
+      scheduledFromName: 'Captured Sender',
+      scheduledEmailStyleConfig: JSON.stringify(capturedStyle),
+    }))
+
+    const updateResponse = await putJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${draftId}`,
+      {
+        subject: 'Edited scheduled title',
+        html: '<p>Edited scheduled body</p>',
+        text: 'Edited scheduled body',
+      },
+      auth
+    )
+    const updated = await updateResponse.json() as {
+      draft: { scheduledAt: string; scheduleLastError: string | null }
+    }
+    const editedRecord = db.newsletterDrafts.get(draftId)
+    const secondEditableHtml = editedRecord?.contentFileName
+    const secondSnapshot = editedRecord?.scheduledContentFileName
+    expect(updateResponse.status).toBe(200)
+    expect(updated.draft).toEqual(expect.objectContaining({
+      scheduledAt: rescheduledAt,
+      scheduleLastError: null,
+    }))
+    expect(secondSnapshot).not.toBe(firstSnapshot)
+    expect(secondEditableHtml).not.toBe(firstEditableHtml)
+    expect(r2Objects.has(String(firstEditableHtml))).toBe(false)
+    expect(r2Objects.has(String(firstEditableText))).toBe(false)
+    expect(r2Objects.has(String(firstSnapshot))).toBe(false)
+    expect(r2Objects.get(String(secondSnapshot))).toContain('font-size: 17px')
+    expect(r2Objects.get(String(secondSnapshot))).not.toContain('font-size: 31px')
+    expect(r2Objects.get(String(editedRecord?.contentFileName))).toBe(
+      '<p>Edited scheduled body</p>'
+    )
+
+    const listResponse = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/scheduled-sends`,
+      auth
+    )
+    await expect(listResponse.json()).resolves.toEqual({
+      scheduledSends: [expect.objectContaining({
+        draftId,
+        subject: 'Edited scheduled title',
+        state: 'scheduled',
+        scheduledAt: rescheduledAt,
+        attemptCount: 0,
+        lastError: null,
+      })],
+    })
+
+    const cancelResponse = await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/scheduled-sends/${draftId}`,
+      auth
+    )
+    const canceled = await cancelResponse.json()
+    expect(cancelResponse.status).toBe(200)
+    expect(canceled).toEqual(expect.objectContaining({
+      draft: expect.objectContaining({ status: 'draft', scheduledAt: null }),
+      html: '<p>Edited scheduled body</p>',
+      text: 'Edited scheduled body',
+    }))
+    expect(db.newsletterDrafts.get(draftId)).toEqual(expect.objectContaining({
+      status: 'draft',
+      scheduledAt: null,
+      scheduledContentFileName: null,
+      scheduledEmailStyleConfig: null,
+    }))
+    expect(r2Objects.has(String(secondSnapshot))).toBe(false)
+    expect(r2Objects.has(String(editedRecord?.contentFileName))).toBe(true)
+  })
+
+  it('Send Now bypasses future backoff and resolves subscribers at dispatch time', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:removed@example.com`, {
+      email: 'removed@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const fixture = await createScheduledDraft(env, {
+      sourceMessageId: 'send-now-schedule-source',
+    })
+    const draftId = fixture.created.draft.id
+    const draft = db.newsletterDrafts.get(draftId)
+    if (!draft) throw new Error('Expected scheduled draft')
+    draft.scheduleNextAttemptAt = futureWholeMinute(1_000)
+    const removed = db.subscribers.get(`${NEWSLETTER_ID}:removed@example.com`)
+    if (!removed) throw new Error('Expected original subscriber')
+    removed.isSubscribed = 0
+    db.subscribers.set(`${NEWSLETTER_ID}:added@example.com`, {
+      email: 'added@example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+
+    const response = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/scheduled-sends/${draftId}/send-now`,
+      {},
+      auth
+    )
+    const result = await response.json() as { sendId: string; recipientCount: number }
+    expect(response.status).toBe(200)
+    expect(result.recipientCount).toBe(1)
+    expect(db.newsletterDrafts.get(draftId)).toEqual(expect.objectContaining({
+      status: 'sent',
+      sendId: result.sendId,
+    }))
+    expect(db.newsletterSends.get(result.sendId)).toEqual(expect.objectContaining({
+      recipientCount: 1,
+      scheduledAt: fixture.scheduledAt,
+      sourceMessageId: 'send-now-schedule-source',
+    }))
+    const recipientMessages = await drainFirstFanoutJob(env, queueSend, queueSendBatch)
+    expect(recipientMessages).toHaveLength(1)
+    expect(recipientEntriesFromQueueBody(recipientMessages[0])).toEqual([
+      expect.objectContaining({ email: 'added@example.com' }),
+    ])
+  })
+
+  it('cron claims once across overlapping runs and recovers stale claims', async () => {
+    const { env, db, queueSend } = createEnv()
+    const first = await createScheduledDraft(env, {
+      sourceMessageId: 'overlapping-cron-source',
+    })
+    const firstDraft = db.newsletterDrafts.get(first.created.draft.id)
+    if (!firstDraft) throw new Error('Expected first scheduled draft')
+    firstDraft.scheduleNextAttemptAt = new Date(Date.now() - 60_000).toISOString()
+
+    await Promise.all([
+      runScheduledHandler(env),
+      runScheduledHandler(env),
+    ])
+
+    expect(db.newsletterSends.size).toBe(1)
+    expect(firstDraft.status).toBe('sent')
+    expect(firstDraft.scheduleAttemptCount).toBe(1)
+    expect(queueSend).toHaveBeenCalledTimes(1)
+
+    const stale = await createScheduledDraft(env, {
+      sourceMessageId: 'stale-cron-source',
+    })
+    const staleDraft = db.newsletterDrafts.get(stale.created.draft.id)
+    if (!staleDraft) throw new Error('Expected stale scheduled draft')
+    staleDraft.status = 'dispatching'
+    staleDraft.scheduleClaimedAt = new Date(Date.now() - 10 * 60_000).toISOString()
+    staleDraft.scheduleLastAttemptAt = staleDraft.scheduleClaimedAt
+    staleDraft.scheduleAttemptCount = 1
+
+    await runScheduledHandler(env)
+
+    expect(staleDraft.status).toBe('sent')
+    expect(staleDraft.scheduleAttemptCount).toBe(2)
+    expect(db.newsletterSends.size).toBe(2)
+    expect(queueSend).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries enqueue failures at 1, 2, 5, 10, then 15 minutes indefinitely', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { env, db, queueSend } = createEnv({ failQueueSendCount: 6 })
+    const fixture = await createScheduledDraft(env, {
+      sourceMessageId: 'retry-schedule-source',
+    })
+    const draft = db.newsletterDrafts.get(fixture.created.draft.id)
+    if (!draft) throw new Error('Expected retry scheduled draft')
+    const expectedDelays = [1, 2, 5, 10, 15, 15]
+
+    for (const [index, expectedDelay] of expectedDelays.entries()) {
+      draft.scheduleNextAttemptAt = new Date(Date.now() - 60_000).toISOString()
+      await runScheduledHandler(env)
+      expect(draft.status).toBe('scheduled')
+      expect(draft.scheduleAttemptCount).toBe(index + 1)
+      expect(draft.scheduleLastError).toContain('Simulated queue send failure')
+      const retryDelayMinutes = Math.round(
+        (Date.parse(String(draft.scheduleNextAttemptAt)) - Date.parse(draft.updatedAt)) / 60_000
+      )
+      expect(retryDelayMinutes).toBe(expectedDelay)
+    }
+
+    expect(db.newsletterSends.size).toBe(1)
+    draft.scheduleNextAttemptAt = new Date(Date.now() - 60_000).toISOString()
+    await runScheduledHandler(env)
+    expect(draft.status).toBe('sent')
+    expect(draft.scheduleAttemptCount).toBe(7)
+    expect(db.newsletterSends.size).toBe(1)
+    expect(queueSend).toHaveBeenCalledTimes(7)
+    expect(consoleError).toHaveBeenCalled()
+  })
+
+  it('completes a zero-recipient cron send through the normal fanout pipeline', async () => {
+    const { env, db, queueSend, queueSendBatch } = createEnv()
+    const fixture = await createScheduledDraft(env, {
+      sourceMessageId: 'zero-recipient-schedule-source',
+    })
+    const draft = db.newsletterDrafts.get(fixture.created.draft.id)
+    if (!draft) throw new Error('Expected zero-recipient scheduled draft')
+    draft.scheduleNextAttemptAt = new Date(Date.now() - 60_000).toISOString()
+
+    await runScheduledHandler(env)
+
+    expect(draft.status).toBe('sent')
+    const send = Array.from(db.newsletterSends.values())[0]
+    expect(send).toEqual(expect.objectContaining({
+      recipientCount: 0,
+      status: 'queued',
+      scheduledAt: fixture.scheduledAt,
+    }))
+    const fanoutBody = queueSend.mock.calls[0]?.[0] as Record<string, unknown>
+    const fanout = createQueueBatch(fanoutBody)
+    await worker.queue(fanout.batch, env)
+
+    expect(fanout.message.retry).not.toHaveBeenCalled()
+    expect(queueSendBatch).not.toHaveBeenCalled()
+    expect(db.newsletterSends.get(send.id)).toEqual(expect.objectContaining({
+      status: 'completed',
+      fanoutCompletedAt: expect.any(String),
+      completedAt: expect.any(String),
+    }))
+  })
+
+  it('blocks deletion and returns 409 for every action after dispatch claims the row', async () => {
+    const { env, db } = createEnv()
+    const fixture = await createScheduledDraft(env, {
+      sourceMessageId: 'claim-race-source',
+    })
+    const draftId = fixture.created.draft.id
+    const scheduledDelete = await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}`,
+      auth
+    )
+    expect(scheduledDelete.status).toBe(409)
+
+    const draft = db.newsletterDrafts.get(draftId)
+    if (!draft) throw new Error('Expected claimed scheduled draft')
+    draft.status = 'dispatching'
+    draft.scheduleClaimedAt = new Date().toISOString()
+    const conflictMessage = {
+      error: 'Delivery has already started. Refresh Send Activity to see the current status.',
+    }
+    const responses = [
+      await putJson(
+        env,
+        `/api/newsletter/${NEWSLETTER_ID}/drafts/${draftId}`,
+        { subject: 'Too late' },
+        auth
+      ),
+      await postJson(
+        env,
+        `/api/newsletter/${NEWSLETTER_ID}/drafts/${draftId}/schedule`,
+        {
+          subject: 'Too late',
+          html: '<p>Too late</p>',
+          text: 'Too late',
+          sourceMessageId: draft.sourceMessageId,
+          scheduledAt: futureWholeMinute(30),
+        },
+        auth
+      ),
+      await patchJson(
+        env,
+        `/api/newsletter/${NEWSLETTER_ID}/scheduled-sends/${draftId}`,
+        { scheduledAt: futureWholeMinute(30) },
+        auth
+      ),
+      await deleteJson(
+        env,
+        `/api/newsletter/${NEWSLETTER_ID}/scheduled-sends/${draftId}`,
+        auth
+      ),
+      await postJson(
+        env,
+        `/api/newsletter/${NEWSLETTER_ID}/scheduled-sends/${draftId}/send-now`,
+        {},
+        auth
+      ),
+    ]
+    for (const response of responses) {
+      expect(response.status).toBe(409)
+      await expect(response.json()).resolves.toEqual(conflictMessage)
+    }
+    const dispatchingDelete = await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}`,
+      auth
+    )
+    expect(dispatchingDelete.status).toBe(409)
+    await expect(dispatchingDelete.json()).resolves.toEqual({
+      error: 'Cancel or send all scheduled messages before deleting this newsletter.',
+    })
+    expect(db.newsletters.get(NEWSLETTER_ID)?.deletedAt).toBeNull()
+  })
+})
+
+describe('unified newsletter trash', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const auth = { Authorization: 'Bearer admin-token' }
+
+  it('lists historical subscribers and restores subscribers without resubscribing them', async () => {
+    const { env, db } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Haben',
+      lastName: 'Girma',
+      isSubscribed: 0,
+      upsertedAt: '2026-07-18T12:00:00.000Z',
+      unsubscribedAt: '2026-07-18T12:00:00.000Z',
+      deletedAt: '2026-07-18T12:00:00.000Z',
+    })
+
+    const listResponse = await getJson(env, '/api/newsletter/trash', auth)
+    const list = await listResponse.json()
+
+    expect(listResponse.status).toBe(200)
+    expect(list).toEqual({
+      items: [{
+        kind: 'subscriber',
+        id: SUBSCRIBER_EMAIL,
+        newsletterId: NEWSLETTER_ID,
+        title: 'Haben Girma',
+        subtitle: `${SUBSCRIBER_EMAIL} • Subscriber in “Test Newsletter”`,
+        deletedAt: '2026-07-18T12:00:00.000Z',
+      }],
+      pagination: { page: 1, limit: 50, total: 1 },
+    })
+
+    const restoreResponse = await postJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}/restore`,
+      {},
+      auth
+    )
+
+    expect(restoreResponse.status).toBe(200)
+    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)).toEqual(
+      expect.objectContaining({ isSubscribed: 0, deletedAt: null })
+    )
+    const repeatedRestore = await postJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/subscribers/${SUBSCRIBER_EMAIL}/restore`,
+      {},
+      auth
+    )
+    expect(repeatedRestore.status).toBe(404)
+  })
+
+  it('restores and permanently deletes draft content through Trash', async () => {
+    const { env, db, r2Delete } = createEnv()
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Recoverable draft', html: '<p>Recover me</p>', text: 'Recover me' },
+      auth
+    )
+    const created = await createResponse.json()
+    await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}`,
+      auth
+    )
+
+    const restoreResponse = await postJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/drafts/${created.draft.id}/restore`,
+      {},
+      auth
+    )
+    expect(restoreResponse.status).toBe(200)
+    expect(db.newsletterDrafts.get(created.draft.id)?.deletedAt).toBeNull()
+
+    await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${created.draft.id}`,
+      auth
+    )
+    const purgeResponse = await deleteJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/drafts/${created.draft.id}`,
+      auth
+    )
+
+    expect(purgeResponse.status).toBe(200)
+    expect(db.newsletterDrafts.has(created.draft.id)).toBe(false)
+    expect(r2Delete).toHaveBeenCalledWith([
+      created.draft.contentFileName,
+      created.draft.textFileName,
+    ])
+  })
+
+  it('packages children under a trashed newsletter and restores their prior states', async () => {
+    const { env, db } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 0,
+      deletedAt: '2026-07-17T12:00:00.000Z',
+    })
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Active child', html: '<p>Child</p>', text: 'Child' },
+      auth
+    )
+    expect(createResponse.status).toBe(201)
+
+    await deleteJson(env, `/api/newsletter/${NEWSLETTER_ID}`, auth)
+    const packagedResponse = await getJson(env, '/api/newsletter/trash', auth)
+    const packaged = await packagedResponse.json()
+    expect(packaged.pagination.total).toBe(1)
+    expect(packaged.items).toEqual([
+      expect.objectContaining({ kind: 'newsletter', id: NEWSLETTER_ID }),
+    ])
+    const hiddenDrafts = await getJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      auth
+    )
+    expect(hiddenDrafts.status).toBe(404)
+
+    const restoreResponse = await postJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/restore`,
+      {},
+      auth
+    )
+    expect(restoreResponse.status).toBe(200)
+    expect(db.newsletters.get(NEWSLETTER_ID)?.deletedAt).toBeNull()
+
+    const restoredListResponse = await getJson(env, '/api/newsletter/trash', auth)
+    const restoredList = await restoredListResponse.json()
+    expect(restoredList.items).toEqual([
+      expect.objectContaining({ kind: 'subscriber', id: SUBSCRIBER_EMAIL }),
+    ])
+  })
+
+  it('empties every displayed item and cascades permanently deleted newsletters', async () => {
+    const { env, db, r2Objects } = createEnv()
+    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
+      email: SUBSCRIBER_EMAIL,
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      isSubscribed: 1,
+    })
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Packaged draft', html: '<p>Packaged</p>', text: 'Packaged' },
+      auth
+    )
+    const created = await createResponse.json()
+    await deleteJson(env, `/api/newsletter/${NEWSLETTER_ID}`, auth)
+
+    const emptyResponse = await deleteJson(env, '/api/newsletter/trash', auth)
+
+    expect(emptyResponse.status).toBe(200)
+    await expect(emptyResponse.json()).resolves.toEqual({
+      message: 'Trash emptied successfully',
+      deleted: { newsletters: 1, subscribers: 0, drafts: 0 },
+    })
+    expect(db.newsletters.has(NEWSLETTER_ID)).toBe(false)
+    expect(db.subscribers.size).toBe(0)
+    expect(db.newsletterDrafts.size).toBe(0)
+    expect(r2Objects.has(created.draft.contentFileName)).toBe(false)
+    expect(r2Objects.has(created.draft.textFileName)).toBe(false)
+  })
+
+  it('does not purge newsletters or drafts that win a restore race', async () => {
+    const newsletterFixture = createEnv()
+    const newsletterDraftResponse = await postJson(
+      newsletterFixture.env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Keep with parent', html: '<p>Keep</p>', text: 'Keep' },
+      auth
+    )
+    const newsletterDraft = (await newsletterDraftResponse.json()).draft
+    await deleteJson(newsletterFixture.env, `/api/newsletter/${NEWSLETTER_ID}`, auth)
+    newsletterFixture.db.beforeNextBatch(() => {
+      const newsletter = newsletterFixture.db.newsletters.get(NEWSLETTER_ID)
+      if (newsletter) newsletter.deletedAt = null
+    })
+
+    const newsletterPurge = await deleteJson(
+      newsletterFixture.env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}`,
+      auth
+    )
+
+    expect(newsletterPurge.status).toBe(404)
+    expect(newsletterFixture.db.newsletters.has(NEWSLETTER_ID)).toBe(true)
+    expect(newsletterFixture.db.newsletterDrafts.has(newsletterDraft.id)).toBe(true)
+    expect(newsletterFixture.r2Objects.has(newsletterDraft.contentFileName)).toBe(true)
+    expect(newsletterFixture.db.trashPurgeJobs.size).toBe(0)
+
+    const draftFixture = createEnv()
+    const draftResponse = await postJson(
+      draftFixture.env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Restore race', html: '<p>Keep draft</p>', text: 'Keep draft' },
+      auth
+    )
+    const draft = (await draftResponse.json()).draft
+    await deleteJson(
+      draftFixture.env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts/${draft.id}`,
+      auth
+    )
+    draftFixture.db.beforeNextBatch(() => {
+      const storedDraft = draftFixture.db.newsletterDrafts.get(draft.id)
+      if (storedDraft) storedDraft.deletedAt = null
+    })
+
+    const draftPurge = await deleteJson(
+      draftFixture.env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/drafts/${draft.id}`,
+      auth
+    )
+
+    expect(draftPurge.status).toBe(404)
+    expect(draftFixture.db.newsletterDrafts.has(draft.id)).toBe(true)
+    expect(draftFixture.r2Objects.has(draft.contentFileName)).toBe(true)
+    expect(draftFixture.db.trashPurgeJobs.size).toBe(0)
+  })
+
+  it('takes the Empty Trash snapshot inside the deletion batch', async () => {
+    const { env, db, r2Objects } = createEnv()
+    const packagedDraftResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Restored parent draft', html: '<p>Parent</p>', text: 'Parent' },
+      auth
+    )
+    const packagedDraft = (await packagedDraftResponse.json()).draft
+    await deleteJson(env, `/api/newsletter/${NEWSLETTER_ID}`, auth)
+
+    db.newsletters.set(SECOND_NEWSLETTER_ID, {
+      id: SECOND_NEWSLETTER_ID,
+      subscribable: 1,
+      title: 'Second Newsletter',
+      description: 'Second description',
+      deletedAt: null,
+    })
+    const newlyTrashedDraftResponse = await postJson(
+      env,
+      `/api/newsletter/${SECOND_NEWSLETTER_ID}/drafts`,
+      { subject: 'Newly trashed', html: '<p>New</p>', text: 'New' },
+      auth
+    )
+    const newlyTrashedDraft = (await newlyTrashedDraftResponse.json()).draft
+    db.beforeNextBatch(() => {
+      const restoredNewsletter = db.newsletters.get(NEWSLETTER_ID)
+      const newDraft = db.newsletterDrafts.get(newlyTrashedDraft.id)
+      if (restoredNewsletter) restoredNewsletter.deletedAt = null
+      if (newDraft) newDraft.deletedAt = '2026-07-19T23:00:00.000Z'
+    })
+
+    const response = await deleteJson(env, '/api/newsletter/trash', auth)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'Trash emptied successfully',
+      deleted: { newsletters: 0, subscribers: 0, drafts: 1 },
+    })
+    expect(db.newsletters.has(NEWSLETTER_ID)).toBe(true)
+    expect(db.newsletterDrafts.has(packagedDraft.id)).toBe(true)
+    expect(r2Objects.has(packagedDraft.contentFileName)).toBe(true)
+    expect(db.newsletterDrafts.has(newlyTrashedDraft.id)).toBe(false)
+    expect(r2Objects.has(newlyTrashedDraft.contentFileName)).toBe(false)
+  })
+
+  it('retains failed R2 cleanup jobs and retries them idempotently', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { env, db, r2Objects } = createEnv({ failR2DeleteOnce: true })
+    const createResponse = await postJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/drafts`,
+      { subject: 'Retry cleanup', html: '<p>Retry</p>', text: 'Retry' },
+      auth
+    )
+    const draft = (await createResponse.json()).draft
+    await deleteJson(env, `/api/newsletter/${NEWSLETTER_ID}/drafts/${draft.id}`, auth)
+
+    const failedPurge = await deleteJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/drafts/${draft.id}`,
+      auth
+    )
+
+    expect(failedPurge.status).toBe(500)
+    expect(db.newsletterDrafts.has(draft.id)).toBe(false)
+    expect(db.trashPurgeJobs.size).toBe(1)
+    expect(r2Objects.has(draft.contentFileName)).toBe(true)
+
+    const retriedPurge = await deleteJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/drafts/${draft.id}`,
+      auth
+    )
+
+    expect(retriedPurge.status).toBe(200)
+    expect(db.trashPurgeJobs.size).toBe(0)
+    expect(r2Objects.has(draft.contentFileName)).toBe(false)
+    expect(consoleError).toHaveBeenCalled()
+  })
+
+  it('returns not found when changing the online state of a trashed newsletter', async () => {
+    const { env, db } = createEnv()
+    await deleteJson(env, `/api/newsletter/${NEWSLETTER_ID}`, auth)
+
+    const offline = await putJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/offline`,
+      {},
+      auth
+    )
+    const online = await putJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/online`,
+      {},
+      auth
+    )
+
+    expect(offline.status).toBe(404)
+    expect(online.status).toBe(404)
+    expect(db.newsletters.get(NEWSLETTER_ID)?.subscribable).toBe(1)
   })
 })
 

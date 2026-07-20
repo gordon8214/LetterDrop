@@ -7,8 +7,11 @@ CREATE TABLE Newsletter (
     logo TEXT,
     subscribable BOOLEAN,
     createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deletedAt DATETIME
 );
+
+CREATE INDEX idx_newsletter_deleted_at ON Newsletter(deletedAt);
 
 CREATE TABLE Subscriber (
     email TEXT,
@@ -72,6 +75,7 @@ CREATE TABLE NewsletterSend (
     from_name TEXT,
     footer_html TEXT,
     footer_text TEXT,
+    scheduled_at DATETIME,
     fanout_snapshot_at DATETIME,
     fanout_cursor_email TEXT,
     fanout_completed_at DATETIME,
@@ -89,6 +93,8 @@ CREATE INDEX idx_subscriber_newsletter_subscribed_email
 ON Subscriber(newsletter_id, isSubscribed, email);
 CREATE INDEX idx_subscriber_newsletter_snapshot_email
 ON Subscriber(newsletter_id, email, subscribed_at, unsubscribed_at, deleted_at);
+CREATE INDEX idx_subscriber_deleted_at
+ON Subscriber(newsletter_id, deleted_at, upsertedAt);
 
 CREATE TABLE NewsletterSendRecipient (
     id TEXT PRIMARY KEY,
@@ -157,6 +163,19 @@ CREATE TABLE NewsletterDraft (
     createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     sentAt DATETIME,
+    deletedAt DATETIME,
+    scheduled_at DATETIME,
+    schedule_next_attempt_at DATETIME,
+    schedule_claimed_at DATETIME,
+    schedule_last_attempt_at DATETIME,
+    schedule_attempt_count INTEGER NOT NULL DEFAULT 0,
+    schedule_last_error TEXT,
+    scheduled_content_file_name TEXT,
+    scheduled_text_file_name TEXT,
+    scheduled_from_name TEXT,
+    scheduled_footer_html TEXT,
+    scheduled_footer_text TEXT,
+    scheduled_email_style_config TEXT,
     FOREIGN KEY (newsletter_id) REFERENCES Newsletter(id),
     FOREIGN KEY (send_id) REFERENCES NewsletterSend(id)
 );
@@ -164,5 +183,25 @@ CREATE TABLE NewsletterDraft (
 CREATE INDEX idx_newsletter_draft_active
 ON NewsletterDraft(newsletter_id, status, updatedAt);
 
+CREATE INDEX idx_newsletter_draft_deleted_at
+ON NewsletterDraft(newsletter_id, deletedAt, updatedAt);
+
+CREATE INDEX idx_newsletter_draft_due_schedule
+ON NewsletterDraft(status, schedule_next_attempt_at, createdAt);
+
+CREATE INDEX idx_newsletter_draft_scheduled_list
+ON NewsletterDraft(newsletter_id, status, scheduled_at);
+
 CREATE UNIQUE INDEX idx_newsletter_draft_source_message
-ON NewsletterDraft(newsletter_id, source_message_id);
+ON NewsletterDraft(newsletter_id, source_message_id)
+WHERE deletedAt IS NULL;
+
+CREATE TABLE TrashPurgeJob (
+    kind TEXT NOT NULL CHECK (kind IN ('newsletter', 'draft')),
+    newsletter_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    content_file_name TEXT,
+    text_file_name TEXT,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, newsletter_id, item_id)
+);
