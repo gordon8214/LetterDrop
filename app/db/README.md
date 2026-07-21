@@ -53,3 +53,13 @@ wrangler d1 execute <d1_database_name> --remote --file db/20260716_add_subscribe
 ```bash
 wrangler d1 execute <d1_database_name> --remote --file db/20260717_add_unsubscribe_footer_snapshots.sql
 ```
+
+## Run case-insensitive subscriber email migration
+
+This migration adds case-insensitive subscriber identity enforcement and
+reconciles complaint and permanent-bounce suppressions that occurred after the
+subscriber's latest subscription.
+
+```bash
+wrangler d1 execute <d1_database_name> --remote --file db/20260720_case_insensitive_subscriber_email.sql
+```

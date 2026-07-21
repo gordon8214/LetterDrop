@@ -323,6 +323,28 @@ class FakeD1Database {
     hook?.()
   }
 
+  private subscriberEntry(
+    newsletterId: string,
+    email: string
+  ): [string, SubscriberRecord] | null {
+    const exactKey = `${newsletterId}:${email}`
+    const exact = this.subscribers.get(exactKey)
+    if (exact) {
+      return [exactKey, exact]
+    }
+
+    const normalizedEmail = email.toLowerCase()
+    for (const [key, subscriber] of this.subscribers.entries()) {
+      if (
+        subscriber.newsletterId === newsletterId &&
+        subscriber.email.toLowerCase() === normalizedEmail
+      ) {
+        return [key, subscriber]
+      }
+    }
+    return null
+  }
+
   private newsletterPurgeJobIds(newsletterId?: string) {
     return new Set(
       Array.from(this.trashPurgeJobs.values())
@@ -421,10 +443,14 @@ class FakeD1Database {
       return ({ total } as T)
     }
 
-    if (normalized.includes('select email from subscriber where email = ? and newsletter_id = ?')) {
+    if (
+      normalized.includes('select email from subscriber') &&
+      normalized.includes('email = ? collate nocase') &&
+      normalized.includes('newsletter_id = ?')
+    ) {
       const email = String(params[0] ?? '')
       const newsletterId = String(params[1] ?? '')
-      const subscriber = this.subscribers.get(`${newsletterId}:${email}`)
+      const subscriber = this.subscriberEntry(newsletterId, email)?.[1]
       if (!subscriber) {
         return null
       }
@@ -958,7 +984,7 @@ class FakeD1Database {
     if (normalized.includes('update subscriber set deleted_at = null')) {
       const email = String(params[0] ?? '')
       const newsletterId = String(params[1] ?? '')
-      const subscriber = this.subscribers.get(`${newsletterId}:${email}`)
+      const subscriber = this.subscriberEntry(newsletterId, email)?.[1]
       const newsletter = this.newsletters.get(newsletterId)
       if (!subscriber?.deletedAt || !newsletter || newsletter.deletedAt) {
         return { meta: { changes: 0 } }
@@ -983,7 +1009,9 @@ class FakeD1Database {
       const subscribedAt = String(params[subscribedAtIndex] ?? upsertedAt)
       const shouldUpdateNotes = hasNotesColumn && Number(params[subscribedAtIndex + 1] ?? 0) === 1
       const key = `${newsletterId}:${email}`
-      const existing = this.subscribers.get(key)
+      const existingEntry = this.subscriberEntry(newsletterId, email)
+      const existingKey = existingEntry?.[0] ?? key
+      const existing = existingEntry?.[1]
       const guardsUnsubscribed = normalized.includes(
         'where subscriber.issubscribed = 1 or ? = 1'
       )
@@ -991,8 +1019,8 @@ class FakeD1Database {
       if (guardsUnsubscribed && existing?.isSubscribed === 0 && !resubscribeUnsubscribed) {
         return { meta: { changes: 0 } }
       }
-      this.subscribers.set(key, {
-        email,
+      this.subscribers.set(existingKey, {
+        email: existing?.email ?? email,
         newsletterId,
         firstName: firstName ?? existing?.firstName ?? null,
         lastName: lastName ?? existing?.lastName ?? null,
@@ -1021,13 +1049,15 @@ class FakeD1Database {
       const upsertedAt = String(params[5] ?? new Date().toISOString())
       const originalEmail = String(params[params.length - 2] ?? '')
       const newsletterId = String(params[params.length - 1] ?? '')
-      const originalKey = `${newsletterId}:${originalEmail}`
+      const originalEntry = this.subscriberEntry(newsletterId, originalEmail)
+      const originalKey = originalEntry?.[0] ?? `${newsletterId}:${originalEmail}`
       const updatedKey = `${newsletterId}:${email}`
-      const existing = this.subscribers.get(originalKey)
+      const existing = originalEntry?.[1]
       if (!existing || existing.deletedAt) {
         return { meta: { changes: 0 } }
       }
-      if (updatedKey !== originalKey && this.subscribers.has(updatedKey)) {
+      const conflictEntry = this.subscriberEntry(newsletterId, email)
+      if (conflictEntry && conflictEntry[0] !== originalKey) {
         throw new Error('UNIQUE constraint failed: Subscriber.email, Subscriber.newsletter_id')
       }
 
@@ -1063,14 +1093,11 @@ class FakeD1Database {
       const emailIndex = hasTimestamp ? (hasDeletedAt ? 3 : 2) : 0
       const email = String(params[emailIndex] ?? '')
       const newsletterId = String(params[emailIndex + 1] ?? '')
-      const key = `${newsletterId}:${email}`
-      const existing = this.subscribers.get(key) ?? {
-        email,
-        newsletterId,
-        firstName: null,
-        lastName: null,
-        isSubscribed: 0,
+      const existingEntry = this.subscriberEntry(newsletterId, email)
+      if (!existingEntry) {
+        return { meta: { changes: 0 } }
       }
+      const [key, existing] = existingEntry
       existing.isSubscribed = 0
       existing.upsertedAt = now
       existing.unsubscribedAt = existing.unsubscribedAt ?? now
@@ -1566,11 +1593,16 @@ class FakeD1Database {
       return { meta: { changes } }
     }
 
-    if (normalized.includes('delete from subscriber where email = ? and newsletter_id = ?')) {
+    if (
+      normalized.includes('delete from subscriber') &&
+      normalized.includes('email = ? collate nocase') &&
+      normalized.includes('newsletter_id = ?')
+    ) {
       const email = String(params[0] ?? '')
       const newsletterId = String(params[1] ?? '')
-      const key = `${newsletterId}:${email}`
-      const subscriber = this.subscribers.get(key)
+      const subscriberEntry = this.subscriberEntry(newsletterId, email)
+      const key = subscriberEntry?.[0] ?? `${newsletterId}:${email}`
+      const subscriber = subscriberEntry?.[1]
       const newsletter = this.newsletters.get(newsletterId)
       const canDelete = Boolean(
         subscriber?.deletedAt && newsletter && !newsletter.deletedAt
@@ -2591,6 +2623,98 @@ describe('admin subscriber notes', () => {
     expect(db.subscribers.get(subscriberKey)?.notes).toBeNull()
   })
 
+  it('matches legacy mixed-case subscribers across admin and Trash mutations', async () => {
+    const { env, db } = createEnv()
+    const storedEmail = 'Legacy.User@Example.com'
+    const normalizedEmail = storedEmail.toLowerCase()
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
+    db.subscribers.set(subscriberKey, {
+      email: storedEmail,
+      newsletterId: NEWSLETTER_ID,
+      firstName: 'Legacy',
+      lastName: 'User',
+      notes: null,
+      isSubscribed: 1,
+    })
+    db.subscribers.set(`${NEWSLETTER_ID}:Conflict@Example.com`, {
+      email: 'Conflict@Example.com',
+      newsletterId: NEWSLETTER_ID,
+      firstName: null,
+      lastName: null,
+      notes: null,
+      isSubscribed: 1,
+    })
+
+    const updateResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${normalizedEmail}`,
+      {
+        email: normalizedEmail,
+        firstName: 'Legacy',
+        lastName: 'User',
+        notes: 'Case-insensitive update',
+      },
+      adminHeaders
+    )
+    expect(updateResponse.status).toBe(200)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      email: storedEmail,
+      notes: 'Case-insensitive update',
+    })
+    expect(db.subscribers.has(`${NEWSLETTER_ID}:${normalizedEmail}`)).toBe(false)
+
+    const conflictResponse = await patchJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${normalizedEmail}`,
+      {
+        email: 'conflict@example.com',
+        firstName: 'Legacy',
+        lastName: 'User',
+        notes: null,
+      },
+      adminHeaders
+    )
+    expect(conflictResponse.status).toBe(409)
+
+    const removeResponse = await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${normalizedEmail}`,
+      adminHeaders
+    )
+    expect(removeResponse.status).toBe(200)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      isSubscribed: 0,
+      deletedAt: expect.any(String),
+    })
+
+    const restoreResponse = await postJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/subscribers/${normalizedEmail}/restore`,
+      {},
+      adminHeaders
+    )
+    expect(restoreResponse.status).toBe(200)
+    expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      email: storedEmail,
+      isSubscribed: 0,
+      deletedAt: null,
+    })
+
+    const secondRemoveResponse = await deleteJson(
+      env,
+      `/api/newsletter/${NEWSLETTER_ID}/subscribers/${normalizedEmail}`,
+      adminHeaders
+    )
+    expect(secondRemoveResponse.status).toBe(200)
+    const purgeResponse = await deleteJson(
+      env,
+      `/api/newsletter/trash/newsletters/${NEWSLETTER_ID}/subscribers/${normalizedEmail}`,
+      adminHeaders
+    )
+    expect(purgeResponse.status).toBe(200)
+    expect(db.subscribers.has(subscriberKey)).toBe(false)
+  })
+
   it('renames a subscriber without changing subscription lifecycle state', async () => {
     const { env, db } = createEnv()
     const originalKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
@@ -2912,10 +3036,11 @@ describe('admin subscriber imports', () => {
 
   it('skips existing unsubscribed subscribers by default', async () => {
     const { env, db } = createEnv()
-    const subscriberKey = `${NEWSLETTER_ID}:unsubscribed@example.com`
+    const storedEmail = 'Unsubscribed@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
     const unsubscribedAt = '2026-02-01T00:00:00.000Z'
     db.subscribers.set(subscriberKey, {
-      email: 'unsubscribed@example.com',
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: 'Original',
       lastName: 'Subscriber',
@@ -2945,9 +3070,10 @@ describe('admin subscriber imports', () => {
 
   it('resubscribes existing unsubscribed subscribers only with an explicit override', async () => {
     const { env, db } = createEnv()
-    const subscriberKey = `${NEWSLETTER_ID}:unsubscribed@example.com`
+    const storedEmail = 'Unsubscribed@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
     db.subscribers.set(subscriberKey, {
-      email: 'unsubscribed@example.com',
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: 'Original',
       lastName: null,
@@ -2966,6 +3092,7 @@ describe('admin subscriber imports', () => {
       skippedUnsubscribedCount: 0,
     })
     expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      email: storedEmail,
       firstName: 'Updated',
       isSubscribed: 1,
       unsubscribedAt: null,
@@ -2987,9 +3114,10 @@ describe('admin subscriber imports', () => {
 
   it('preserves the existing add endpoint resubscription behavior', async () => {
     const { env, db } = createEnv()
-    const subscriberKey = `${NEWSLETTER_ID}:unsubscribed@example.com`
+    const storedEmail = 'Unsubscribed@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
     db.subscribers.set(subscriberKey, {
-      email: 'unsubscribed@example.com',
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: 'Original',
       lastName: null,
@@ -3003,10 +3131,12 @@ describe('admin subscriber imports', () => {
 
     expect(response.status).toBe(201)
     expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      email: storedEmail,
       firstName: 'Updated',
       isSubscribed: 1,
       unsubscribedAt: null,
     })
+    expect(db.subscribers.has(`${NEWSLETTER_ID}:unsubscribed@example.com`)).toBe(false)
   })
 })
 
@@ -6777,8 +6907,10 @@ describe('stateless newsletter unsubscribe links', () => {
 
   async function sendQueuedNewsletterAndExtractToken() {
     const { env, db, notificationFetch } = createEnv()
-    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
-      email: SUBSCRIBER_EMAIL,
+    const storedEmail = 'User@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
+    db.subscribers.set(subscriberKey, {
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: null,
       lastName: null,
@@ -6789,7 +6921,7 @@ describe('stateless newsletter unsubscribe links', () => {
     await env.R2.put(fileName, '<p>Body</p>')
     await env.R2.put(textFileName, 'Body')
     const { batch } = createQueueBatch({
-      email: SUBSCRIBER_EMAIL,
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       subject: 'Unsubscribe test',
       fileName,
@@ -6798,11 +6930,11 @@ describe('stateless newsletter unsubscribe links', () => {
 
     await worker.queue(batch, env)
     const sendBody = await getNotificationRequestBody(notificationFetch)
-    return { env, db, token: extractUnsubscribeToken(sendBody) }
+    return { env, db, subscriberKey, token: extractUnsubscribeToken(sendBody) }
   }
 
   it('supports RFC 8058 one-click POST unsubscribe', async () => {
-    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+    const { env, db, subscriberKey, token } = await sendQueuedNewsletterAndExtractToken()
 
     const response = await postJson(env, `/api/subscribe/list-unsubscribe/${token}`, {})
 
@@ -6810,11 +6942,12 @@ describe('stateless newsletter unsubscribe links', () => {
     await expect(response.json()).resolves.toEqual({
       message: 'Unsubscribed successfully',
     })
-    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+    expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(0)
+    expect(db.subscribers.has(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)).toBe(false)
   })
 
   it('rejects tampered unsubscribe tokens without changing subscriber state', async () => {
-    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+    const { env, db, subscriberKey, token } = await sendQueuedNewsletterAndExtractToken()
     const tamperedToken = `${token.slice(0, -1)}x`
 
     const response = await postJson(env, `/api/subscribe/list-unsubscribe/${tamperedToken}`, {})
@@ -6823,11 +6956,11 @@ describe('stateless newsletter unsubscribe links', () => {
     await expect(response.json()).resolves.toEqual({
       error: 'Invalid unsubscribe token',
     })
-    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(1)
+    expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(1)
   })
 
   it('renders visible GET unsubscribe confirmation without unsubscribing', async () => {
-    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+    const { env, db, subscriberKey, token } = await sendQueuedNewsletterAndExtractToken()
 
     const response = await app.request(
       `https://example.com/api/subscribe/unsubscribe/${token}`,
@@ -6837,17 +6970,17 @@ describe('stateless newsletter unsubscribe links', () => {
 
     expect(response.status).toBe(200)
     await expect(response.text()).resolves.toContain('Confirm unsubscribe')
-    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(1)
+    expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(1)
   })
 
   it('supports visible POST unsubscribe confirmation', async () => {
-    const { env, db, token } = await sendQueuedNewsletterAndExtractToken()
+    const { env, db, subscriberKey, token } = await sendQueuedNewsletterAndExtractToken()
 
     const response = await postJson(env, `/api/subscribe/unsubscribe/${token}`, {})
 
     expect(response.status).toBe(200)
     await expect(response.text()).resolves.toContain('Unsubscribed successfully')
-    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+    expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(0)
   })
 })
 
@@ -6859,8 +6992,10 @@ describe('SES SNS suppression webhook', () => {
   it('records permanent bounces and unsubscribes matching newsletter subscribers', async () => {
     const { env, db } = createEnv()
     const { signEnvelope } = await createSnsSigner()
-    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
-      email: SUBSCRIBER_EMAIL,
+    const storedEmail = 'User@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
+    db.subscribers.set(subscriberKey, {
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: null,
       lastName: null,
@@ -6889,7 +7024,8 @@ describe('SES SNS suppression webhook', () => {
       recordedCount: 1,
       unsubscribedCount: 1,
     })
-    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+    expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(0)
+    expect(db.subscribers.has(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)).toBe(false)
     expect(db.suppressionEvents[0]).toEqual(expect.objectContaining({
       email: SUBSCRIBER_EMAIL,
       newsletterId: NEWSLETTER_ID,
@@ -7134,8 +7270,10 @@ describe('SES SNS suppression webhook', () => {
   it('records complaints and unsubscribes matching newsletter subscribers', async () => {
     const { env, db } = createEnv()
     const { signEnvelope } = await createSnsSigner()
-    db.subscribers.set(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`, {
-      email: SUBSCRIBER_EMAIL,
+    const storedEmail = 'User@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
+    db.subscribers.set(subscriberKey, {
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: null,
       lastName: null,
@@ -7158,8 +7296,46 @@ describe('SES SNS suppression webhook', () => {
     }))
 
     expect(response.status).toBe(200)
-    expect(db.subscribers.get(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)?.isSubscribed).toBe(0)
+    await expect(response.json()).resolves.toEqual({
+      message: 'SES notification processed',
+      recordedCount: 1,
+      unsubscribedCount: 1,
+    })
+    expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(0)
+    expect(db.subscribers.has(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)).toBe(false)
     expect(db.suppressionEvents[0].eventType).toBe('complaint')
+  })
+
+  it('records suppressions without claiming an unsubscribe when no subscriber matches', async () => {
+    const { env, db } = createEnv()
+    const { signEnvelope } = await createSnsSigner()
+
+    const response = await postJson(env, '/api/ses/sns/ses-webhook-token', await signEnvelope({
+      Type: 'Notification',
+      TopicArn: env.SES_SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        notificationType: 'Complaint',
+        mail: {
+          messageId: 'missing-subscriber-complaint',
+          tags: { newsletterId: [NEWSLETTER_ID] },
+        },
+        complaint: {
+          complainedRecipients: [{ emailAddress: 'missing@example.com' }],
+        },
+      }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      message: 'SES notification processed',
+      recordedCount: 1,
+      unsubscribedCount: 0,
+    })
+    expect(db.suppressionEvents[0]).toEqual(expect.objectContaining({
+      email: 'missing@example.com',
+      eventType: 'complaint',
+    }))
+    expect(db.subscribers.size).toBe(0)
   })
 
   it('rejects SNS notifications without a valid signature', async () => {
@@ -7282,9 +7458,10 @@ describe('single-use subscription tokens', () => {
 
   it('preserves manager notes when a subscriber confirms again', async () => {
     const { env, db, kv } = createEnv()
-    const subscriberKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
+    const storedEmail = 'User@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
     db.subscribers.set(subscriberKey, {
-      email: SUBSCRIBER_EMAIL,
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: 'Ada',
       lastName: 'Lovelace',
@@ -7312,17 +7489,20 @@ describe('single-use subscription tokens', () => {
 
     expect(response.status).toBe(303)
     expect(db.subscribers.get(subscriberKey)).toMatchObject({
+      email: storedEmail,
       isSubscribed: 1,
       firstName: 'Updated',
       notes: 'Private manager context',
     })
+    expect(db.subscribers.has(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)).toBe(false)
   })
 
   it('splits cancel into GET interstitial and POST, preserving locale rendering', async () => {
     const { env, db, kv } = createEnv()
-    const subscriberKey = `${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`
+    const storedEmail = 'User@Example.com'
+    const subscriberKey = `${NEWSLETTER_ID}:${storedEmail}`
     db.subscribers.set(subscriberKey, {
-      email: SUBSCRIBER_EMAIL,
+      email: storedEmail,
       newsletterId: NEWSLETTER_ID,
       firstName: null,
       lastName: null,
@@ -7354,6 +7534,7 @@ describe('single-use subscription tokens', () => {
     expect(postResponse.status).toBe(200)
     await expect(postResponse.text()).resolves.toContain('取消订阅成功')
     expect(db.subscribers.get(subscriberKey)?.isSubscribed).toBe(0)
+    expect(db.subscribers.has(`${NEWSLETTER_ID}:${SUBSCRIBER_EMAIL}`)).toBe(false)
 
     const usedToken = JSON.parse(kv.store.get(token) ?? '{}')
     expect(typeof usedToken.usedAt).toBe('string')

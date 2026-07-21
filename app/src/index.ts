@@ -2344,7 +2344,8 @@ app.post(
       const result = await c.env.DB.prepare(
         `UPDATE Subscriber
          SET deleted_at = NULL
-         WHERE email = ? AND newsletter_id = ? AND deleted_at IS NOT NULL
+         WHERE email = ? COLLATE NOCASE
+           AND newsletter_id = ? AND deleted_at IS NOT NULL
            AND EXISTS (
              SELECT 1 FROM Newsletter
              WHERE id = ? AND deletedAt IS NULL
@@ -2373,7 +2374,8 @@ app.delete(
     try {
       const result = await c.env.DB.prepare(
         `DELETE FROM Subscriber
-         WHERE email = ? AND newsletter_id = ? AND deleted_at IS NOT NULL
+         WHERE email = ? COLLATE NOCASE
+           AND newsletter_id = ? AND deleted_at IS NOT NULL
            AND EXISTS (
              SELECT 1 FROM Newsletter
              WHERE id = ? AND deletedAt IS NULL
@@ -3635,7 +3637,7 @@ async function upsertAdminSubscribers(
              upsertedAt, subscribed_at, unsubscribed_at, deleted_at
            )
            VALUES (?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
-           ON CONFLICT(email, newsletter_id) DO UPDATE SET
+           ON CONFLICT(newsletter_id, email COLLATE NOCASE) DO UPDATE SET
              isSubscribed = 1,
              first_name = COALESCE(excluded.first_name, Subscriber.first_name),
              last_name = COALESCE(excluded.last_name, Subscriber.last_name),
@@ -3737,7 +3739,8 @@ app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
 
     const existing = await c.env.DB.prepare(
       `SELECT email FROM Subscriber
-       WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
+       WHERE email = ? COLLATE NOCASE
+         AND newsletter_id = ? AND deleted_at IS NULL`,
     )
       .bind(originalEmail, newsletterId)
       .first<{ email: string }>();
@@ -3745,9 +3748,23 @@ app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
       return c.json({ error: "Subscriber not found" }, 404);
     }
 
-    if (updatedEmail !== originalEmail) {
+    const existingNormalizedEmail = normalizeEmail(existing.email);
+    if (!existingNormalizedEmail) {
+      return internalServerError(
+        c,
+        "update-subscriber",
+        new Error("Stored subscriber email is invalid"),
+      );
+    }
+    const preservesExistingEmail = updatedEmail === existingNormalizedEmail;
+    const storedUpdatedEmail = preservesExistingEmail
+      ? existing.email
+      : updatedEmail;
+
+    if (!preservesExistingEmail) {
       const conflict = await c.env.DB.prepare(
-        `SELECT email FROM Subscriber WHERE email = ? AND newsletter_id = ?`,
+        `SELECT email FROM Subscriber
+         WHERE email = ? COLLATE NOCASE AND newsletter_id = ?`,
       )
         .bind(updatedEmail, newsletterId)
         .first<{ email: string }>();
@@ -3781,10 +3798,11 @@ app.patch("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
                WHEN ? = 1 THEN NULL
                ELSE deleted_at
              END
-         WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
+         WHERE email = ? COLLATE NOCASE
+           AND newsletter_id = ? AND deleted_at IS NULL`,
       )
         .bind(
-          updatedEmail,
+          storedUpdatedEmail,
           normalizeOptionalName(parsedBody.body.firstName),
           normalizeOptionalName(parsedBody.body.lastName),
           normalizeNonEmptyString(parsedBody.body.notes),
@@ -3827,7 +3845,8 @@ app.delete("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
     }
     const subscriber = await c.env.DB.prepare(
       `SELECT email FROM Subscriber
-       WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
+       WHERE email = ? COLLATE NOCASE
+         AND newsletter_id = ? AND deleted_at IS NULL`,
     )
       .bind(email, newsletterId)
       .first();
@@ -3843,7 +3862,8 @@ app.delete("/api/newsletter/:newsletterId/subscribers/:email", async (c) => {
            upsertedAt = ?,
            unsubscribed_at = COALESCE(unsubscribed_at, ?),
            deleted_at = ?
-       WHERE email = ? AND newsletter_id = ? AND deleted_at IS NULL`,
+       WHERE email = ? COLLATE NOCASE
+         AND newsletter_id = ? AND deleted_at IS NULL`,
     )
       .bind(now, now, now, email, newsletterId)
       .run();
@@ -3910,7 +3930,7 @@ app.post("/api/subscribe/confirm/:token", async (c) => {
          upsertedAt, subscribed_at, unsubscribed_at, deleted_at
        )
        VALUES (?, ?, ?, ?, 1, ?, ?, NULL, NULL)
-       ON CONFLICT(email, newsletter_id) DO UPDATE SET
+       ON CONFLICT(newsletter_id, email COLLATE NOCASE) DO UPDATE SET
          isSubscribed = 1,
          first_name = COALESCE(excluded.first_name, Subscriber.first_name),
          last_name = COALESCE(excluded.last_name, Subscriber.last_name),
@@ -4537,8 +4557,11 @@ async function processSesNotification(
     }
 
     if (shouldUnsubscribe && newsletterId) {
-      await markSubscriberUnsubscribed(env.DB, email, newsletterId);
-      unsubscribedCount += 1;
+      unsubscribedCount += await markSubscriberUnsubscribed(
+        env.DB,
+        email,
+        newsletterId,
+      );
     }
   }
 
@@ -5106,18 +5129,19 @@ async function markSubscriberUnsubscribed(
   db: D1Database,
   email: string,
   newsletterId: string,
-): Promise<void> {
+): Promise<number> {
   const now = new Date().toISOString();
-  await db
+  const result = await db
     .prepare(
       `UPDATE Subscriber
        SET isSubscribed = 0,
            upsertedAt = ?,
            unsubscribed_at = COALESCE(unsubscribed_at, ?)
-       WHERE email = ? AND newsletter_id = ?`,
+       WHERE email = ? COLLATE NOCASE AND newsletter_id = ?`,
     )
     .bind(now, now, email, newsletterId)
     .run();
+  return result.meta.changes ?? 0;
 }
 
 function appendUnsubscribeFooterToHtml(

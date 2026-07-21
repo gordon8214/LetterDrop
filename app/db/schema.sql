@@ -93,6 +93,8 @@ CREATE INDEX idx_subscriber_newsletter_subscribed_email
 ON Subscriber(newsletter_id, isSubscribed, email);
 CREATE INDEX idx_subscriber_newsletter_snapshot_email
 ON Subscriber(newsletter_id, email, subscribed_at, unsubscribed_at, deleted_at);
+CREATE UNIQUE INDEX idx_subscriber_newsletter_email_nocase
+ON Subscriber(newsletter_id, email COLLATE NOCASE);
 CREATE INDEX idx_subscriber_deleted_at
 ON Subscriber(newsletter_id, deleted_at, upsertedAt);
 

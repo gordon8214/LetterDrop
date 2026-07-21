@@ -229,11 +229,25 @@ async function checkMigrations(databaseName, envName) {
          'idx_newsletter_deleted_at',
          'idx_newsletter_draft_deleted_at',
          'idx_subscriber_deleted_at',
+         'idx_subscriber_newsletter_email_nocase',
          'idx_newsletter_draft_due_schedule',
          'idx_newsletter_draft_scheduled_list'
        )`
   )
   const indexNames = new Set(indexes.map((index) => String(index.name ?? '')))
+  const subscriberEmailIndex = indexes.find(
+    (index) => String(index.name ?? '') === 'idx_subscriber_newsletter_email_nocase'
+  )
+  const subscriberEmailIndexSql = String(subscriberEmailIndex?.sql ?? '')
+    .replace(/\s+/g, '')
+    .toLowerCase()
+  if (!subscriberEmailIndexSql.includes(
+    'onsubscriber(newsletter_id,emailcollatenocase)'
+  )) {
+    throw new Error(
+      'Missing case-insensitive subscriber email index. Apply db/20260720_case_insensitive_subscriber_email.sql before deploy.'
+    )
+  }
   const missingIndexes = [
     'idx_subscriber_newsletter_snapshot_email',
     'idx_newsletter_send_recipient_status_email',
