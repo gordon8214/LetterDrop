@@ -238,14 +238,27 @@ async function checkMigrations(databaseName, envName) {
   const subscriberEmailIndex = indexes.find(
     (index) => String(index.name ?? '') === 'idx_subscriber_newsletter_email_nocase'
   )
+  const subscriberIndexMetadata = await queryD1(
+    databaseName,
+    envName,
+    "PRAGMA index_list('Subscriber')"
+  )
+  const subscriberEmailIndexMetadata = subscriberIndexMetadata.find(
+    (index) => String(index.name ?? '') === 'idx_subscriber_newsletter_email_nocase'
+  )
+  const subscriberEmailIndexIsUnique =
+    Number(subscriberEmailIndexMetadata?.unique ?? 0) === 1
   const subscriberEmailIndexSql = String(subscriberEmailIndex?.sql ?? '')
     .replace(/\s+/g, '')
     .toLowerCase()
-  if (!subscriberEmailIndexSql.includes(
-    'onsubscriber(newsletter_id,emailcollatenocase)'
-  )) {
+  if (
+    !subscriberEmailIndexIsUnique ||
+    !subscriberEmailIndexSql.includes(
+      'onsubscriber(newsletter_id,emailcollatenocase)'
+    )
+  ) {
     throw new Error(
-      'Missing case-insensitive subscriber email index. Apply db/20260720_case_insensitive_subscriber_email.sql before deploy.'
+      'Missing or incompatible unique case-insensitive subscriber email index. Apply db/20260720_case_insensitive_subscriber_email.sql before deploy.'
     )
   }
   const missingIndexes = [
